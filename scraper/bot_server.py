@@ -4,13 +4,13 @@ import time
 import asyncio
 import requests
 import uvicorn
-import re
 from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from google import genai
 from dotenv import load_dotenv
 
 import templates
+import bot_logic
 from hotel_scraper import fetch_hotel_availability
 
 load_dotenv()
@@ -29,9 +29,9 @@ with open("pricing.json", "r", encoding="utf-8") as f:
 app = FastAPI()
 
 AVAILABILITY_CACHE = {}
-CACHE_TTL = 900  
+CACHE_TTL = 900
 
-IGNORE_CATEGORIES = ["Колиба", "Басейн", "Overbooking"]
+# IGNORE_CATEGORIES is imported from bot_logic (single source of truth).
 
 def send_chatwoot_message(conversation_id: int, message_text: str):
     url = f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/messages"
@@ -135,7 +135,7 @@ async def process_incoming_message(user_message: str, conversation_id: int):
     
     try:
         intent_response = await generate_with_retry(intent_prompt)
-        needs_calendar = "ТАК" in intent_response.text.strip().upper()
+        needs_calendar = bot_logic.intent_says_yes(intent_response.text)
     except Exception as e:
         print(f"[-] Помилка інтенту: {e}")
         return
@@ -145,13 +145,7 @@ async def process_incoming_message(user_message: str, conversation_id: int):
     if needs_calendar:
         availability_data = await get_hotel_data_cached(conversation_id)
         if availability_data:
-            simplified_data = {}
-            for room_type, r_data in availability_data.items():
-                if any(ignore_word.lower() in room_type.lower() for ignore_word in IGNORE_CATEGORIES):
-                    continue
-                    
-                if isinstance(r_data, dict) and "total_available" in r_data:
-                    simplified_data[room_type] = r_data["total_available"]
+            simplified_data = bot_logic.build_simplified_availability(availability_data)
             context += f"\nРЕАЛЬНИЙ СТАН КІМНАТ (Шахівниця):\n{json.dumps(simplified_data, ensure_ascii=False)}\n"
         else:
             await asyncio.to_thread(send_chatwoot_message, conversation_id, "Вибачте, технічна затримка бази. Менеджер вже підключається.")
@@ -209,7 +203,15 @@ async def process_incoming_message(user_message: str, conversation_id: int):
     1. ПАМ'ЯТЬ (УВАГА!): Уважно читай ВСЮ історію діалогу! Клієнт міг написати дати в одному повідомленні, дорослих у другому, а ночі в третьому. ОБ'ЄДНУЙ ці дані. Не перепитуй те, що клієнт вже вказував вище! У <THINK> обов'язково випиши зібрані дані: Дати, Ночі, Гості.
     2. КАЛЕНДАР 2026: Вихідні ночі (тариф "вихідні") — це П'ЯТНИЦЯ та СУБОТА (наприклад, 3 і 4 липня). Будні — Нд, Пн, Вт, Ср, Чт.
     3. МАТЕМАТИКА НОЧЕЙ: Дата виїзду МІНУС Дата заїзду (6-8 липня = 2 ночі). День виїзду НІКОЛИ не перевіряється в базі на зайнятість.
-    4. БЕЗКОШТОВНІ ДІТИ: Вважаємо, що діти сплять з батьками. НЕ ДОДАВАЙ ЖОДНИХ ДОПЛАТ за дітей або додаткові ліжка! Рахуй СУВОРО: Вартість = `вартість_кімнати` * кількість ночей.
+    4. ДІТИ ТА ДОДАТКОВІ МІСЦЯ (СУВОРА ТАРИФІКАЦІЯ!): Базова `вартість_кімнати` покриває до 2 гостей (базова місткість).
+       Рахуй доплати ЗА КОЖНУ НІЧ за кожного гостя, що ПЕРЕВИЩУЄ базову місткість (2):
+         • Дитина 0–6 років (включно) — БЕЗКОШТОВНО (спить з батьками, доплати 0). Не займає платного місця.
+         • Дитина 7–12 років — додай `дитяче_місце` (це вже 50% тариф).
+         • Гість старше 12 років АБО дорослий — додай `додаткове_місце` (повний тариф).
+       Базову місткість заповнюй найдорожчими гостями (дорослі/діти 12+), тому "зайвими" (платними) стають найдешевші.
+       ФОРМУЛА за ніч = `вартість_кімнати` (або `одномісне_поселення` якщо платний гість лише 1) + сума доплат за зайвих гостей.
+       Приклад (Кейс 7): Стандарт, 2 дорослих + дитина 8 р., 2 будні ночі = (вартість_кімнати + дитяче_місце) * 2.
+       Підсумовуй ПО НОЧАХ окремо (будні/вихідні тариф може відрізнятись для різних ночей).
     5. У тег <REPLY> ти ЗОБОВ'ЯЗАНИЙ скопіювати ПОВНИЙ ТЕКСТ із шаблону БАЗИ ЗНАНЬ.
     
     АЛГОРИТМ ДІЙ (Обери СУВОРО ОДИН варіант):
@@ -237,7 +239,7 @@ async def process_incoming_message(user_message: str, conversation_id: int):
         <THINK>
         1. Визначаємо точні ночі проживання.
         2. Перевіряємо Шахівницю. Якщо ХОЧА Б НА ОДНУ ніч проживання є '0' -> ЗАЙНЯТО.
-        3. Рахуємо ціну СУВОРО за Правилами 3 і 4 (без жодних доплат за дітей).
+        3. Рахуємо ціну СУВОРО за Правилами 3 і 4 (доплати за дітей/додаткові місця рахуй за тарифною таблицею Правила 4).
         </THINK>
         IF (Номер ВІЛЬНИЙ на всі ночі):
             <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_PRICE_CALLCULATION (заміни змінні на реальні дані з Прайсу)</REPLY>
@@ -256,23 +258,13 @@ async def process_incoming_message(user_message: str, conversation_id: int):
     try:
         final_response = await generate_with_retry(sys_prompt)
         response_text = final_response.text
-        
-        reply_match = re.search(r"<REPLY>(.*?)</REPLY>", response_text, re.DOTALL | re.IGNORECASE)
-        
-        if reply_match:
-            clean_message = reply_match.group(1).strip()
-        else:
-            clean_message = re.sub(r"<THINK>.*?(</THINK>|THINK>|>|$)", "", response_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        if not bot_has_spoken and "Доброго дня! Вас вітає D&T Hotel" not in clean_message:
-            clean_message = "Доброго дня! Вас вітає D&T Hotel ⛰\nРаді, що зацікавились нашим готелем!\n[SPLIT]\n" + clean_message
+        clean_message = bot_logic.extract_reply(response_text)
+        clean_message = bot_logic.prepend_greeting_if_needed(clean_message, bot_has_spoken)
 
-        messages = clean_message.split("[SPLIT]")
-        for msg in messages:
-            msg = msg.strip()
-            if msg:
-                await asyncio.to_thread(send_chatwoot_message, conversation_id, msg)
-                await asyncio.sleep(1.5)
+        for msg in bot_logic.split_messages(clean_message):
+            await asyncio.to_thread(send_chatwoot_message, conversation_id, msg)
+            await asyncio.sleep(1.5)
                 
     except Exception as e:
         print(f"[-] Помилка генерації відповіді: {e}")

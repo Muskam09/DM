@@ -1,0 +1,4 @@
+# Test-only dependencies (kept out of the production image).
+# Install inside the bot-brain container to run the suite:
+#   pip install -r requirements-dev.txt && python -m pytest -v
+pytest==8.3.4

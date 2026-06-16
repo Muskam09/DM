@@ -2,3 +2,8 @@ venv/*
 .env
 __pycache__/
 *.pyc
+your_instagram_*
+.pytest_cache/
+
+# Raw development chat log — large and may contain secrets; never publish.
+context.txt

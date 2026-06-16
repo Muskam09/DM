@@ -1,0 +1,122 @@
+# skills.md — Business math & calendar parsing for the D&T Hotel bot
+
+The exact, testable domain knowledge the bot must apply. Numbers below are
+illustrative; the live values always come from `pricing.json`. The canonical,
+unit-tested implementation of everything here is `scraper/pricing_engine.py`
+(price math) and `scraper/bot_logic.py` (availability handling).
+
+---
+
+## 1. Pricing math
+
+### 1.1 Nights
+`nights = checkout_date − checkin_date` (integer days). **The checkout day is
+never paid and never checked for availability.** Examples:
+* `28–29 June` → 1 night (you sleep on the 28th).
+* `6–8 July` → 2 nights (you sleep on the 6th and 7th).
+
+### 1.2 Weekday vs. weekend tariff (decided **per night**)
+The tariff of a night is set by **the day you sleep on**:
+* **"вихідні" (weekend rate):** the night of **Friday** and the night of **Saturday**.
+* **"будні" (weekday rate):** Sunday, Monday, Tuesday, Wednesday, Thursday.
+
+A multi-night stay can mix tariffs — compute each night separately and sum.
+(`pricing_engine.is_weekend_night`: `date.weekday() in {4,5}` → Fri/Sat.)
+
+2026 anchors used in the User Cases: `2026-06-28` = Sunday (будні);
+`2026-07-06` = Monday, `2026-07-07` = Tuesday (both будні).
+
+### 1.3 Base price & capacity
+`вартість_кімнати` is the room price **per night** and covers up to
+**BASE_CAPACITY = 2** paying guests. If exactly **one** paying guest stays and the
+room defines `одномісне_поселення`, that single-occupancy rate replaces
+`вартість_кімнати`.
+
+### 1.4 Children & extra places (TIERED — authoritative, decided 2026-06-16)
+Charged **per night**, **only for guests beyond base capacity (2)**:
+
+| Guest | Per-night surcharge |
+|---|---|
+| Child **0–6** (inclusive) | **0** — free, shares parents' bed, takes no paid slot |
+| Child **7–12** | `дитяче_місце` (already a 50% extra-bed rate, e.g. 300 грн) |
+| Child **>12** or an **extra adult** | `додаткове_місце` (full extra-bed rate) |
+
+Fill the base capacity with the **most expensive** occupants first (adults / 12+),
+so the cheapest guests become the charged "extras" — the customer-friendly reading
+that matches Case 7. Free (≤6) children never consume a paid slot.
+
+### 1.5 The formula
+```
+price = Σ over each night [ room_rate(night) + Σ surcharge(extra_guest, night) ]
+room_rate(night) = одномісне_поселення  if exactly 1 paying guest and it exists
+                   else вартість_кімнати  (at that night's будні/вихідні tariff)
+```
+
+### 1.6 Worked examples (must stay true — see `test_pricing.py`)
+* **Case 3** — Стандарт +, 28–29 June 2026, 2 adults: 1 будні night, no extras →
+  `2400 × 1 = 2400 грн`.
+* **Case 7** — Стандарт, 6–8 July 2026, 2 adults + child 8: 2 будні nights, child 8
+  → `дитяче_місце` (300) → `(2200 + 300) × 2 = 5000 грн`.
+* 3 adults, Стандарт, 1 будні night July → `(2200 + 500) = 2700 грн`
+  (`додаткове_місце` 500 for the 3rd adult).
+* 2 adults + child 5, any room → child is free → just `вартість_кімнати × nights`.
+
+### 1.7 Other discounts (templates / pricing.json `правила_готелю`)
+* Military with УБД: **−20%** of the total.
+* These are stated in templates and applied on explicit request; the core
+  per-night engine above covers room + child/extra-place math.
+
+## 2. Parsing the hotel calendar JSON ("Шахівниця")
+
+`hotel_scraper.fetch_hotel_availability()` returns, per room category:
+```jsonc
+{
+  "Стандарт +": {
+    "total_available": { "2026-06-28": 2, "2026-06-29": 0, ... },  // free physical rooms per DATE
+    "rooms": { "28 - Гропа": { "2026-06-28": "Available", "2026-06-29": "Booked", ... }, ... }
+  },
+  ...
+}
+```
+
+* **Dates** come from OtelMS `day_id` = **days since 1970-01-01**:
+  `date = datetime(1970,1,1) + timedelta(days=int(day_id))`.
+* **`total_available[date]`** = how many physical rooms of that category are free
+  that night. `0` = sold out that night.
+* **`rooms[name][date]`** = `"Available"` / `"Booked"` for each physical room. A
+  booking marks every night from `Заїзд` (check-in) up to but **excluding**
+  `Виїзд` (check-out).
+
+### 2.1 What the bot consumes
+`bot_logic.build_simplified_availability(raw)` reduces the above to
+`{room_type: {date: count}}` and **drops blacklisted categories**
+(`IGNORE_CATEGORIES = ["Колиба","Басейн","Overbooking"]`). Only this simplified
+view is put into the prompt — the bot can never offer a blacklisted entity.
+
+### 2.2 Availability decisions
+* **Room free for a stay?** It is bookable only if `total_available[night] > 0`
+  for **every** night in `[checkin, checkout)`. If **any** night is `0` → treated
+  as **booked** (Case 4/5).
+* **Partial overbooking (Case 4):** chosen room is `0`, but other categories are
+  `> 0` → offer **only** the genuinely free categories via `ROOM_BOOKED`.
+* **Full sold-out (Case 5):** every category `0` on the dates → say everything is
+  booked and offer to search nearest dates; on agreement, scan forward from the
+  client's dates for the first window where the chosen room is `> 0` on all needed
+  nights → `NEAREST_DATES`.
+
+## 3. The 8 User Cases (behavioural contract — `project_spec.md` §6)
+
+| # | Trigger | Scraper? | Expected reply |
+|---|---|---|---|
+| 1 | First contact, no data | No | Greeting + `[SPLIT]` + `QUESTION_ALL_MISSING` |
+| 2 | Dates only, no room | No | Detect month → `PRICE_JUNE/JULY/AUGUST` |
+| 3 | Picks a specific room (data complete) | **Yes** | "Секундочку…" then filled `PRICE_CALLCULATION` |
+| 4 | Room = 0 but others free | Yes | `ROOM_BOOKED` listing only the free categories |
+| 5 | All categories = 0; then "Так" | Yes | Sold-out msg; then forward-scan → `NEAREST_DATES` |
+| 6 | Data dripped word-by-word | No | Consolidate in `<THINK>`, never re-ask |
+| 7 | Full data + child (extra place) | Yes | Tiered price (Case 7 = 5000) in `PRICE_CALLCULATION` |
+| 8 | Changes dates/nights for chosen room | **Yes** | Re-check availability, recompute |
+
+Tests in `test_webhook.py` assert the deterministic parts of each case (intent →
+scrape gating, blacklist filtering, sold-out branch, template/greeting/split
+plumbing) and exact prices via `pricing_engine`.
