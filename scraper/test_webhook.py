@@ -59,7 +59,8 @@ def test_is_room_available_states():
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-05"]) == "available"
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-06"]) == "sold_out"
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-05", "2026-07-06"]) == "sold_out"
-    assert bot_logic.is_room_available(avail, "Президентський", ["2026-07-05"]) == "unknown"
+    assert bot_logic.is_room_available(avail, "Président", ["2026-07-05"]) == "unknown"      # unknown room
+    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-08-10"]) == "unknown"       # out of window
 
 
 def test_room_key_matching_handles_spacing():

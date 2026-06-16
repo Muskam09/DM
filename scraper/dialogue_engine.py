@@ -133,7 +133,7 @@ def _missing_dates_question(rooms: List[Dict]) -> str:
 
 def _monthly_price(rooms: List[Dict]) -> str:
     for r in rooms:
-        if _has_dates(r):
+        if r.get("checkin"):                      # a known month is enough
             month = pricing_engine._as_date(r["checkin"]).month
             return _MONTH_TEMPLATE.get(month, templates.OFF_SEASON)
     return templates.QUESTION_MISSING_DATES
@@ -157,28 +157,40 @@ def plan(slots: Dict) -> Dict:
     """
     rooms = slots.get("rooms") or []
 
-    # Off-season: any concrete stay in an unpriced month -> we cannot quote.
+    # 1) Off-season: a KNOWN check-in month that isn't priced (covers a bare
+    #    "ціни на жовтень" where only the month is given) -> we cannot quote.
     for r in rooms:
-        if _has_dates(r) and not pricing_engine.stay_is_priced(r["checkin"], r["checkout"]):
+        ci, co = r.get("checkin"), r.get("checkout")
+        if ci and not pricing_engine.is_priced_month(ci):
+            return {"action": "reply", "reply": templates.OFF_SEASON}
+        if ci and co and not pricing_engine.stay_is_priced(ci, co):
             return {"action": "reply", "reply": templates.OFF_SEASON}
 
-    any_dates = any(_has_dates(r) for r in rooms)
+    any_full = any(_has_dates(r) for r in rooms)            # both check-in & check-out
+    any_month = any(r.get("checkin") for r in rooms)        # at least a month is known
     any_guests = any(_has_guests(r) for r in rooms)
     any_room = any(r.get("room_type") for r in rooms)
 
-    if not any_dates and not any_guests and not any_room:
+    # 2) Nothing useful at all.
+    if not any_month and not any_guests and not any_room:
         return {"action": "reply", "reply": templates.QUESTION_ALL_MISSING}
-    if not any_dates:
+
+    # 3) A specific room + full dates + guests -> deterministic price quote.
+    bookable = [r for r in rooms if r.get("room_type") and _has_dates(r) and _has_guests(r)]
+    if bookable:
+        return {"action": "quote", "rooms": bookable}
+
+    # 4) Month + guests known (even without exact days) and no specific room ->
+    #    general monthly price (e.g. "ціни на серпень на двох" -> PRICE_AUGUST).
+    if any_month and any_guests:
+        return {"action": "reply", "reply": _monthly_price(rooms)}
+
+    # 5) Otherwise ask for whatever is still missing.
+    if not any_month and not any_full:
         return {"action": "reply", "reply": _missing_dates_question(rooms)}
     if not any_guests:
         return {"action": "reply", "reply": templates.QUESTION_MISSING_GUESTS}
-    if not any_room:
-        return {"action": "reply", "reply": _monthly_price(rooms)}
-
-    bookable = [r for r in rooms if r.get("room_type") and _has_dates(r)]
-    if not bookable:
-        return {"action": "reply", "reply": templates.QUESTION_MISSING_DATES}
-    return {"action": "quote", "rooms": bookable}
+    return {"action": "reply", "reply": templates.QUESTION_MISSING_DATES}
 
 
 # --- finalisation (availability gate -> price -> exact format) -------------

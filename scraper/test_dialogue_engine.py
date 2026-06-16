@@ -81,6 +81,20 @@ def test_plan_off_season():
     assert out["reply"] == templates.OFF_SEASON
 
 
+def test_plan_month_only_off_season():
+    # "ціни на жовтень" -> only a month, no exact days -> still off-season.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-10-01",
+                              "checkout": None, "adults": 0, "children_ages": []}]})
+    assert out["reply"] == templates.OFF_SEASON
+
+
+def test_plan_month_only_general_price():
+    # "ціни на серпень на двох" -> month + guests, no exact days -> monthly price.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-08-01",
+                              "checkout": None, "adults": 2, "children_ages": []}]})
+    assert out["reply"] == templates.PRICE_AUGUST
+
+
 def test_plan_complete_requests_quote():
     out = de.plan({"rooms": [{"room_type": "Стандарт", "checkin": "2026-07-06",
                               "checkout": "2026-07-08", "adults": 2, "children_ages": []}]})
@@ -153,3 +167,12 @@ def test_finalize_unknown_room_in_availability_still_quotes():
         [{"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-07",
           "adults": 2, "children_ages": []}], {})
     assert "2200 грн" in reply
+
+
+def test_finalize_out_of_window_dates_quote_not_blocked():
+    # Дати поза вікном "Шахівниці" (тільки липень у даних) -> unknown -> все одно ціна.
+    avail = {"Стандарт": {"2026-07-05": 3}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2026-08-10", "checkout": "2026-08-11",
+          "adults": 2, "children_ages": []}], avail)
+    assert "грн" in reply and reply != templates.POLITE_CLOSE

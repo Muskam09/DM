@@ -96,7 +96,13 @@ def is_room_available(simplified: Dict, room_type: str, night_dates: List[str]) 
     if key is None:
         return "unknown"
     avail = simplified.get(key) or {}
-    if night_dates and all(avail.get(d, 0) > 0 for d in night_dates):
+    if not night_dates:
+        return "unknown"
+    # A date outside the scraped window ("Шахівниця" only shows a few weeks) is
+    # NOT the same as sold out — we simply cannot confirm it.
+    if any(d not in avail for d in night_dates):
+        return "unknown"
+    if all(avail.get(d, 0) > 0 for d in night_dates):
         return "available"
     return "sold_out"
 
