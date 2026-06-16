@@ -175,3 +175,48 @@ def test_case8_recalc_changed_dates_mixed_tariff(engine):
     q = engine.quote("Стандарт", "2026-08-10", "2026-08-15", make_guests(adults=2))
     assert q.total == 12300
     assert q.nights == 5 and q.weekday_nights == 4 and q.weekend_nights == 1
+
+
+# --- Case 10: multi-room booking (up to 8 rooms) ---------------------------
+
+def test_multi_room_sums_each_room(engine):
+    # A family wants a Standard + a Standard+ for 6-8 July (2 будні nights), 2 adults each.
+    mq = engine.quote_multiple([
+        {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+         "guests": make_guests(adults=2)},
+        {"room_type": "Стандарт +", "checkin": "2026-07-06", "checkout": "2026-07-08",
+         "guests": make_guests(adults=2)},
+    ])
+    assert [q.total for q in mq.rooms] == [4400, 5200]   # 2200*2, 2600*2
+    assert mq.total == 9600
+
+
+def test_multi_room_accepts_tuples(engine):
+    mq = engine.quote_multiple([
+        ("Стандарт", "2026-07-06", "2026-07-07", make_guests(adults=2)),
+        ("Стандарт", "2026-07-06", "2026-07-07", make_guests(adults=3)),
+    ])
+    assert mq.total == 2200 + 2700  # base + (base+додаткове)
+
+
+def test_multi_room_rejects_over_8(engine):
+    one = ("Стандарт", "2026-07-06", "2026-07-07", make_guests(adults=2))
+    with pytest.raises(ValueError):
+        engine.quote_multiple([one] * 9)
+
+
+# --- Case 11: off-season (Sept–May) has no pricing -------------------------
+
+def test_off_season_raises_offseason_error(engine):
+    from pricing_engine import OffSeasonError
+    with pytest.raises(OffSeasonError):
+        engine.price("Стандарт", "2026-09-13", "2026-09-14", make_guests(adults=2))
+
+
+def test_is_priced_month_and_stay():
+    from pricing_engine import is_priced_month, stay_is_priced
+    assert is_priced_month("2026-07-06") is True
+    assert is_priced_month("2026-09-01") is False
+    assert stay_is_priced("2026-07-06", "2026-07-08") is True
+    # checkin Aug 31 -> night of Sep 1 is off-season:
+    assert stay_is_priced("2026-08-31", "2026-09-02") is False

@@ -7,3 +7,8 @@ your_instagram_*
 
 # Raw development chat log — large and may contain secrets; never publish.
 context.txt
+
+# Instagram export analysis — derived from real customer data (PII); keep local.
+analyze_ig_export.py
+ig_analysis_summary.json
+new_user_cases_report.md

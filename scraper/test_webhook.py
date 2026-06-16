@@ -145,6 +145,53 @@ def test_extract_reply_strips_think_when_no_reply_tag():
     assert "міркування" not in bot_logic.extract_reply(raw)
 
 
+# -- B2B spam detection (Case: ignore, no reply) ----------------------------
+
+@pytest.mark.parametrize("text", [
+    "Доброго дня! Я з команди Stix, робимо 3D-стікери для вашого бізнесу",
+    "Створюю розумних чат-ботів для готелів та ресторанів",
+    "Пропоную просування сторінки в інстаграм, є пробний тариф 🤗",
+    "Я таргетолог, допоможу залучення клієнтів через рекламу",
+])
+def test_is_spam_true(text):
+    assert bot_logic.is_spam(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "Доброго дня, є вільні номери на 6-8 липня?",
+    "Стандарт + на 2 дорослих, яка ціна?",
+    "Скільки коштує сауна?",
+    "Чи можна з собакою?",
+])
+def test_is_spam_false(text):
+    assert bot_logic.is_spam(text) is False
+
+
+# -- phone-number capture (Case: hand off to a human) -----------------------
+
+@pytest.mark.parametrize("text,expected", [
+    ("0959224876 Аліна", True),
+    ("+380987521919", True),
+    ("мій телефон 067 344 52 20", True),
+    ("10-15 серпня, 2 дорослих", False),
+    ("вартість 2400 грн", False),
+    ("Стандарт +", False),
+])
+def test_contains_phone_number(text, expected):
+    assert bot_logic.contains_phone_number(text) is expected
+
+
+# -- new templates carry the owner's exact content --------------------------
+
+def test_new_templates_content():
+    assert "0673445220" in templates.LARGE_GROUPS_EVENTS          # co-owner phone
+    assert "350" in templates.FOOD_PRICES and "1100" in templates.FOOD_PRICES
+    assert "instagram.com/stories/highlights" in templates.PETS   # pet-rules link
+    assert "WiFi" in templates.ROOM_AMENITIES
+    assert "Стандарт +" in templates.SMOKING                      # balcony exception
+    assert templates.OFF_SEASON and templates.FUZZY_DATES and templates.POLITE_CLOSE
+
+
 # ===========================================================================
 # Layer B — live orchestration (skips unless FastAPI/google-genai available)
 # ===========================================================================
@@ -157,7 +204,8 @@ def server(monkeypatch):
     except Exception as exc:  # ImportError locally, anything in a broken env
         pytest.skip(f"bot_server unavailable here (needs container deps): {exc}")
 
-    sent = []  # messages "sent" to Chatwoot
+    sent = []      # messages "sent" to Chatwoot
+    prompts = []   # prompts passed to the (faked) LLM
     state = {"scraped": False}
 
     monkeypatch.setattr(bot_server, "send_chatwoot_message",
@@ -171,6 +219,7 @@ def server(monkeypatch):
 
     def configure(intent="НІ", reply="", history=None, availability=None):
         async def fake_llm(prompt, *a, **k):
+            prompts.append(prompt)
             text = intent if "запускати скрапер" in prompt else reply
             return SimpleNamespace(text=text)
         monkeypatch.setattr(bot_server, "generate_with_retry", fake_llm)
@@ -183,7 +232,7 @@ def server(monkeypatch):
         monkeypatch.setattr(bot_server, "fetch_hotel_availability", fake_fetch)
         return bot_server
 
-    return SimpleNamespace(configure=configure, sent=sent, state=state)
+    return SimpleNamespace(configure=configure, sent=sent, prompts=prompts, state=state)
 
 
 def _run(coro):
@@ -285,3 +334,38 @@ def test_webhook_routing_schedules_only_incoming(server):
     assert schedules(incoming) == 1
     assert schedules(echo) == 0
     assert schedules({"event": "conversation_updated"}) == 0
+
+
+# -- Case 15 e2e: B2B spam is ignored entirely (no reply, no LLM, no scrape) -
+
+def test_e2e_spam_is_ignored_no_reply(server):
+    bs = server.configure(intent="НІ", reply="<REPLY>x</REPLY>")
+    _run(bs.process_incoming_message("Створюю чат-ботів для готелів, є пробний тариф", 215))
+    assert server.sent == []            # nothing sent to Chatwoot
+    assert server.prompts == []         # LLM never called
+    assert server.state["scraped"] is False
+
+
+# -- phone handoff e2e: reply PHONE_RECEIVED and stop (no LLM) ---------------
+
+def test_e2e_phone_number_handoff(server):
+    bs = server.configure(intent="НІ", reply="<REPLY>x</REPLY>")
+    _run(bs.process_incoming_message("Передзвоніть мені 0959224876", 216))
+    assert server.sent == [templates.PHONE_RECEIVED]
+    assert server.prompts == []         # short-circuits before the LLM
+
+
+# -- sys_prompt enforces Ukrainian-only + exposes the new templates ---------
+
+def test_e2e_sys_prompt_enforces_ukrainian_and_new_templates(server):
+    bs = server.configure(
+        intent="НІ", reply="<REPLY>ok</REPLY>",
+        history=[{"id": 1, "message_type": "outgoing", "content": "вітаю"}],
+    )
+    _run(bs.process_incoming_message("Скажіть про чани та харчування", 217))
+    sys_prompts = [p for p in server.prompts if "системний алгоритм" in p]
+    assert sys_prompts, "sys_prompt was not generated"
+    sp = sys_prompts[0]
+    assert "ВИКЛЮЧНО УКРАЇНСЬКОЮ" in sp                    # strict-UA hard rule
+    assert "SAUNA_VATS" in sp and "FOOD_PRICES" in sp      # new FAQ templates wired in
+    assert "LARGE_GROUPS_EVENTS" in sp                     # groups/events branch present

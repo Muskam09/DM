@@ -105,6 +105,17 @@ async def generate_with_retry(prompt: str, retries: int = 3, delay: int = 2):
                 raise e
 
 async def process_incoming_message(user_message: str, conversation_id: int):
+    # B2B / реклама / спам -> повністю ігноруємо (НЕ відправляємо жодної відповіді).
+    if bot_logic.is_spam(user_message):
+        print(f"[!] Спам проігноровано: {user_message[:50]}")
+        return
+
+    # Клієнт залишив номер телефону -> передаємо менеджеру і зупиняємо діалог.
+    if bot_logic.contains_phone_number(user_message):
+        print(f"[i] Отримано контакт, передаю менеджеру: {user_message[:50]}")
+        await asyncio.to_thread(send_chatwoot_message, conversation_id, templates.PHONE_RECEIVED)
+        return
+
     raw_history = get_chatwoot_history(conversation_id)
     bot_has_spoken = any(msg.get("message_type") in ["outgoing", 1] for msg in raw_history)
 
@@ -179,6 +190,16 @@ async def process_incoming_message(user_message: str, conversation_id: int):
 [BREAKFAST_IN_THE_PRICE]: {templates.BREAKFAST_IN_THE_PRICE}
 [KITCHEN]: {templates.KITCHEN}
 [NEAREST_DATES]: {templates.NEAREST_DATES}
+[LARGE_GROUPS_EVENTS]: {templates.LARGE_GROUPS_EVENTS}
+[OFF_SEASON]: {templates.OFF_SEASON}
+[FUZZY_DATES]: {templates.FUZZY_DATES}
+[SAUNA_VATS]: {templates.SAUNA_VATS}
+[FOOD_PRICES]: {templates.FOOD_PRICES}
+[TRANSFER_PARKING]: {templates.TRANSFER_PARKING}
+[ROOM_AMENITIES]: {templates.ROOM_AMENITIES}
+[SMOKING]: {templates.SMOKING}
+[THINKING_ABOUT_IT]: {templates.THINKING_ABOUT_IT}
+[POLITE_CLOSE]: {templates.POLITE_CLOSE}
 -----------------------------
     """
 
@@ -200,6 +221,7 @@ async def process_incoming_message(user_message: str, conversation_id: int):
     {kb_templates}
     
     СУВОРІ ПРАВИЛА ТА МАТЕМАТИКА (КРИТИЧНО!):
+    0. МОВА (НАЙВАЖЛИВІШЕ!): ЗАВЖДИ відповідай ВИКЛЮЧНО УКРАЇНСЬКОЮ мовою, навіть якщо клієнт пише російською чи будь-якою іншою мовою. У <REPLY> не має бути ЖОДНОГО слова іншою мовою.
     1. ПАМ'ЯТЬ (УВАГА!): Уважно читай ВСЮ історію діалогу! Клієнт міг написати дати в одному повідомленні, дорослих у другому, а ночі в третьому. ОБ'ЄДНУЙ ці дані. Не перепитуй те, що клієнт вже вказував вище! У <THINK> обов'язково випиши зібрані дані: Дати, Ночі, Гості.
     2. КАЛЕНДАР 2026: Вихідні ночі (тариф "вихідні") — це П'ЯТНИЦЯ та СУБОТА (наприклад, 3 і 4 липня). Будні — Нд, Пн, Вт, Ср, Чт.
     3. МАТЕМАТИКА НОЧЕЙ: Дата виїзду МІНУС Дата заїзду (6-8 липня = 2 ночі). День виїзду НІКОЛИ не перевіряється в базі на зайнятість.
@@ -213,13 +235,36 @@ async def process_incoming_message(user_message: str, conversation_id: int):
        Приклад (Кейс 7): Стандарт, 2 дорослих + дитина 8 р., 2 будні ночі = (вартість_кімнати + дитяче_місце) * 2.
        Підсумовуй ПО НОЧАХ окремо (будні/вихідні тариф може відрізнятись для різних ночей).
     5. У тег <REPLY> ти ЗОБОВ'ЯЗАНИЙ скопіювати ПОВНИЙ ТЕКСТ із шаблону БАЗИ ЗНАНЬ.
-    
+    6. БРОНЮВАННЯ КІЛЬКОХ НОМЕРІВ (до 8): Якщо клієнт хоче 2+ номери, у <THINK> рахуй КОЖЕН номер ОКРЕМО (Крок 1: Номер 1 — тип, дати, гості, ціна; Крок 2: Номер 2 — тип, дати, гості, ціна; і т.д.), потім ПІДСУМУЙ загальну вартість і чітко виведи клієнту розбивку по номерах + загальну суму.
+    7. МІСЯЦІ З ЦІНАМИ: Ціни є ТІЛЬКИ на Червень, Липень, Серпень. На будь-які інші місяці (вересень–травень) ціни НЕ визначені — використовуй шаблон OFF_SEASON.
+
     АЛГОРИТМ ДІЙ (Обери СУВОРО ОДИН варіант):
     {greeting_instruction}
     
-    IF (Клієнт задає загальне питання (FAQ)):
-        <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_БАЗИ_ЗНАНЬ (наприклад: POOL, PETS, KITCHEN)</REPLY>
-        
+    IF (Клієнт пише, що ПОДУМАЄ / порадиться / відпише пізніше ("дякую, подумаю", "ще міркуємо")):
+        <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_THINKING_ABOUT_IT</REPLY>
+        # УВАГА: НЕ став ЖОДНИХ додаткових питань після цього.
+
+    ELSE IF (Велика група 40+ осіб / табір / тур, АБО захід / банкет / весілля / корпоратив / святкування):
+        <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_LARGE_GROUPS_EVENTS</REPLY>
+        # НЕ намагайся бронювати такі запити — лише перенаправ до співвласника.
+
+    ELSE IF (Клієнт хоче 2 і більше номерів одночасно (мульти-бронювання, до 8)):
+        <THINK>За Правилом 6 рахую КОЖЕН номер окремо (тип, дати, гості, ціна), потім підсумовую.</THINK>
+        <REPLY>Чітка розбивка по кожному номеру (як у PRICE_CALLCULATION) + рядок "Разом: {{сума}} грн". Бажаєте забронювати?</REPLY>
+
+    ELSE IF (Дати клієнта припадають на місяць БЕЗ цін: вересень, жовтень, листопад, грудень, січень ... травень):
+        <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_OFF_SEASON</REPLY>
+
+    ELSE IF (Клієнт назвав НЕЧІТКИЙ період без конкретного місяця та дат ("на літо", "влітку", "колись восени")):
+        <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_FUZZY_DATES</REPLY>
+
+    ELSE IF (Клієнт задає загальне питання (FAQ)):
+        <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_БАЗИ_ЗНАНЬ. Підбери шаблон за темою:
+        басейн -> POOL; чани/сауна -> SAUNA_VATS; харчування/ціни на їжу -> FOOD_PRICES (або EAT/BREAKFAST_IN_THE_PRICE/KITCHEN); тварини/собака/кіт -> PETS;
+        трансфер/як доїхати/парковка -> TRANSFER_PARKING; WiFi/інтернет/світло/генератор/мангал/дрова/фен/рушник -> ROOM_AMENITIES; куріння -> SMOKING;
+        локація/адреса -> PLACE; оплата/бронювання -> BOOK_ROOM; військові -> MILITARY; що входить у вартість -> INCLUDED_IN_THE_PRICE; знижки дітям -> CHILDREN; бар -> BAR; басейн для гостей ззовні -> GUEST_POOL.</REPLY>
+
     ELSE IF (У ВСІЙ зібраній історії діалогу НЕ ВИСТАЧАЄ Дат, АБО Кількості ночей, АБО Гостей):
         <THINK>Перевіряємо ВСЮ історію. Чого бракує? Обираємо відповідний шаблон питання.</THINK>
         <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_БАЗИ_ЗНАНЬ (QUESTION_ALL_MISSING, QUESTION_MISSING_DATES_1_CHILD тощо)</REPLY>
@@ -250,7 +295,10 @@ async def process_incoming_message(user_message: str, conversation_id: int):
             
     ELSE IF (Клієнт погоджується бронювати ("Так", "Давайте") ПІСЛЯ розрахунку ціни):
         <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_BOOK_ROOM</REPLY>
-        
+
+    ELSE IF (Клієнт каже, що НЕ може змінити дати, а на ці дати все повністю заброньовано):
+        <REPLY>КОПІЮЙ_СЮДИ_ТЕКСТ_З_POLITE_CLOSE</REPLY>
+
     Нове повідомлення: {user_message}
     Твоя відповідь (ТІЛЬКИ ОДИН СТАН, обов'язково використовуй <THINK> і <REPLY>):
     """

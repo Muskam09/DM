@@ -68,6 +68,41 @@ def is_sold_out(simplified: Dict, night_dates: List[str]) -> bool:
     return len(free_room_types(simplified, night_dates)) == 0
 
 
+# --- B2B spam detection -----------------------------------------------------
+# Markers of vendor/outreach DMs (sticker shops, chatbot/SMM/targeting sellers,
+# content agencies, scams). When detected the bot stays SILENT — no Chatwoot reply.
+SPAM_MARKERS = [
+    "стікер", "чат-бот", "чатбот", "чат бот", "таргетолог", "таргетинг",
+    "smm", "сммщик", "просування сторінк", "просуванні сторінк", "накрутк",
+    "пробний тариф", "рекламні макет", "контент для соцмереж", "візуальний контент",
+    "ведення сторінк", "ведення інстаграм", "ведення профіл", "холодний трафік",
+    "розробка сайт", "розробку сайт", "веб-сайт", "комерційну пропозицію",
+    "комерційна пропозиція", "автоматизуйте", "автоматизація сервіс",
+    "лідогенерац", "збільшити продаж", "залучення клієнт", "співпрацю по бартер",
+    "пропоную співпрацю", "інвестиц", "заробіток від", "криптовалют", "казино",
+]
+
+
+def is_spam(text: str) -> bool:
+    """Detect B2B outreach / spam so the bot can ignore it entirely (no reply)."""
+    t = (text or "").lower()
+    return any(marker in t for marker in SPAM_MARKERS)
+
+
+# --- phone-number capture ---------------------------------------------------
+# A customer who leaves a phone number is handed to a human (reply PHONE_RECEIVED,
+# stop). Match a token with >= 9 digits (UA: 0XXXXXXXXX / +380XXXXXXXXX), which
+# excludes dates ("10-15") and prices ("2400 грн").
+_PHONE_RE = re.compile(r"\+?\d[\d\-\s()]{7,}\d")
+
+
+def contains_phone_number(text: str) -> bool:
+    for match in _PHONE_RE.finditer(text or ""):
+        if 9 <= sum(ch.isdigit() for ch in match.group()) <= 13:
+            return True
+    return False
+
+
 def extract_reply(response_text: str) -> str:
     """Return only the text inside <REPLY>...</REPLY>. If the tag is missing,
     strip out any <THINK> machine-reasoning and return what remains.

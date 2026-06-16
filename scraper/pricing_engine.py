@@ -50,7 +50,17 @@ _UA_MONTHS = {
 CHILD_PLACE_KEY = "дитяче_місце"
 EXTRA_PLACE_KEY = "додаткове_місце"
 
+# Only the summer months are priced today; everything else is off-season.
+PRICED_MONTHS = frozenset({6, 7, 8})
+
+# A single booking may span at most this many rooms (multi-room calculation).
+MAX_ROOMS_PER_BOOKING = 8
+
 _DEFAULT_PRICING_PATH = os.path.join(os.path.dirname(__file__), "pricing.json")
+
+
+class OffSeasonError(KeyError):
+    """Raised when a stay falls in a month that has no price table (Sept–May)."""
 
 
 # --- Data models -----------------------------------------------------------
@@ -78,6 +88,13 @@ class Quote:
     weekend_nights: int
     room_type: str
     breakdown: List[str] = field(default_factory=list)
+
+
+@dataclass
+class MultiQuote:
+    """Total of several rooms booked together (multi-room booking, up to 8)."""
+    total: int
+    rooms: List[Quote] = field(default_factory=list)
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -108,6 +125,22 @@ def is_weekend_night(night: date) -> bool:
 
 def month_name_uk(d: date) -> str:
     return _UA_MONTHS[d.month]
+
+
+def is_priced_month(value) -> bool:
+    """True if the given date's month has a price table (summer only)."""
+    return _as_date(value).month in PRICED_MONTHS
+
+
+def stay_is_priced(checkin, checkout) -> bool:
+    """True only if EVERY night of the stay falls in a priced month."""
+    ci, co = _as_date(checkin), _as_date(checkout)
+    night = ci
+    while night < co:
+        if night.month not in PRICED_MONTHS:
+            return False
+        night += timedelta(days=1)
+    return True
 
 
 def child_place_key(age: int) -> Optional[str]:
@@ -150,6 +183,11 @@ class PricingEngine:
         raise KeyError(f"Unknown room type: {room_type!r}")
 
     def _rates_for_night(self, room_type: str, night: date) -> dict:
+        if night.month not in PRICED_MONTHS:
+            raise OffSeasonError(
+                f"No pricing for {month_name_uk(night)} ({night.isoformat()}); "
+                f"off-season (only {sorted(PRICED_MONTHS)} are priced)."
+            )
         month = month_name_uk(night)
         try:
             month_table = self.prices[room_type][month]
@@ -256,6 +294,29 @@ class PricingEngine:
     def price(self, room_type, checkin, checkout, guests: List[Guest]) -> int:
         """Convenience wrapper returning only the total price in UAH."""
         return self.quote(room_type, checkin, checkout, guests).total
+
+    def quote_multiple(self, bookings) -> MultiQuote:
+        """Quote several rooms in one booking and sum them (multi-room, <=8 rooms).
+
+        Each booking is a dict {room_type, checkin, checkout, guests} or a
+        (room_type, checkin, checkout, guests) tuple. Mirrors the per-room then
+        sum logic the bot performs in <THINK> for "we want 2+ rooms" requests.
+        """
+        bookings = list(bookings)
+        if not bookings:
+            raise ValueError("At least one room booking is required")
+        if len(bookings) > MAX_ROOMS_PER_BOOKING:
+            raise ValueError(
+                f"At most {MAX_ROOMS_PER_BOOKING} rooms per booking (got {len(bookings)})"
+            )
+        quotes: List[Quote] = []
+        for b in bookings:
+            if isinstance(b, dict):
+                quotes.append(self.quote(b["room_type"], b["checkin"],
+                                         b["checkout"], b["guests"]))
+            else:
+                quotes.append(self.quote(*b))
+        return MultiQuote(total=sum(q.total for q in quotes), rooms=quotes)
 
 
 # --- Convenience parsing for guest specs -----------------------------------
