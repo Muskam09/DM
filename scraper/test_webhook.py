@@ -369,3 +369,4 @@ def test_e2e_sys_prompt_enforces_ukrainian_and_new_templates(server):
     assert "ВИКЛЮЧНО УКРАЇНСЬКОЮ" in sp                    # strict-UA hard rule
     assert "SAUNA_VATS" in sp and "FOOD_PRICES" in sp      # new FAQ templates wired in
     assert "LARGE_GROUPS_EVENTS" in sp                     # groups/events branch present
+    assert "НЕМАЄ КОТЕДЖІВ" in sp                          # no-cottage guard (rule 1)
