@@ -22,46 +22,57 @@ Playwright scrape -> main LLM (State Machine) -> reply POSTed back to Chatwoot`.
 
 ```
 scraper/                     # the deployed application
-  bot_server.py              # FastAPI core: webhook, intent pre-filter, sys_prompt State Machine, Chatwoot I/O, cache
-  bot_logic.py               # PURE, dependency-free decision helpers (intent gate, JSON filter, [SPLIT], <REPLY>, greeting)
-  pricing_engine.py          # PURE deterministic price math — the tested reference implementation of §5 rules
-  templates.py               # knowledge base: every client-facing text template (FAQ, presentations, prices)
+  bot_server.py              # FastAPI core: webhook, the LLM EXTRACTION call, deterministic routing, Chatwoot I/O, cache
+  dialogue_engine.py         # PURE deterministic reply builder: plan() + finalize_quote() + the rigid quote format
+  bot_logic.py               # PURE helpers: availability filter/gate, spam/phone/large-group detection, [SPLIT], greeting
+  pricing_engine.py          # PURE deterministic price math — dates/weekday/total/multi-room/off-season (tested)
+  templates.py               # knowledge base: every client-facing text template (FAQ, prices, redirects, closes)
   hotel_scraper.py           # Playwright scraper of the OtelMS calendar -> availability JSON
   pricing.json               # price + rules config (per room type / month / weekday-weekend)
-  test_pricing.py            # unit tests for pricing_engine (exact UAH numbers)
-  test_webhook.py            # tests for the 8 User Cases (intent gating, templates, availability, pricing)
+  test_pricing.py            # unit tests for pricing_engine (exact UAH numbers, multi-room, off-season)
+  test_dialogue_engine.py    # unit tests for the deterministic reply builder (format, gating, planning)
+  test_webhook.py            # Layer A helpers + Layer B live-flow e2e (extraction mocked)
   Dockerfile                 # bot-brain image (python:3.11-slim + Playwright Chromium)
   docker-compose.yaml        # full stack: bot-brain + Chatwoot (rails, sidekiq, postgres, redis)
   .env                       # secrets (GITIGNORED — never commit)
 etc/                         # legacy / scratch helpers and the deprecated manual test.html
-project_spec.md              # ТЗ: architecture, business rules, the 8 User Cases (behavioural source of truth)
+project_spec.md              # ТЗ: architecture, business rules, User Cases (behavioural source of truth)
 context.txt                  # 1.1 MB raw development chat log (UNTRACKED — do NOT commit; may contain secrets)
 ```
 
-## 3. The `<THINK>` / `<REPLY>` pattern (Hidden State)
+## 3. Architecture: LLM extracts, Python decides (deterministic core)
 
-The main model is a **state machine**, not a chatbot. Every response MUST be:
+The LLM is reduced to **extraction/classification only**. It NEVER computes a
+price, a day-of-week, or a total, and NEVER writes the client-facing text.
 
 ```
-<THINK> all reasoning, data collection, availability checks and price math go here </THINK>
-<REPLY> ONLY the final client-facing text (a filled template) goes here </REPLY>
+incoming → spam? phone? (deterministic guards) → LLM EXTRACTION (returns JSON slots)
+         → deterministic large-group override → route:
+             simple topic  → fixed template (FAQ / redirect / thinking / close)
+             booking/price → dialogue_engine.plan() → (if quote) scrape →
+                             dialogue_engine.finalize_quote()  [availability gate → engine → exact format]
 ```
 
-* `bot_server.py` extracts **only** `<REPLY>...</REPLY>` via `bot_logic.extract_reply`
-  (`re.search(r"<REPLY>(.*?)</REPLY>")`). The client never sees `<THINK>`.
-* Inside `<THINK>` the model MUST restate the consolidated slots it has gathered
-  from the **whole** dialogue: **Dates, Nights, Guests** (and children ages).
-* `[SPLIT]` marker → `bot_logic.split_messages` cuts the reply into parts sent
-  sequentially with `asyncio.sleep(1.5)` to mimic human typing.
-* First bot turn only: prepend the greeting + `[SPLIT]`
-  (`bot_logic.prepend_greeting_if_needed`). Never greet twice.
+* **Extraction** (`bot_server.EXTRACTION_PROMPT`) returns `{topic, rooms[], faq_template}`.
+  Slots (dates/nights/guests/room) are consolidated from the **whole** dialogue
+  (drip handling). Parsed robustly by `dialogue_engine.parse_slots` (bad JSON →
+  safe "greeting" fallback).
+* **All money/calendar/format logic is `dialogue_engine` + `pricing_engine`** — tested,
+  deterministic. This is why the bot can no longer mis-date a night or invent a price.
+* `[SPLIT]` → `bot_logic.split_messages`; first turn prepends the greeting via
+  `bot_logic.prepend_greeting_if_needed`. Replies are UA by construction (templates
+  / Python-formatted), so no language drift.
 
 ## 4. Core algorithm rules (do not break)
 
-1. **Intent pre-filter gates the scraper.** A cheap LLM call decides if the
-   Playwright scrape runs. It runs **only** when the client picks/asks the price of
-   a *specific* room, changes dates/nights for an already-chosen room, or agrees to
-   a nearest-date search. Plain dates / guest counts / FAQ → **no** scrape.
+1. **Extraction decides routing; Python decides everything else.** The scrape runs
+   only on the deterministic **quote** path (`plan()` returns `action: "quote"`):
+   a *specific* room + dates + guests, in a priced month. FAQ / greeting / group /
+   off-season / fuzzy / thinking never scrape.
+1b. **Availability gating (mandatory):** `finalize_quote` checks the calendar FIRST;
+   if any requested room is sold out on the dates it returns the Polite Close and
+   **never quotes a price**. Large groups (40+) / events are redirected
+   deterministically (`bot_logic.looks_like_large_group`), not left to the LLM.
 2. **Nights = checkout − checkin.** The checkout day is never charged and never
    checked for availability.
 3. **Weekend nights = Friday & Saturday** (тариф "вихідні"); Sun–Thu = "будні".

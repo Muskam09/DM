@@ -143,6 +143,17 @@ def stay_is_priced(checkin, checkout) -> bool:
     return True
 
 
+def night_dates(checkin, checkout) -> List[str]:
+    """List of 'YYYY-MM-DD' for each night slept (checkout day excluded)."""
+    ci, co = _as_date(checkin), _as_date(checkout)
+    out = []
+    night = ci
+    while night < co:
+        out.append(night.isoformat())
+        night += timedelta(days=1)
+    return out
+
+
 def child_place_key(age: int) -> Optional[str]:
     """Which extra-place rate a child of the given age pays (None == free)."""
     if age <= 6:

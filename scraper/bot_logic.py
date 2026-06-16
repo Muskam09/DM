@@ -2,7 +2,7 @@
 bot_logic.py — Pure, dependency-free helpers extracted from bot_server.py.
 
 These functions hold the deterministic, side-effect-free decision logic of the
-bot (intent gating, availability filtering, message splitting, reply extraction,
+bot (availability filtering & gating, spam/phone detection, message splitting,
 greeting injection). Keeping them here lets the automated test suite assert the
 bot's behaviour without importing FastAPI / google-genai / Playwright, and
 guarantees the live server and the tests exercise the very same code.
@@ -23,11 +23,6 @@ GREETING = (
 )
 # Stable marker used to detect that the greeting is already present in a reply.
 GREETING_MARKER = "Доброго дня! Вас вітає D&T Hotel"
-
-
-def intent_says_yes(intent_text: str) -> bool:
-    """The intent pre-filter triggers the scraper only on an explicit 'ТАК'."""
-    return "ТАК" in (intent_text or "").strip().upper()
 
 
 def build_simplified_availability(
@@ -68,6 +63,44 @@ def is_sold_out(simplified: Dict, night_dates: List[str]) -> bool:
     return len(free_room_types(simplified, night_dates)) == 0
 
 
+def _norm_room(s: str) -> str:
+    return "".join((s or "").lower().split())
+
+
+def match_availability_key(simplified: Dict, room_type: str):
+    """Find the availability key matching a requested room type (handles spacing/
+    case, then a lenient substring match). Returns the key or None."""
+    if not simplified or not room_type:
+        return None
+    if room_type in simplified:
+        return room_type
+    target = _norm_room(room_type)
+    for key in simplified:                       # exact, normalised
+        if _norm_room(key) == target:
+            return key
+    for key in simplified:                       # lenient substring
+        nk = _norm_room(key)
+        if target and (target in nk or nk in target):
+            return key
+    return None
+
+
+def is_room_available(simplified: Dict, room_type: str, night_dates: List[str]) -> str:
+    """Availability of a specific room over the requested nights.
+
+    Returns 'available' (free every night), 'sold_out' (booked on >=1 night), or
+    'unknown' (room not found in the scraped data). Used to GATE pricing: the bot
+    must never quote a 'sold_out' room.
+    """
+    key = match_availability_key(simplified, room_type)
+    if key is None:
+        return "unknown"
+    avail = simplified.get(key) or {}
+    if night_dates and all(avail.get(d, 0) > 0 for d in night_dates):
+        return "available"
+    return "sold_out"
+
+
 # --- B2B spam detection -----------------------------------------------------
 # Markers of vendor/outreach DMs (sticker shops, chatbot/SMM/targeting sellers,
 # content agencies, scams). When detected the bot stays SILENT — no Chatwoot reply.
@@ -89,6 +122,31 @@ def is_spam(text: str) -> bool:
     return any(marker in t for marker in SPAM_MARKERS)
 
 
+# --- large-group / event detection (deterministic, not left to the LLM) -----
+# Big groups (40+) and events must ALWAYS be redirected to the co-owner — too
+# important to rely on fuzzy classification, so we detect it in code.
+_GROUP_NUM_RE = re.compile(
+    r"(\d{2,3})\s*[-–—+]?\s*\d{0,3}\s*(?:осіб|чол|людей|людин|дітей|діток|гостей|дорослих|учн)",
+    re.IGNORECASE,
+)
+_EVENT_WORDS = [
+    "весілл", "банкет", "корпоратив", "табір", "спортивні збори",
+    "проведення заход", "відсвяткувати", "ювіле",
+]
+
+
+def looks_like_large_group(text: str) -> bool:
+    """True if the conversation is clearly a 40+ group or an event/banquet."""
+    t = (text or "").lower()
+    for m in _GROUP_NUM_RE.finditer(t):
+        try:
+            if int(m.group(1)) >= 40:
+                return True
+        except ValueError:
+            pass
+    return any(w in t for w in _EVENT_WORDS)
+
+
 # --- phone-number capture ---------------------------------------------------
 # A customer who leaves a phone number is handed to a human (reply PHONE_RECEIVED,
 # stop). Match a token with >= 9 digits (UA: 0XXXXXXXXX / +380XXXXXXXXX), which
@@ -101,22 +159,6 @@ def contains_phone_number(text: str) -> bool:
         if 9 <= sum(ch.isdigit() for ch in match.group()) <= 13:
             return True
     return False
-
-
-def extract_reply(response_text: str) -> str:
-    """Return only the text inside <REPLY>...</REPLY>. If the tag is missing,
-    strip out any <THINK> machine-reasoning and return what remains.
-    """
-    response_text = response_text or ""
-    reply_match = re.search(
-        r"<REPLY>(.*?)</REPLY>", response_text, re.DOTALL | re.IGNORECASE
-    )
-    if reply_match:
-        return reply_match.group(1).strip()
-    return re.sub(
-        r"<THINK>.*?(</THINK>|THINK>|>|$)", "", response_text,
-        flags=re.DOTALL | re.IGNORECASE,
-    ).strip()
 
 
 def prepend_greeting_if_needed(clean_message: str, bot_has_spoken: bool) -> str:

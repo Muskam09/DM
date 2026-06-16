@@ -1,151 +1,87 @@
 """
-test_webhook.py — Behavioural tests for the 8 User Cases (project_spec.md §6).
+test_webhook.py — behavioural tests for the bot's live flow.
 
-The bot answers out-of-band: POST /webhook returns {"status":"ok"} and the real
-reply is sent to Chatwoot from a background task, with all pricing decided by the
-LLM. So this suite asserts the *deterministic* behaviour of each case:
+New architecture: the LLM does EXTRACTION ONLY (returns JSON slots); all pricing,
+availability gating, formatting and routing are deterministic. So:
 
-  Layer A (runs anywhere, pure modules): intent->scrape gating, blacklist
-          filtering, availability decisions, greeting/[SPLIT]/<REPLY> plumbing,
-          and exact prices via pricing_engine.
-  Layer B (runs where FastAPI/google-genai are installed — i.e. the bot-brain
-          container): drives process_incoming_message / the /webhook handler with
-          the Gemini, Chatwoot and Playwright boundaries mocked, asserting the
-          orchestration (scrape or not, "Секундочку", greeting, message delivery).
-
-Exact price correctness is locked down separately in test_pricing.py.
+  Layer A (pure, runs anywhere): the deterministic helpers — blacklist filtering,
+          availability gating, spam/phone detection, greeting/[SPLIT], templates.
+  Layer B (needs FastAPI/google-genai -> runs in the bot-brain container): drives
+          process_incoming_message / the /webhook handler with the extraction LLM,
+          Chatwoot and Playwright boundaries mocked, asserting the deterministic
+          routing (quote totals, availability gate, redirects, spam, drip context).
 """
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 
 import bot_logic
 import templates
-from pricing_engine import PricingEngine, make_guests
 
 
 # ===========================================================================
 # Layer A — deterministic, dependency-free
 # ===========================================================================
 
-engine = PricingEngine()
+DATES_28 = ["2026-06-28"]
 
-
-# -- shared fixtures: a synthetic "Шахівниця" for the chosen June dates --------
-
-DATES_28 = ["2026-06-28"]  # single night 28->29
-
-RAW_PARTIAL_OVERBOOKING = {  # Case 4: chosen room sold out, another free
+RAW_PARTIAL_OVERBOOKING = {
     "Стандарт +": {"total_available": {"2026-06-28": 0}, "rooms": {}},
     "Напівлюкс": {"total_available": {"2026-06-28": 2}, "rooms": {}},
     "Колиба": {"total_available": {"2026-06-28": 5}, "rooms": {}},        # blacklisted
     "Overbooking": {"total_available": {"2026-06-28": 9}, "rooms": {}},   # blacklisted
     "Басейн": {"total_available": {"2026-06-28": 1}, "rooms": {}},        # blacklisted
 }
-
-RAW_SOLD_OUT = {  # Case 5: everything sold out on the dates
+RAW_SOLD_OUT = {
     "Стандарт +": {"total_available": {"2026-06-28": 0}, "rooms": {}},
     "Напівлюкс": {"total_available": {"2026-06-28": 0}, "rooms": {}},
 }
 
 
-# -- Case 1: First contact, no data -----------------------------------------
+def test_blacklist_filtered_and_free_rooms():
+    simplified = bot_logic.build_simplified_availability(RAW_PARTIAL_OVERBOOKING)
+    assert set(simplified) == {"Стандарт +", "Напівлюкс"}
+    assert bot_logic.free_room_types(simplified, DATES_28) == ["Напівлюкс"]
+    assert bot_logic.is_sold_out(simplified, DATES_28) is False
 
-def test_case1_no_scrape_and_greeting_with_split():
-    assert bot_logic.intent_says_yes("НІ") is False  # scraper must NOT run
-    reply = bot_logic.prepend_greeting_if_needed(templates.QUESTION_ALL_MISSING,
-                                                 bot_has_spoken=False)
+
+def test_full_sold_out_detected():
+    simplified = bot_logic.build_simplified_availability(RAW_SOLD_OUT)
+    assert bot_logic.is_sold_out(simplified, DATES_28) is True
+
+
+# -- availability gating helper (the new pricing gate) ----------------------
+
+def test_is_room_available_states():
+    avail = {"Стандарт": {"2026-07-05": 3, "2026-07-06": 0}, "Напівлюкс": {"2026-07-05": 1}}
+    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-05"]) == "available"
+    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-06"]) == "sold_out"
+    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-05", "2026-07-06"]) == "sold_out"
+    assert bot_logic.is_room_available(avail, "Президентський", ["2026-07-05"]) == "unknown"
+
+
+def test_room_key_matching_handles_spacing():
+    avail = {"Стандарт +": {"2026-07-05": 2}}
+    assert bot_logic.match_availability_key(avail, "Стандарт+") == "Стандарт +"
+
+
+# -- greeting / [SPLIT] ------------------------------------------------------
+
+def test_greeting_prepended_and_split_first_turn():
+    reply = bot_logic.prepend_greeting_if_needed(templates.QUESTION_ALL_MISSING, bot_has_spoken=False)
     parts = bot_logic.split_messages(reply)
     assert len(parts) == 2
     assert parts[0].startswith("Доброго дня! Вас вітає D&T Hotel")
     assert parts[1] == templates.QUESTION_ALL_MISSING
 
 
-def test_no_double_greeting_when_bot_already_spoke():
-    reply = bot_logic.prepend_greeting_if_needed("Вже без вітання", bot_has_spoken=True)
-    assert not reply.startswith("Доброго дня")
+def test_no_double_greeting():
+    assert not bot_logic.prepend_greeting_if_needed("x", bot_has_spoken=True).startswith("Доброго")
 
 
-# -- Case 2: Dates only, no room chosen -> no scrape -------------------------
-
-def test_case2_dates_only_does_not_trigger_scrape():
-    assert bot_logic.intent_says_yes("НІ") is False
-
-
-# -- Case 3: Room chosen, data complete -> price (1 weekday night) -----------
-
-def test_case3_intent_triggers_scrape_and_price():
-    assert bot_logic.intent_says_yes("ТАК") is True
-    price = engine.price("Стандарт +", "2026-06-28", "2026-06-29", make_guests(adults=2))
-    assert price == 2400
-
-
-# -- Case 4: Partial overbooking -> only genuinely-free rooms offered --------
-
-def test_case4_blacklist_filtered_and_only_free_rooms_offered():
-    simplified = bot_logic.build_simplified_availability(RAW_PARTIAL_OVERBOOKING)
-    # Blacklisted categories are gone:
-    assert set(simplified) == {"Стандарт +", "Напівлюкс"}
-    # Only the genuinely free category is offerable (asserted via real bot code):
-    assert bot_logic.free_room_types(simplified, DATES_28) == ["Напівлюкс"]
-    assert bot_logic.is_sold_out(simplified, DATES_28) is False
-
-
-# -- Case 5: Full sold-out ---------------------------------------------------
-
-def test_case5_full_sold_out_detected():
-    simplified = bot_logic.build_simplified_availability(RAW_SOLD_OUT)
-    assert bot_logic.free_room_types(simplified, DATES_28) == []  # nothing free
-    assert bot_logic.is_sold_out(simplified, DATES_28) is True    # -> sold-out branch
-
-
-# -- Case 6: Data dripped word-by-word -> still no scrape until room chosen --
-
-def test_case6_partial_drip_does_not_trigger_scrape():
-    # "5 липня", "дитині 7 років", "2 дорослих", "1 ніч" — each is data, not a
-    # room selection, so the intent pre-filter answers НІ.
-    assert bot_logic.intent_says_yes("НІ") is False
-
-
-# -- Case 7: Strict math with an extra child place --------------------------
-
-def test_case7_child_extra_place_price():
-    price = engine.price("Стандарт", "2026-07-06", "2026-07-08",
-                         make_guests(adults=2, children_ages=[8]))
-    assert price == 5000  # (2200 + 300) * 2
-
-
-# -- Case 8: Changing dates/nights for a chosen room -> must re-scrape -------
-
-@pytest.mark.parametrize("msg_intent", ["ТАК"])
-def test_case8_change_dates_triggers_scrape(msg_intent):
-    assert bot_logic.intent_says_yes(msg_intent) is True
-
-
-# -- intent pre-filter robustness -------------------------------------------
-
-@pytest.mark.parametrize("text,expected", [
-    ("ТАК", True), ("так", True), ("Так, звичайно", True),
-    ("НІ", False), ("ні", False), ("", False), ("Не впевнений", False),
-])
-def test_intent_says_yes_variants(text, expected):
-    assert bot_logic.intent_says_yes(text) is expected
-
-
-# -- <REPLY> extraction ------------------------------------------------------
-
-def test_extract_reply_takes_only_reply_tag():
-    raw = "<THINK>Дати: 28-29. Ночі: 1. Гості: 2.</THINK><REPLY>Вартість 2400 грн</REPLY>"
-    assert bot_logic.extract_reply(raw) == "Вартість 2400 грн"
-
-
-def test_extract_reply_strips_think_when_no_reply_tag():
-    raw = "<THINK>міркування</THINK>Текст без тегу"
-    assert "міркування" not in bot_logic.extract_reply(raw)
-
-
-# -- B2B spam detection (Case: ignore, no reply) ----------------------------
+# -- B2B spam / phone detection ---------------------------------------------
 
 @pytest.mark.parametrize("text", [
     "Доброго дня! Я з команди Stix, робимо 3D-стікери для вашого бізнесу",
@@ -167,8 +103,6 @@ def test_is_spam_false(text):
     assert bot_logic.is_spam(text) is False
 
 
-# -- phone-number capture (Case: hand off to a human) -----------------------
-
 @pytest.mark.parametrize("text,expected", [
     ("0959224876 Аліна", True),
     ("+380987521919", True),
@@ -181,31 +115,39 @@ def test_contains_phone_number(text, expected):
     assert bot_logic.contains_phone_number(text) is expected
 
 
-# -- new templates carry the owner's exact content --------------------------
+@pytest.mark.parametrize("text,expected", [
+    ("нас 45 людей, корпоратив", True),
+    ("Липень на 70-80 чол на 6 днів", True),
+    ("весілля на 30 гостей", True),       # event word wins regardless of count
+    ("2 дорослих і дитина 8 років", False),
+    ("група 15 дітей, школа", False),     # 15 < 40, not an event
+    ("Стандарт на 5-7 липня", False),
+])
+def test_looks_like_large_group(text, expected):
+    assert bot_logic.looks_like_large_group(text) is expected
+
 
 def test_new_templates_content():
-    assert "0673445220" in templates.LARGE_GROUPS_EVENTS          # co-owner phone
+    assert "0673445220" in templates.LARGE_GROUPS_EVENTS
     assert "350" in templates.FOOD_PRICES and "1100" in templates.FOOD_PRICES
-    assert "instagram.com/stories/highlights" in templates.PETS   # pet-rules link
+    assert "instagram.com/stories/highlights" in templates.PETS
     assert "WiFi" in templates.ROOM_AMENITIES
-    assert "Стандарт +" in templates.SMOKING                      # balcony exception
-    assert templates.OFF_SEASON and templates.FUZZY_DATES and templates.POLITE_CLOSE
+    assert "Стандарт +" in templates.SMOKING
 
 
 # ===========================================================================
-# Layer B — live orchestration (skips unless FastAPI/google-genai available)
+# Layer B — live flow (skips unless FastAPI/google-genai available)
 # ===========================================================================
 
 @pytest.fixture
 def server(monkeypatch):
-    """Import bot_server (skips locally) and stub all external boundaries."""
     try:
         import bot_server
-    except Exception as exc:  # ImportError locally, anything in a broken env
+    except Exception as exc:
         pytest.skip(f"bot_server unavailable here (needs container deps): {exc}")
 
-    sent = []      # messages "sent" to Chatwoot
-    prompts = []   # prompts passed to the (faked) LLM
+    sent = []      # messages sent to Chatwoot
+    prompts = []   # prompts handed to the (faked) extraction LLM
     state = {"scraped": False}
 
     monkeypatch.setattr(bot_server, "send_chatwoot_message",
@@ -214,17 +156,17 @@ def server(monkeypatch):
     async def _fast_sleep(*_a, **_k):
         return None
     monkeypatch.setattr(bot_server.asyncio, "sleep", _fast_sleep)
-
     bot_server.AVAILABILITY_CACHE.clear()
 
-    def configure(intent="НІ", reply="", history=None, availability=None):
+    def configure(slots=None, slots_text=None, history=None, availability=None):
+        text = slots_text if slots_text is not None else json.dumps(
+            slots or {"topic": "greeting", "rooms": []})
+
         async def fake_llm(prompt, *a, **k):
             prompts.append(prompt)
-            text = intent if "запускати скрапер" in prompt else reply
             return SimpleNamespace(text=text)
         monkeypatch.setattr(bot_server, "generate_with_retry", fake_llm)
-        monkeypatch.setattr(bot_server, "get_chatwoot_history",
-                            lambda conv_id: history or [])
+        monkeypatch.setattr(bot_server, "get_chatwoot_history", lambda conv_id: history or [])
 
         async def fake_fetch():
             state["scraped"] = True
@@ -239,81 +181,155 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# -- Case 1 end-to-end: greeting + question, no scrape ----------------------
+def _bot_spoke():
+    return [{"id": 1, "message_type": "outgoing", "content": "вітаю"}]
 
-def test_e2e_case1_first_contact(server):
-    bs = server.configure(
-        intent="НІ",
-        reply=f"<THINK>немає даних</THINK><REPLY>{templates.QUESTION_ALL_MISSING}</REPLY>",
-        history=[],
-    )
-    _run(bs.process_incoming_message("Доброго дня, хочу забронювати номер!", 101))
+
+def _raw(avail_simplified):
+    """Wrap {room_type:{date:count}} into the scraper's raw shape."""
+    return {rt: {"total_available": d, "rooms": {}} for rt, d in avail_simplified.items()}
+
+
+# -- first contact: greeting + ask, no scrape -------------------------------
+
+def test_e2e_first_contact(server):
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, history=[])
+    _run(bs.process_incoming_message("Доброго дня, хочу до вас!", 301))
     assert server.state["scraped"] is False
     assert server.sent[0].startswith("Доброго дня! Вас вітає D&T Hotel")
     assert server.sent[-1] == templates.QUESTION_ALL_MISSING
 
 
-# -- Case 3 end-to-end: scrape runs, "Секундочку" precedes the quote --------
+# -- price quote: scrape, then a DETERMINISTIC total (the July-5 fix) --------
 
-def test_e2e_case3_scrape_and_quote(server):
-    history = [
-        {"id": 1, "message_type": "incoming", "content": "28-29 червня, 2 дорослих"},
-        {"id": 2, "message_type": "outgoing", "content": templates.PRICE_JUNE},
-    ]
-    quote = "Вартість номеру типу Стандарт +, для 2 осіб, на 1 ніч (28-29 червня), буде вартувати - 2400 грн."
+def test_e2e_price_quote_deterministic_total(server):
     bs = server.configure(
-        intent="ТАК",
-        reply=f"<THINK>1 будня ніч, вільно</THINK><REPLY>{quote}</REPLY>",
-        history=history,
-        availability={"Стандарт +": {"total_available": {"2026-06-28": 2}, "rooms": {}}},
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(),
+        availability=_raw({"Стандарт": {"2026-07-05": 3, "2026-07-06": 3}}),
     )
-    _run(bs.process_incoming_message("Давайте номер типу Стандарт +", 103))
+    _run(bs.process_incoming_message("Давайте Стандарт на 5-7 липня", 302))
     assert server.state["scraped"] is True
-    assert "Секундочку" in server.sent[0]      # scrape notice goes out first
-    assert server.sent[-1] == quote
-    # No greeting mid-dialogue:
-    assert not any(m.startswith("Доброго дня") for m in server.sent)
+    assert any("Секундочку" in m for m in server.sent)        # availability checked first
+    assert any("4400 грн" in m for m in server.sent)          # 2200*2 будні, NOT 2500
+    assert not any("2500" in m for m in server.sent)
 
 
-# -- Case 5 end-to-end: agreeing to a nearest-date search re-scrapes ---------
+# -- availability gating: sold out -> Polite Close, no price ----------------
 
-def test_e2e_case5_nearest_search_triggers_scrape(server):
+def test_e2e_sold_out_polite_close(server):
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(),
+        availability=_raw({"Стандарт": {"2026-07-05": 3, "2026-07-06": 0}}),  # 6th booked
+    )
+    _run(bs.process_incoming_message("Стандарт на 5-7 липня", 303))
+    assert any(templates.POLITE_CLOSE == m for m in server.sent)
+    assert not any("грн" in m for m in server.sent)           # never quoted a price
+
+
+# -- multi-room: per-room lines + Загальна вартість -------------------------
+
+def test_e2e_multiroom_total(server):
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": []},
+            {"room_type": "Напівлюкс", "checkin": "2026-07-05", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": [8]}]},
+        history=_bot_spoke(),
+        availability=_raw({"Стандарт": {"2026-07-05": 3, "2026-07-06": 3},
+                           "Напівлюкс": {"2026-07-05": 1, "2026-07-06": 1}}),
+    )
+    _run(bs.process_incoming_message("Хочемо два номери", 304))
+    full = "\n".join(server.sent)
+    assert "4400 грн" in full and "6000 грн" in full and "Загальна вартість: 10400 грн" in full
+
+
+# -- topic redirects (group/event, faq) -------------------------------------
+
+def test_e2e_group_event_redirect(server):
+    bs = server.configure(slots={"topic": "group_event", "rooms": []}, history=_bot_spoke())
+    _run(bs.process_incoming_message("нас 45, корпоратив", 305))
+    assert server.state["scraped"] is False
+    assert server.sent == [templates.LARGE_GROUPS_EVENTS]
+
+
+def test_e2e_large_group_override_beats_llm(server):
+    # Even when the extractor mislabels the last message, a 70-80 person inquiry
+    # earlier in the thread is deterministically redirected.
+    bs = server.configure(
+        slots={"topic": "fuzzy_dates", "rooms": []},
+        history=[{"id": 1, "message_type": "incoming", "content": "Липень на 70-80 чол на 6 днів"},
+                 {"id": 2, "message_type": "outgoing", "content": "вітаю"}])
+    _run(bs.process_incoming_message("Ще актуальні ці дати?", 311))
+    assert server.sent == [templates.LARGE_GROUPS_EVENTS]
+
+
+def test_e2e_faq_routes_to_template(server):
+    bs = server.configure(slots={"topic": "faq", "faq_template": "PETS", "rooms": []},
+                          history=_bot_spoke())
+    _run(bs.process_incoming_message("а з песиком можна?", 306))
+    assert server.sent == [templates.PETS]
+
+
+def test_e2e_booking_confirm_off_season_blocked(server):
+    # Confirming a May (off-season) stay must NOT yield payment details.
+    bs = server.configure(
+        slots={"topic": "booking_confirm", "rooms": [
+            {"room_type": None, "checkin": "2026-05-11", "checkout": "2026-05-13",
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("узгоджуємо 11-13 травня", 310))
+    assert server.sent == [templates.OFF_SEASON]
+    assert not any("IBAN" in m for m in server.sent)
+
+
+# -- spam ignored entirely; phone -> handoff (both before any LLM) ----------
+
+def test_e2e_spam_silent(server):
+    bs = server.configure(slots={"topic": "greeting", "rooms": []})
+    _run(bs.process_incoming_message("Створюю чат-ботів, є пробний тариф", 307))
+    assert server.sent == [] and server.prompts == []
+
+
+def test_e2e_phone_handoff(server):
+    bs = server.configure(slots={"topic": "greeting", "rooms": []})
+    _run(bs.process_incoming_message("Передзвоніть 0991234567", 308))
+    assert server.sent == [templates.PHONE_RECEIVED] and server.prompts == []
+
+
+# -- DRIP handling (directive 4): full fragmented history reaches the extractor
+
+def test_e2e_drip_history_is_passed_to_extractor(server):
     history = [
-        {"id": 1, "message_type": "incoming", "content": "Стандарт +"},
-        {"id": 2, "message_type": "outgoing",
-         "content": "На жаль, на ваші дати всі номери повністю заброньовані"},
+        {"id": 1, "message_type": "incoming", "content": "Привіт"},
+        {"id": 2, "message_type": "outgoing", "content": "Вітаємо! Які дати цікавлять?"},
+        {"id": 3, "message_type": "incoming", "content": "А є вільний стандарт?"},
+        {"id": 4, "message_type": "incoming", "content": "на 12 липня"},
     ]
     bs = server.configure(
-        intent="ТАК",
-        reply="<THINK>шукаю вперед</THINK><REPLY>" + templates.NEAREST_DATES + "</REPLY>",
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-12", "checkout": "2026-07-13",
+             "adults": 2, "children_ages": []}]},
         history=history,
-        availability=RAW_SOLD_OUT,
+        availability=_raw({"Стандарт": {"2026-07-12": 2}}),
     )
-    _run(bs.process_incoming_message("Так, підшукайте", 105))
-    assert server.state["scraped"] is True
+    _run(bs.process_incoming_message("2 дорослих", 309))
+    prompt = server.prompts[-1]
+    # all fragments are present so the extractor can consolidate them into one intent
+    for fragment in ["Привіт", "вільний стандарт", "12 липня", "2 дорослих"]:
+        assert fragment in prompt
 
 
-# -- Case 8 end-to-end: changing dates forces a re-scrape -------------------
-
-def test_e2e_case8_date_change_triggers_scrape(server):
-    history = [
-        {"id": 1, "message_type": "incoming", "content": "Стандарт"},
-        {"id": 2, "message_type": "outgoing", "content": "Вартість ... 2400 грн"},
-    ]
-    bs = server.configure(
-        intent="ТАК",
-        reply="<THINK>нові дати, перевіряю</THINK><REPLY>Перерахунок готовий.</REPLY>",
-        history=history,
-        availability={"Стандарт": {"total_available": {"2026-08-10": 0}, "rooms": {}}},
-    )
-    _run(bs.process_incoming_message("А якщо 10-15 серпня?", 108))
-    assert server.state["scraped"] is True
-
-
-# -- webhook routing: only incoming message_created events are processed -----
+# -- webhook routing: only incoming message_created is processed ------------
 
 def test_webhook_routing_schedules_only_incoming(server):
-    bs = server.configure(intent="НІ", reply="<REPLY>ok</REPLY>")
+    bs = server.configure(slots={"topic": "greeting", "rooms": []})
     from fastapi import BackgroundTasks
 
     class FakeRequest:
@@ -327,46 +343,8 @@ def test_webhook_routing_schedules_only_incoming(server):
         _run(bs.chatwoot_webhook(FakeRequest(payload), bg))
         return len(bg.tasks)
 
-    incoming = {"event": "message_created", "message_type": "incoming",
-                "content": "Привіт", "conversation": {"id": 1}}
-    echo = {"event": "message_created", "message_type": "outgoing",
-            "content": "Бот", "conversation": {"id": 1}}
-    assert schedules(incoming) == 1
-    assert schedules(echo) == 0
+    assert schedules({"event": "message_created", "message_type": "incoming",
+                      "content": "Привіт", "conversation": {"id": 1}}) == 1
+    assert schedules({"event": "message_created", "message_type": "outgoing",
+                      "content": "Бот", "conversation": {"id": 1}}) == 0
     assert schedules({"event": "conversation_updated"}) == 0
-
-
-# -- Case 15 e2e: B2B spam is ignored entirely (no reply, no LLM, no scrape) -
-
-def test_e2e_spam_is_ignored_no_reply(server):
-    bs = server.configure(intent="НІ", reply="<REPLY>x</REPLY>")
-    _run(bs.process_incoming_message("Створюю чат-ботів для готелів, є пробний тариф", 215))
-    assert server.sent == []            # nothing sent to Chatwoot
-    assert server.prompts == []         # LLM never called
-    assert server.state["scraped"] is False
-
-
-# -- phone handoff e2e: reply PHONE_RECEIVED and stop (no LLM) ---------------
-
-def test_e2e_phone_number_handoff(server):
-    bs = server.configure(intent="НІ", reply="<REPLY>x</REPLY>")
-    _run(bs.process_incoming_message("Передзвоніть мені 0959224876", 216))
-    assert server.sent == [templates.PHONE_RECEIVED]
-    assert server.prompts == []         # short-circuits before the LLM
-
-
-# -- sys_prompt enforces Ukrainian-only + exposes the new templates ---------
-
-def test_e2e_sys_prompt_enforces_ukrainian_and_new_templates(server):
-    bs = server.configure(
-        intent="НІ", reply="<REPLY>ok</REPLY>",
-        history=[{"id": 1, "message_type": "outgoing", "content": "вітаю"}],
-    )
-    _run(bs.process_incoming_message("Скажіть про чани та харчування", 217))
-    sys_prompts = [p for p in server.prompts if "системний алгоритм" in p]
-    assert sys_prompts, "sys_prompt was not generated"
-    sp = sys_prompts[0]
-    assert "ВИКЛЮЧНО УКРАЇНСЬКОЮ" in sp                    # strict-UA hard rule
-    assert "SAUNA_VATS" in sp and "FOOD_PRICES" in sp      # new FAQ templates wired in
-    assert "LARGE_GROUPS_EVENTS" in sp                     # groups/events branch present
-    assert "НЕМАЄ КОТЕДЖІВ" in sp                          # no-cottage guard (rule 1)

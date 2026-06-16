@@ -12,3 +12,6 @@ context.txt
 analyze_ig_export.py
 ig_analysis_summary.json
 new_user_cases_report.md
+stress_scenarios.json
+stress_test_live.py
+simulate_live_chat.py
