@@ -167,6 +167,36 @@ def contains_phone_number(text: str) -> bool:
     return False
 
 
+# --- payment hand-off & bot muting ------------------------------------------
+# The bot must NEVER auto-confirm a booking (it cannot verify a real transfer vs a
+# fake screenshot). A payment signal -> hand off to a human admin + tag + mute.
+ORDER_LABEL = "Замовлено"                 # Chatwoot label that mutes the bot
+MUTE_LABELS = [ORDER_LABEL]               # any of these means a human has taken over
+
+# Completed-action signals only — NOT the bare noun "оплата" (a client ASKING
+# "Яка оплата?" must not be mistaken for a submitted payment).
+PAYMENT_KEYWORDS = [
+    "оплатив", "оплатила", "сплатив", "сплатила", "оплачено",
+    "скинув", "скинула", "скидаю", "надіслав оплату", "відправив оплату",
+    "квитанц", "чек", "готово", "перерахував", "перерахувала", "переказав",
+    "переказала", "переказ", "скрін", "screenshot", "завдаток вніс", "аванс вніс",
+]
+
+
+def is_payment_intent(text: str, has_attachment: bool = False) -> bool:
+    """True when the client is submitting a payment — an attachment (screenshot)
+    or a payment keyword. Triggers the human hand-off (never an auto-confirmation)."""
+    if has_attachment:
+        return True
+    t = (text or "").lower()
+    return any(k in t for k in PAYMENT_KEYWORDS)
+
+
+def is_muted(labels) -> bool:
+    """True if a human admin has taken over this conversation (mute label present)."""
+    return any(lbl in (labels or []) for lbl in MUTE_LABELS)
+
+
 def prepend_greeting_if_needed(clean_message: str, bot_has_spoken: bool) -> str:
     """On the bot's very first message, guarantee the greeting + [SPLIT] prefix."""
     if not bot_has_spoken and GREETING_MARKER not in clean_message:

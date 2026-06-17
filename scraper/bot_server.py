@@ -67,6 +67,34 @@ def get_chatwoot_history(conversation_id: int):
         print(f"[-] Помилка історії: {e}")
     return []
 
+def get_conversation_labels(conversation_id: int):
+    """Return the list of Chatwoot labels on a conversation (empty on error)."""
+    url = f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/labels"
+    headers = {"api_access_token": CHATWOOT_TOKEN, "Content-Type": "application/json"}
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            return response.json().get("payload", []) or []
+    except Exception as e:
+        print(f"[-] Помилка читання міток: {e}")
+    return []
+
+def add_conversation_label(conversation_id: int, label: str):
+    """Add a label to a conversation (Chatwoot replaces the full set, so we union)."""
+    url = f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/labels"
+    headers = {"api_access_token": CHATWOOT_TOKEN, "Content-Type": "application/json"}
+    labels = get_conversation_labels(conversation_id)
+    if label not in labels:
+        labels = labels + [label]
+    try:
+        response = requests.post(url, json={"labels": labels}, headers=headers, timeout=5)
+        if response.status_code in (200, 201):
+            print(f"[->] Мітку '{label}' додано до конверсації {conversation_id}")
+        else:
+            print(f"[-] Chatwoot відхилив мітку! Статус: {response.status_code}")
+    except Exception as e:
+        print(f"[-] Помилка додавання мітки: {e}")
+
 async def get_hotel_data_cached(conversation_id: int):
     now = time.time()
     if conversation_id in AVAILABILITY_CACHE:
@@ -182,10 +210,27 @@ async def _deliver(conversation_id: int, text: str):
         await asyncio.sleep(1.5)
 
 
-async def process_incoming_message(user_message: str, conversation_id: int):
+async def process_incoming_message(user_message: str, conversation_id: int,
+                                   has_attachment: bool = False):
+    # 0) MUTE SWITCH: if a human admin has taken over the conversation (the
+    #    "Замовлено" label, or any mute label), the bot stays COMPLETELY silent —
+    #    no labels query beyond this, no LLM, no reply.
+    labels = await asyncio.to_thread(get_conversation_labels, conversation_id)
+    if bot_logic.is_muted(labels):
+        print(f"[i] Конверсація {conversation_id} під керуванням людини ({labels}); бот мовчить.")
+        return
+
     # B2B / реклама / спам -> повністю ігноруємо (НЕ відправляємо жодної відповіді).
     if bot_logic.is_spam(user_message):
         print(f"[!] Спам проігноровано: {user_message[:50]}")
+        return
+
+    # ОПЛАТА (скрін / квитанція / ключові слова) -> НЕ підтверджуємо бронь
+    # автоматично: передаємо людині-адміністратору, тегуємо конверсацію, замовкаємо.
+    if bot_logic.is_payment_intent(user_message, has_attachment):
+        print(f"[i] Виявлено оплату -> хендоф адміністратору, тег '{bot_logic.ORDER_LABEL}'")
+        await asyncio.to_thread(send_chatwoot_message, conversation_id, templates.PAYMENT_RECEIVED_HANDOFF)
+        await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.ORDER_LABEL)
         return
 
     # Клієнт залишив номер телефону -> передаємо менеджеру і зупиняємо діалог.
@@ -262,10 +307,13 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
     if payload.get("event") == "message_created" and payload.get("message_type") == "incoming":
         content = payload.get("content")
         conversation_id = payload.get("conversation", {}).get("id")
-        
-        if content and conversation_id:
-            background_tasks.add_task(process_incoming_message, content, conversation_id)
-            
+        # A payment screenshot may arrive as an image with NO text -> still process.
+        has_attachment = bool(payload.get("attachments"))
+
+        if conversation_id and (content or has_attachment):
+            background_tasks.add_task(process_incoming_message, content or "",
+                                      conversation_id, has_attachment)
+
     return {"status": "ok"}
 
 # Запусти код я не тестив ще)

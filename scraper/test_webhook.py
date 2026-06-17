@@ -136,6 +136,34 @@ def test_new_templates_content():
     assert "Стандарт +" in templates.SMOKING
 
 
+# -- payment hand-off & bot muting ------------------------------------------
+
+@pytest.mark.parametrize("text,attach,expected", [
+    ("Оплатив! Ось квитанція", False, True),
+    ("скинув гроші на картку", False, True),
+    ("готово", False, True),
+    ("оплата зроблена, чек нижче", False, True),
+    ("", True, True),                              # image / screenshot, no text
+    ("Доброго дня, є вільні номери?", False, False),
+    ("Стандарт на 5-7 липня для двох", False, False),
+])
+def test_is_payment_intent(text, attach, expected):
+    assert bot_logic.is_payment_intent(text, attach) is expected
+
+
+def test_is_muted():
+    assert bot_logic.is_muted([bot_logic.ORDER_LABEL]) is True
+    assert bot_logic.is_muted(["VIP", "Замовлено"]) is True
+    assert bot_logic.is_muted(["VIP"]) is False
+    assert bot_logic.is_muted([]) is False
+    assert bot_logic.is_muted(None) is False
+
+
+def test_payment_handoff_template():
+    t = templates.PAYMENT_RECEIVED_HANDOFF
+    assert "адміністратор" in t and "ПІБ" in t and "Instagram" in t
+
+
 # ===========================================================================
 # Layer B — live flow (skips unless FastAPI/google-genai available)
 # ===========================================================================
@@ -147,19 +175,24 @@ def server(monkeypatch):
     except Exception as exc:
         pytest.skip(f"bot_server unavailable here (needs container deps): {exc}")
 
-    sent = []      # messages sent to Chatwoot
-    prompts = []   # prompts handed to the (faked) extraction LLM
-    state = {"scraped": False}
+    sent = []           # messages sent to Chatwoot
+    prompts = []        # prompts handed to the (faked) extraction LLM
+    added_labels = []   # labels added to the conversation
+    state = {"scraped": False, "labels": []}
 
     monkeypatch.setattr(bot_server, "send_chatwoot_message",
                         lambda conv_id, text: sent.append(text))
+    monkeypatch.setattr(bot_server, "get_conversation_labels", lambda cid: state["labels"])
+    monkeypatch.setattr(bot_server, "add_conversation_label",
+                        lambda cid, label: added_labels.append(label))
 
     async def _fast_sleep(*_a, **_k):
         return None
     monkeypatch.setattr(bot_server.asyncio, "sleep", _fast_sleep)
     bot_server.AVAILABILITY_CACHE.clear()
 
-    def configure(slots=None, slots_text=None, history=None, availability=None):
+    def configure(slots=None, slots_text=None, history=None, availability=None, labels=None):
+        state["labels"] = labels or []
         text = slots_text if slots_text is not None else json.dumps(
             slots or {"topic": "greeting", "rooms": []})
 
@@ -175,7 +208,8 @@ def server(monkeypatch):
         monkeypatch.setattr(bot_server, "fetch_hotel_availability", fake_fetch)
         return bot_server
 
-    return SimpleNamespace(configure=configure, sent=sent, prompts=prompts, state=state)
+    return SimpleNamespace(configure=configure, sent=sent, prompts=prompts,
+                           added_labels=added_labels, state=state)
 
 
 def _run(coro):
@@ -295,6 +329,39 @@ def test_e2e_faq_routes_to_template(server):
     assert server.sent == [templates.PETS]
 
 
+# -- payment hand-off: reply + tag "Замовлено" + never confirm via LLM ------
+
+def test_e2e_payment_keyword_handoff_and_label(server):
+    bs = server.configure(slots={"topic": "greeting", "rooms": []})
+    _run(bs.process_incoming_message("Оплатив! Ось квитанція 🙂", 401))
+    assert server.sent == [templates.PAYMENT_RECEIVED_HANDOFF]
+    assert server.added_labels == [bot_logic.ORDER_LABEL]   # tagged "Замовлено"
+    assert server.prompts == []                             # LLM never triggered
+
+
+def test_e2e_payment_attachment_handoff(server):
+    # An image-only payment screenshot (empty text + attachment) hands off too.
+    bs = server.configure(slots={"topic": "greeting", "rooms": []})
+    _run(bs.process_incoming_message("", 402, True))
+    assert server.sent == [templates.PAYMENT_RECEIVED_HANDOFF]
+    assert server.added_labels == [bot_logic.ORDER_LABEL]
+
+
+# -- mute switch: a human-owned ("Замовлено") conversation is ignored -------
+
+def test_e2e_muted_conversation_is_ignored(server):
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": []}]},
+        labels=["Замовлено"])
+    _run(bs.process_incoming_message("Стандарт на 6-7 липня для двох", 403))
+    assert server.sent == []          # bot stays completely silent
+    assert server.prompts == []       # no LLM
+    assert server.added_labels == []  # no changes
+    assert server.state["scraped"] is False
+
+
 def test_e2e_booking_confirm_off_season_blocked(server):
     # Confirming a May (off-season) stay must NOT yield payment details.
     bs = server.configure(
@@ -366,3 +433,10 @@ def test_webhook_routing_schedules_only_incoming(server):
     assert schedules({"event": "message_created", "message_type": "outgoing",
                       "content": "Бот", "conversation": {"id": 1}}) == 0
     assert schedules({"event": "conversation_updated"}) == 0
+    # image-only payment screenshot (no text, but an attachment) is still processed
+    assert schedules({"event": "message_created", "message_type": "incoming",
+                      "content": None, "attachments": [{"id": 1}],
+                      "conversation": {"id": 1}}) == 1
+    # truly empty incoming (no text, no attachment) is ignored
+    assert schedules({"event": "message_created", "message_type": "incoming",
+                      "content": None, "conversation": {"id": 1}}) == 0
