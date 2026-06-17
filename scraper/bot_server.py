@@ -137,7 +137,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 Поверни ВИКЛЮЧНО JSON (без markdown, без пояснень) такої структури:
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting>",
-  "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "adults": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
+  "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "adults": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
   "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
 
@@ -162,6 +162,10 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - checkout = дата ВИЇЗДУ (остання ніч НЕ включається). "5-7 липня" => checkin 2026-07-05, checkout 2026-07-07.
 - Якщо дано дату заїзду + кількість ночей — обчисли checkout = заїзд + ночі.
 - Відносні дати ("завтра", "післязавтра", "на вихідних") рахуй від %%TODAY%%.
+- ТОЧНІ vs НЕЧІТКІ дати (ВАЖЛИВО):
+  • ТОЧНИЙ діапазон (конкретні числа заїзду+виїзду АБО дата+кількість ночей, напр. "з 22.06 по 02.07", "17-19 липня", "20.07 на 3 ночі") => заповни checkin/checkout, fuzzy_date=null, і topic="price_quote" (НІКОЛИ не "general_price").
+  • НЕЧІТКИЙ період ("початок серпня", "друга половина липня", "у серпні", "влітку", "кінець місяця", "після 6 серпня") => fuzzy_date="<текст періоду клієнта>", checkin=null, checkout=null.
+  • НЕ підставляй "перше число місяця" як checkin для нечітких періодів — став fuzzy_date.
 - adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" => 3; одна особа => 1.
 - children_ages — лише ВІДОМІ віки дітей (цілі числа). Якщо вік невідомий — НЕ вигадуй.
 - ВАЖЛИВО: якщо названо лише дорослих і про дітей НЕ згадано — це означає, що дітей НЕМАЄ: постав children_ages=[]. НЕ повертайся до питання про дітей, якщо кількість дорослих уже відома.
@@ -184,7 +188,6 @@ _SIMPLE_TOPIC_TEMPLATE = {
     "reject_dates": "POLITE_CLOSE",
     "booking_confirm": "BOOK_ROOM",
     "presentation": "PRESENTATION_ROOMS",
-    "fuzzy_dates": "FUZZY_DATES",
     "nearest_dates": "NEAREST_DATES",
 }
 
@@ -200,9 +203,14 @@ def route_simple_topic(slots: dict):
         return getattr(templates, _SIMPLE_TOPIC_TEMPLATE[topic])
     if topic == "faq":
         name = slots.get("faq_template")
-        if isinstance(name, str) and hasattr(templates, name):
-            return getattr(templates, name)
-        return templates.GENERAL_INFORMATION
+        reply = (getattr(templates, name)
+                 if isinstance(name, str) and hasattr(templates, name)
+                 else templates.GENERAL_INFORMATION)
+        # FAQ answered mid-booking (no exact dates yet) -> gently nudge for dates.
+        if slots.get("_faq_override") and not any(
+                r.get("checkin") and r.get("checkout") for r in slots.get("rooms", [])):
+            reply = reply + templates.FAQ_DATE_NUDGE
+        return reply
     return None  # price_quote / general_price / greeting -> booking path
 
 
@@ -286,23 +294,25 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         print(f"[-] Помилка екстракції: {e}")
         return
 
-    # DETERMINISTIC override: a 40+ group / event must always be redirected,
-    # regardless of what the LLM classified (the rule is too important to guess).
+    # DETERMINISTIC overrides (too important / too often mislabelled to leave to the LLM):
     if bot_logic.looks_like_large_group(f"{dialogue_history}\n{user_message}"):
         slots["topic"] = "group_event"
-    # "Де знаходиться готель?" is a top intent the LLM keeps mislabelling -> pin PLACE.
-    elif bot_logic.is_location_question(user_message):
-        slots["topic"] = "faq"
-        slots["faq_template"] = "PLACE"
+    else:
+        # FAQ ABSOLUTE PRIORITY: a clear FAQ (location/pets/food/transport/…) is
+        # answered immediately, overriding slot collection.
+        faq_tmpl = bot_logic.faq_override(user_message)
+        if faq_tmpl:
+            slots["topic"] = "faq"
+            slots["faq_template"] = faq_tmpl
+            slots["_faq_override"] = True
     print(f"[i] Slots: {slots}")
 
     # 2) DETERMINISTIC ROUTING — Python decides everything below.
     reply = route_simple_topic(slots)
     if reply is None:
         decision = dialogue_engine.plan(slots)
-        if decision["action"] == "quote":
-            # Fix 1 — correct ORDER on the first turn: greet FIRST, then the scrape
-            # notice, then the result. So greet BEFORE calling the scraper.
+        if decision["action"] in ("quote", "quote_all"):
+            # Greet FIRST on the first turn, then the scrape notice, then the result.
             if not bot_has_spoken:
                 await _deliver(conversation_id, bot_logic.GREETING)
                 bot_has_spoken = True
@@ -313,7 +323,10 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                                         "Вибачте, технічна затримка бази. Менеджер вже підключається.")
                 return
             simplified = bot_logic.build_simplified_availability(availability_data)
-            reply = dialogue_engine.finalize_quote(decision["rooms"], simplified)
+            if decision["action"] == "quote":
+                reply = dialogue_engine.finalize_quote(decision["rooms"], simplified)
+            else:  # quote_all — exact dates, no chosen room -> price every type
+                reply = dialogue_engine.finalize_quote_all(decision["spec"], simplified)
         else:
             reply = decision["reply"]
 

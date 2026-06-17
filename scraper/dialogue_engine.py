@@ -123,6 +123,11 @@ def build_quote_reply(priced_rooms: List[Dict]) -> str:
 
 # --- planning (slots -> decision) ------------------------------------------
 
+OFFERABLE_ROOMS = ["Стандарт", "Стандарт +", "Напівлюкс"]
+_ROOM_EMOJI = {"Стандарт": "🏔", "Стандарт +": "🌿", "Напівлюкс": "✨"}
+_OFFSEASON_WORDS = ["січ", "лют", "берез", "квіт", "трав", "верес", "жовт", "листопад", "груд"]
+
+
 def _has_dates(room: Dict) -> bool:
     return bool(room.get("checkin") and room.get("checkout"))
 
@@ -131,20 +136,10 @@ def _has_guests(room: Dict) -> bool:
     return (room.get("adults") or 0) >= 1 or bool(room.get("children_ages"))
 
 
-def _missing_dates_question(rooms: List[Dict]) -> str:
-    children = [a for r in rooms for a in (r.get("children_ages") or [])]
-    if children:
-        return (templates.QUESTION_MISSING_DATES_1_CHILD if len(children) == 1
-                else templates.QUESTION_MISSING_DATES_CHILDREN)
-    return templates.QUESTION_MISSING_DATES
-
-
-def _monthly_price(rooms: List[Dict]) -> str:
-    for r in rooms:
-        if r.get("checkin"):                      # a known month is enough
-            month = pricing_engine._as_date(r["checkin"]).month
-            return _MONTH_TEMPLATE.get(month, templates.OFF_SEASON)
-    return templates.QUESTION_MISSING_DATES
+def _fuzzy_offseason(fuzzy: str) -> bool:
+    """True if a fuzzy period clearly names an unpriced (non-summer) month."""
+    t = (fuzzy or "").lower()
+    return any(w in t for w in _OFFSEASON_WORDS)
 
 
 def has_off_season_dates(slots: Dict) -> bool:
@@ -159,46 +154,49 @@ def has_off_season_dates(slots: Dict) -> bool:
 def plan(slots: Dict) -> Dict:
     """Decide the booking-path reply from extracted slots WITHOUT touching the LLM.
 
-    Returns {"action": "reply", "reply": str} for everything that can be answered
-    immediately, or {"action": "quote", "rooms": [...]} when a live availability
-    check + price calculation is required.
+    Returns {"action": "reply", "reply": str}, {"action": "quote", "rooms": [...]}
+    (specific room(s) -> calendar check + price), or {"action": "quote_all",
+    "spec": {...}} (exact dates but no chosen room -> price every available type).
     """
     rooms = slots.get("rooms") or []
 
-    # 1) Off-season: a KNOWN check-in month that isn't priced (covers a bare
-    #    "ціни на жовтень" where only the month is given) -> we cannot quote.
+    # Off-season guard — an exact OR a clearly-named fuzzy month that isn't priced.
     for r in rooms:
         ci, co = r.get("checkin"), r.get("checkout")
         if ci and not pricing_engine.is_priced_month(ci):
             return {"action": "reply", "reply": templates.OFF_SEASON}
         if ci and co and not pricing_engine.stay_is_priced(ci, co):
             return {"action": "reply", "reply": templates.OFF_SEASON}
+    fuzzy = next((r.get("fuzzy_date") for r in rooms if r.get("fuzzy_date")), None)
+    if fuzzy and _fuzzy_offseason(fuzzy):
+        return {"action": "reply", "reply": templates.OFF_SEASON}
 
-    any_full = any(_has_dates(r) for r in rooms)            # both check-in & check-out
-    any_month = any(r.get("checkin") for r in rooms)        # at least a month is known
+    any_exact = any(_has_dates(r) for r in rooms)
     any_guests = any(_has_guests(r) for r in rooms)
-    any_room = any(r.get("room_type") for r in rooms)
 
-    # 2) Nothing useful at all.
-    if not any_month and not any_guests and not any_room:
-        return {"action": "reply", "reply": templates.QUESTION_ALL_MISSING}
+    # Fix 4: an EXACT date range + guests MUST hit the calendar (never a generic range).
+    if any_exact and any_guests:
+        dated = [r for r in rooms if _has_dates(r)]
+        chosen = [r for r in dated if r.get("room_type")]
+        if chosen:
+            return {"action": "quote", "rooms": chosen}            # specific room(s)
+        return {"action": "quote_all", "spec": dated[0]}           # price every type
 
-    # 3) A specific room + full dates + guests -> deterministic price quote.
-    bookable = [r for r in rooms if r.get("room_type") and _has_dates(r) and _has_guests(r)]
-    if bookable:
-        return {"action": "quote", "rooms": bookable}
+    # Exact dates but guests unknown -> ask ONLY for guests (Fix 1).
+    if any_exact and not any_guests:
+        return {"action": "reply", "reply": templates.ASK_GUESTS_ONLY}
 
-    # 4) Month + guests known (even without exact days) and no specific room ->
-    #    general monthly price (e.g. "ціни на серпень на двох" -> PRICE_AUGUST).
-    if any_month and any_guests:
-        return {"action": "reply", "reply": _monthly_price(rooms)}
+    # Fix 3: a fuzzy period (no exact dates) -> acknowledge it, ask for exact dates.
+    if fuzzy:
+        return {"action": "reply",
+                "reply": templates.ACKNOWLEDGE_FUZZY.replace("{fuzzy_date}", fuzzy)}
 
-    # 5) Otherwise ask for whatever is still missing.
-    if not any_month and not any_full:
-        return {"action": "reply", "reply": _missing_dates_question(rooms)}
-    if not any_guests:
-        return {"action": "reply", "reply": templates.QUESTION_MISSING_GUESTS}
-    return {"action": "reply", "reply": templates.QUESTION_MISSING_DATES}
+    # Fix 1: guests known but no dates at all -> ask ONLY for dates.
+    if any_guests:
+        return {"action": "reply", "reply": templates.ASK_DATES_ONLY}
+
+    # Nothing usable (or only a room type) -> the full first-contact question.
+    return {"action": "reply", "reply": templates.QUESTION_ALL_MISSING}
 
 
 # --- finalisation (availability gate -> price -> exact format) -------------
@@ -249,3 +247,39 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
         })
 
     return build_quote_reply(priced)
+
+
+def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE) -> str:
+    """Exact dates but no chosen room -> price EVERY available room type (Fix 4).
+
+    Skips sold-out / unpriced types; if nothing is free -> SOLD_OUT_NEAREST.
+    """
+    checkin, checkout = spec.get("checkin"), spec.get("checkout")
+    nights = pricing_engine.night_dates(checkin, checkout)
+    adults = spec.get("adults") or 0
+    children_ages = spec.get("children_ages") or []
+    if adults == 0 and not children_ages:
+        adults = 2
+    ubd = bool(spec.get("ubd"))
+
+    lines = []
+    for room_type in OFFERABLE_ROOMS:
+        if bot_logic.is_room_available(simplified_availability, room_type, nights) == "sold_out":
+            continue
+        try:
+            guests = pricing_engine.make_guests(adults=adults, children_ages=children_ages)
+            quote = engine.quote(room_type, checkin, checkout, guests)
+        except (pricing_engine.OffSeasonError, KeyError):
+            continue
+        price = pricing_engine.apply_military_discount(quote.total) if ubd else quote.total
+        lines.append(f"{_ROOM_EMOJI.get(room_type, '•')} {room_type} — {price} грн")
+
+    if not lines:
+        return templates.SOLD_OUT_NEAREST
+
+    header = (f"На дати {dates_phrase(checkin, checkout)} ({nights_phrase(len(nights))}) "
+              f"для {guests_phrase(adults, children_ages)} доступні такі номери:")
+    reply = header + "\n" + "\n".join(lines) + "\nЯкий тип номеру обираєте? 💙"
+    if ubd:
+        reply += "\n\n" + templates.MILITARY
+    return reply

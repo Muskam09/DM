@@ -170,6 +170,32 @@ def is_location_question(text: str) -> bool:
     return any(k in t for k in ["адрес", "локац", "на карті", "де ви є", "де ви знаход"])
 
 
+# FAQ intent must override slot-collection: a terse "собачка" / "харчування?" gets
+# answered immediately, not after rounds of "which dates?". Maps keywords -> template.
+_FAQ_OVERRIDE = [
+    (["соба", "песик", "пёс", "пекінес", "тварин", "кіт", "котик", "кота", "улюбленц"], "PETS"),
+    (["харчув", "сніданок", "сніданк", "їжа", "їсти", "поїсти", "меню", "обід", "годуєте", "перекус"], "FOOD_PRICES"),
+    (["сауна", "чани", "чан ", "баня", "лазн"], "SAUNA_VATS"),
+    (["трансфер", "парковк", "паркінг"], "TRANSFER_PARKING"),
+    (["добра", "доїх", "дістат", "як до вас", "залізниц", "потяг", "електричк"], "HOW_TO_GET_THERE"),
+    (["курит", "палит", "куріння", "паління"], "SMOKING"),
+    (["басейн"], "POOL"),
+]
+
+
+def faq_override(text: str):
+    """Return a fixed FAQ template name when the message is clearly one of the
+    priority FAQs (location/pets/food/transport/…), else None. Used to answer the
+    question immediately instead of continuing slot collection."""
+    if is_location_question(text):
+        return "PLACE"
+    t = (text or "").lower()
+    for keywords, template in _FAQ_OVERRIDE:
+        if any(k in t for k in keywords):
+            return template
+    return None
+
+
 # --- phone-number capture ---------------------------------------------------
 # A customer who leaves a phone number is handed to a human (reply PHONE_RECEIVED,
 # stop). Match a token with >= 9 digits (UA: 0XXXXXXXXX / +380XXXXXXXXX), which

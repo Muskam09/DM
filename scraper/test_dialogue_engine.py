@@ -57,18 +57,6 @@ def test_plan_all_missing_asks():
     assert out == {"action": "reply", "reply": templates.QUESTION_ALL_MISSING}
 
 
-def test_plan_missing_guests():
-    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06",
-                              "checkout": "2026-07-08", "adults": 0, "children_ages": []}]})
-    assert out["reply"] == templates.QUESTION_MISSING_GUESTS
-
-
-def test_plan_general_price_picks_month():
-    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06",
-                              "checkout": "2026-07-08", "adults": 2, "children_ages": []}]})
-    assert out["reply"] == templates.PRICE_JULY
-
-
 def test_has_off_season_dates():
     assert de.has_off_season_dates({"rooms": [{"checkin": "2026-05-11", "checkout": "2026-05-13"}]}) is True
     assert de.has_off_season_dates({"rooms": [{"checkin": "2026-07-05", "checkout": "2026-07-07"}]}) is False
@@ -81,32 +69,57 @@ def test_plan_off_season():
     assert out["reply"] == templates.OFF_SEASON
 
 
-def test_plan_month_only_off_season():
-    # "ціни на жовтень" -> only a month, no exact days -> still off-season.
-    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-10-01",
-                              "checkout": None, "adults": 0, "children_ages": []}]})
+def test_plan_fuzzy_off_season():
+    # "жовтень" (fuzzy) names an unpriced month -> OFF_SEASON.
+    out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "жовтень",
+                              "checkin": None, "checkout": None, "adults": 2, "children_ages": []}]})
     assert out["reply"] == templates.OFF_SEASON
 
 
-def test_plan_month_only_general_price():
-    # "ціни на серпень на двох" -> month + guests, no exact days -> monthly price.
-    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-08-01",
-                              "checkout": None, "adults": 2, "children_ages": []}]})
-    assert out["reply"] == templates.PRICE_AUGUST
+def test_plan_fuzzy_priced_month_acknowledges():
+    # Fix 3: "початок серпня" (fuzzy, priced) -> acknowledge + ask exact dates.
+    out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "початок серпня",
+                              "checkin": None, "checkout": None, "adults": 2, "children_ages": []}]})
+    assert "початок серпня" in out["reply"] and "точні дати" in out["reply"]
 
 
-def test_plan_complete_requests_quote():
+def test_plan_exact_dates_no_room_quotes_all():
+    # Fix 4: exact dates + guests, no chosen room -> price every type (quote_all).
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06",
+                              "checkout": "2026-07-08", "adults": 2, "children_ages": []}]})
+    assert out["action"] == "quote_all"
+
+
+def test_plan_exact_dates_with_room_quotes():
     out = de.plan({"rooms": [{"room_type": "Стандарт", "checkin": "2026-07-06",
                               "checkout": "2026-07-08", "adults": 2, "children_ages": []}]})
     assert out["action"] == "quote" and len(out["rooms"]) == 1
 
 
-def test_plan_guests_known_does_not_fall_back_to_all_missing():
-    # Fix 4: adults given (no children) -> ask only for dates, never QUESTION_ALL_MISSING.
+def test_plan_dates_only_asks_guests_only():
+    # Fix 1: exact dates but no guests -> ask ONLY for guests.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06",
+                              "checkout": "2026-07-08", "adults": 0, "children_ages": []}]})
+    assert out["reply"] == templates.ASK_GUESTS_ONLY
+
+
+def test_plan_guests_only_asks_dates_only():
+    # Fix 1: guests known, no dates -> ask ONLY for dates (not the monolith).
     out = de.plan({"rooms": [{"room_type": None, "checkin": None, "checkout": None,
                               "adults": 2, "children_ages": []}]})
+    assert out["reply"] == templates.ASK_DATES_ONLY
     assert out["reply"] != templates.QUESTION_ALL_MISSING
-    assert out["reply"] == templates.QUESTION_MISSING_DATES
+
+
+def test_finalize_quote_all_lists_available_types():
+    avail = {"Стандарт": {"2026-07-06": 3, "2026-07-07": 3},
+             "Стандарт +": {"2026-07-06": 3, "2026-07-07": 3},
+             "Напівлюкс": {"2026-07-06": 0, "2026-07-07": 0}}  # Напівлюкс sold out
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 2, "children_ages": []}, avail)
+    assert "Стандарт" in reply and "грн" in reply
+    assert "Напівлюкс" not in reply          # sold-out type skipped
+    assert "Який тип номеру обираєте" in reply
 
 
 # --- finalize_quote: pricing is deterministic (the July-5 bug fix) ----------

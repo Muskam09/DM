@@ -140,6 +140,20 @@ def test_is_location_question(text, expected):
     assert bot_logic.is_location_question(text) is expected
 
 
+@pytest.mark.parametrize("text,expected", [
+    ("а можна з собачкою?", "PETS"),
+    ("+ собачка", "PETS"),
+    ("а харчування у вас є?", "FOOD_PRICES"),
+    ("Як до вас добратися?", "HOW_TO_GET_THERE"),
+    ("Де саме знаходиться готель?", "PLACE"),
+    ("чи є сауна або чани?", "SAUNA_VATS"),
+    ("Стандарт на 5-7 липня для двох", None),
+    ("2 дорослих", None),
+])
+def test_faq_override(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
 def test_new_templates_content():
     assert "0673445220" in templates.LARGE_GROUPS_EVENTS
     assert "350" in templates.FOOD_PRICES and "1100" in templates.FOOD_PRICES
@@ -346,7 +360,9 @@ def test_e2e_faq_routes_to_template(server):
     bs = server.configure(slots={"topic": "faq", "faq_template": "PETS", "rooms": []},
                           history=_bot_spoke())
     _run(bs.process_incoming_message("а з песиком можна?", 306))
-    assert server.sent == [templates.PETS]
+    assert len(server.sent) == 1
+    assert server.sent[0].startswith(templates.PETS)
+    assert templates.FAQ_DATE_NUDGE in server.sent[0]   # FAQ answered + gentle date nudge
 
 
 def test_e2e_location_question_pinned_to_place(server):
@@ -355,7 +371,7 @@ def test_e2e_location_question_pinned_to_place(server):
         slots={"topic": "faq", "faq_template": "GENERAL_INFORMATION", "rooms": []},
         history=_bot_spoke())
     _run(bs.process_incoming_message("Де саме знаходиться готель?", 501))
-    assert server.sent == [templates.PLACE]
+    assert len(server.sent) == 1 and server.sent[0].startswith(templates.PLACE)
 
 
 def test_e2e_concurrent_drip_no_double_greeting(server):
