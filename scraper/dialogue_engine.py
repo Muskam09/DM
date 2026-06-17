@@ -92,25 +92,33 @@ def dates_phrase(checkin, checkout) -> str:
     return f"{ci.day} {_GEN_MONTHS[ci.month]} - {co.day} {_GEN_MONTHS[co.month]}"
 
 
-def quote_line(room_type, adults, children_ages, checkin, checkout, nights, price) -> str:
+def quote_line(room_type, adults, children_ages, checkin, checkout, nights, price,
+               ubd=False) -> str:
     """The single, rigid quote format mandated by the business."""
-    return (
+    line = (
         f"Вартість номеру типу {room_type}, для {guests_phrase(adults, children_ages)}, "
         f"на {nights_phrase(nights)} ({dates_phrase(checkin, checkout)}), "
         f"буде вартувати - {price} грн"
     )
+    if ubd:
+        line += " (з урахуванням знижки УБД -20%)"
+    return line
 
 
 def build_quote_reply(priced_rooms: List[Dict]) -> str:
     lines = [
         quote_line(r["room_type"], r["adults"], r["children_ages"],
-                   r["checkin"], r["checkout"], r["nights"], r["price"])
+                   r["checkin"], r["checkout"], r["nights"], r["price"], r.get("ubd", False))
         for r in priced_rooms
     ]
     if len(lines) == 1:
-        return lines[0] + "\nБажаєте забронювати? 💙"
-    total = sum(r["price"] for r in priced_rooms)
-    return "\n".join(lines) + f"\n\nЗагальна вартість: {total} грн\nБажаєте забронювати? 💙"
+        reply = lines[0] + "\nБажаєте забронювати? 💙"
+    else:
+        total = sum(r["price"] for r in priced_rooms)
+        reply = "\n".join(lines) + f"\n\nЗагальна вартість: {total} грн\nБажаєте забронювати? 💙"
+    if any(r.get("ubd") for r in priced_rooms):
+        reply += "\n\n" + templates.MILITARY
+    return reply
 
 
 # --- planning (slots -> decision) ------------------------------------------
@@ -230,10 +238,14 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
         except KeyError:
             return templates.PRESENTATION_ROOMS  # unknown room type -> present options
 
+        # УБД (combat-veteran) 20% discount, deterministic, per requested room.
+        ubd = bool(r.get("ubd"))
+        price = pricing_engine.apply_military_discount(quote.total) if ubd else quote.total
+
         priced.append({
             "room_type": quote.room_type, "adults": adults, "children_ages": children_ages,
             "checkin": checkin, "checkout": checkout, "nights": quote.nights,
-            "price": quote.total,
+            "price": price, "ubd": ubd,
         })
 
     return build_quote_reply(priced)

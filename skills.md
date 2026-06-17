@@ -61,10 +61,41 @@ room_rate(night) = одномісне_поселення  if exactly 1 paying gu
   (`додаткове_місце` 500 for the 3rd adult).
 * 2 adults + child 5, any room → child is free → just `вартість_кімнати × nights`.
 
-### 1.7 Other discounts (templates / pricing.json `правила_готелю`)
-* Military with УБД: **−20%** of the total.
-* These are stated in templates and applied on explicit request; the core
-  per-night engine above covers room + child/extra-place math.
+### 1.7 УБД (combat-veteran) discount — DETERMINISTIC
+* Strict **−20%** off a room's total: `pricing_engine.apply_military_discount(total)
+  = round(total × 0.8)`.
+* The extractor sets `ubd:true` per room; `dialogue_engine.finalize_quote` applies the
+  discount to the flagged room only ("знижка по УБД на один номер" → one room),
+  shows the discounted total + "(з урахуванням знижки УБД -20%)", and appends the
+  `MILITARY` template. Example: Стандарт July 6–8, 2 adults = 4400 → **3520** грн.
+
+## 1b. Deterministic guards & flow (NOT left to the LLM)
+
+`process_incoming_message` order: **mute → spam → payment → phone → extraction →
+large-group override → route**.
+* **Mute (`is_muted`):** conversation has the `Замовлено` label → bot stays silent
+  (a human admin owns it).
+* **Spam (`is_spam`):** B2B/ads → silent.
+* **Payment (`is_payment_intent`):** an attachment (screenshot) OR a completed-payment
+  keyword (`оплатив/скинув/квитанція/чек/готово/переказ…`; NOT the bare noun "оплата")
+  → send `PAYMENT_RECEIVED_HANDOFF`, add the `Замовлено` label, go silent. The bot
+  **never auto-confirms a booking**.
+* **Phone (`contains_phone_number`):** ≥9 digits → `PHONE_RECEIVED`, hand to manager.
+* **Large group (`looks_like_large_group`):** 40+ people / event keyword anywhere →
+  force `group_event` → `LARGE_GROUPS_EVENTS` redirect.
+
+### Availability gating (Cases 4 & 5)
+`finalize_quote` checks each requested room with `bot_logic.is_room_available`
+(`available` / `sold_out` / `unknown`). Sold out + other categories free →
+`ROOM_BOOKED`; fully booked → `SOLD_OUT_NEAREST`; a date outside the scrape window →
+`unknown` → quote proceeds (never block on missing data).
+
+### Drip consolidation
+Slots are merged across the WHOLE history; `topic`/`faq_template` follow the LAST
+question (except the large-group override). "двоє дорослих" → `adults=2,
+children_ages=[]` (no re-asking about kids); a known month + guests (even with no
+exact days) → monthly `PRICE_*` (or `OFF_SEASON` if unpriced), never the
+`QUESTION_ALL_MISSING` fallback once guests are known.
 
 ## 2. Parsing the hotel calendar JSON ("Шахівниця")
 

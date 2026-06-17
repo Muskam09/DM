@@ -185,3 +185,32 @@ def test_finalize_out_of_window_dates_quote_not_blocked():
         [{"room_type": "Стандарт", "checkin": "2026-08-10", "checkout": "2026-08-11",
           "adults": 2, "children_ages": []}], avail)
     assert "грн" in reply and reply != templates.POLITE_CLOSE
+
+
+# --- УБД (combat-veteran) 20% discount, deterministic ----------------------
+
+def test_apply_military_discount():
+    import pricing_engine
+    assert pricing_engine.apply_military_discount(4400) == 3520
+    assert pricing_engine.apply_military_discount(5000) == 4000
+
+
+def test_finalize_ubd_single_room_discount_and_text():
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+          "adults": 2, "children_ages": [], "ubd": True}], {})
+    assert "3520 грн" in reply            # 4400 * 0.8
+    assert "УБД" in reply
+    assert templates.MILITARY in reply    # UBD template appended
+
+
+def test_finalize_ubd_applies_only_to_flagged_room():
+    rooms = [
+        {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+         "adults": 2, "children_ages": [], "ubd": True},
+        {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+         "adults": 2, "children_ages": [], "ubd": False},
+    ]
+    reply = de.finalize_quote(rooms, {})
+    assert "3520 грн" in reply and "4400 грн" in reply
+    assert "Загальна вартість: 7920 грн" in reply

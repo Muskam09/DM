@@ -137,8 +137,8 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 Поверни ВИКЛЮЧНО JSON (без markdown, без пояснень) такої структури:
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting>",
-  "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "adults": <ціле>, "children_ages": [<вік>, ...]} ],
-  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
+  "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "adults": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
+  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
 
 Дати/гостей/номери збирай з УСІЄЇ історії. Якщо обрано topic=faq — faq_template обирай за ОСТАННІМ (поточним) питанням клієнта.
@@ -166,6 +166,9 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - children_ages — лише ВІДОМІ віки дітей (цілі числа). Якщо вік невідомий — НЕ вигадуй.
 - ВАЖЛИВО: якщо названо лише дорослих і про дітей НЕ згадано — це означає, що дітей НЕМАЄ: постав children_ages=[]. НЕ повертайся до питання про дітей, якщо кількість дорослих уже відома.
 - Якщо взагалі не вказано ні дорослих, ні дітей — постав adults=0, children_ages=[].
+- ubd — true ЛИШЕ якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових для ЦЬОГО номеру; інакше false. Якщо просять знижку УБД "на один номер" — постав ubd=true тільки для одного (першого) номеру.
+
+FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY.
 
 ІСТОРІЯ ДІАЛОГУ:
 %%HISTORY%%

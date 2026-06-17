@@ -56,6 +56,9 @@ PRICED_MONTHS = frozenset({6, 7, 8})
 # A single booking may span at most this many rooms (multi-room calculation).
 MAX_ROOMS_PER_BOOKING = 8
 
+# Combat-veteran (УБД) discount: a strict 20% off the room total.
+MILITARY_DISCOUNT_RATE = 0.20
+
 _DEFAULT_PRICING_PATH = os.path.join(os.path.dirname(__file__), "pricing.json")
 
 
@@ -141,6 +144,11 @@ def stay_is_priced(checkin, checkout) -> bool:
             return False
         night += timedelta(days=1)
     return True
+
+
+def apply_military_discount(total: int) -> int:
+    """Apply the strict 20% УБД (combat veteran) discount to a room total."""
+    return round(total * (1 - MILITARY_DISCOUNT_RATE))
 
 
 def night_dates(checkin, checkout) -> List[str]:

@@ -134,6 +134,7 @@ def test_new_templates_content():
     assert "instagram.com/stories/highlights" in templates.PETS
     assert "WiFi" in templates.ROOM_AMENITIES
     assert "Стандарт +" in templates.SMOKING
+    assert "Ворохта" in templates.HOW_TO_GET_THERE
 
 
 # -- payment hand-off & bot muting ------------------------------------------

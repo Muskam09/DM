@@ -69,10 +69,23 @@ incoming → spam? phone? (deterministic guards) → LLM EXTRACTION (returns JSO
    only on the deterministic **quote** path (`plan()` returns `action: "quote"`):
    a *specific* room + dates + guests, in a priced month. FAQ / greeting / group /
    off-season / fuzzy / thinking never scrape.
-1b. **Availability gating (mandatory):** `finalize_quote` checks the calendar FIRST;
-   if any requested room is sold out on the dates it returns the Polite Close and
-   **never quotes a price**. Large groups (40+) / events are redirected
-   deterministically (`bot_logic.looks_like_large_group`), not left to the LLM.
+1b. **Availability gating (mandatory):** `finalize_quote` checks the calendar FIRST
+   and **never quotes a sold-out room**. Sold out + other categories free →
+   `ROOM_BOOKED` (Case 4); fully booked → `SOLD_OUT_NEAREST` (Case 5). A date
+   **outside** the scrape window is `unknown` (not sold out) → quote proceeds.
+   Large groups (40+) / events are redirected deterministically
+   (`bot_logic.looks_like_large_group`), not left to the LLM.
+1c. **Guard order in `process_incoming_message`:** `mute (Замовлено label) → spam →
+   payment → phone → extraction → large-group override → route`. The first four are
+   deterministic short-circuits (no LLM).
+1d. **Payment = human hand-off, never auto-confirm.** A screenshot attachment OR a
+   completed-payment keyword (`bot_logic.is_payment_intent`) → send
+   `PAYMENT_RECEIVED_HANDOFF`, add the `Замовлено` label, go silent. If a
+   conversation already has `Замовлено` (`bot_logic.is_muted`) the bot ignores ALL
+   messages (a human owns it).
+1e. **УБД −20% (deterministic):** the extractor sets `ubd:true` per room; `finalize_quote`
+   applies `pricing_engine.apply_military_discount` (round(total×0.8)) to that room,
+   shows the discounted total, and appends the `MILITARY` template.
 2. **Nights = checkout − checkin.** The checkout day is never charged and never
    checked for availability.
 3. **Weekend nights = Friday & Saturday** (тариф "вихідні"); Sun–Thu = "будні".
