@@ -213,8 +213,28 @@ async def _deliver(conversation_id: int, text: str):
         await asyncio.sleep(1.5)
 
 
+_conv_locks: dict = {}
+
+
+def _lock_for(conversation_id):
+    lock = _conv_locks.get(conversation_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _conv_locks[conversation_id] = lock
+    return lock
+
+
 async def process_incoming_message(user_message: str, conversation_id: int,
                                    has_attachment: bool = False):
+    # Serialize messages WITHIN one conversation so drip fragments are handled in
+    # order and we never send a double greeting when two arrive near-simultaneously.
+    # Different conversations still run in parallel.
+    async with _lock_for(conversation_id):
+        await _handle_incoming(user_message, conversation_id, has_attachment)
+
+
+async def _handle_incoming(user_message: str, conversation_id: int,
+                           has_attachment: bool = False):
     # 0) MUTE SWITCH: if a human admin has taken over the conversation (the
     #    "Замовлено" label, or any mute label), the bot stays COMPLETELY silent —
     #    no labels query beyond this, no LLM, no reply.

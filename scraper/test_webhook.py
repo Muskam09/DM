@@ -203,8 +203,10 @@ def server(monkeypatch):
         return None
     monkeypatch.setattr(bot_server.asyncio, "sleep", _fast_sleep)
     bot_server.AVAILABILITY_CACHE.clear()
+    bot_server._conv_locks.clear()   # fresh per-conversation locks per test/event-loop
 
-    def configure(slots=None, slots_text=None, history=None, availability=None, labels=None):
+    def configure(slots=None, slots_text=None, history=None, availability=None,
+                  labels=None, dynamic_history=False):
         state["labels"] = labels or []
         text = slots_text if slots_text is not None else json.dumps(
             slots or {"topic": "greeting", "rooms": []})
@@ -213,7 +215,12 @@ def server(monkeypatch):
             prompts.append(prompt)
             return SimpleNamespace(text=text)
         monkeypatch.setattr(bot_server, "generate_with_retry", fake_llm)
-        monkeypatch.setattr(bot_server, "get_chatwoot_history", lambda conv_id: history or [])
+        if dynamic_history:
+            # mimic real Chatwoot: history reflects what the bot has already sent
+            monkeypatch.setattr(bot_server, "get_chatwoot_history", lambda conv_id: [
+                {"id": i, "message_type": "outgoing", "content": m} for i, m in enumerate(sent)])
+        else:
+            monkeypatch.setattr(bot_server, "get_chatwoot_history", lambda conv_id: history or [])
 
         async def fake_fetch():
             state["scraped"] = True
@@ -349,6 +356,21 @@ def test_e2e_location_question_pinned_to_place(server):
         history=_bot_spoke())
     _run(bs.process_incoming_message("Де саме знаходиться готель?", 501))
     assert server.sent == [templates.PLACE]
+
+
+def test_e2e_concurrent_drip_no_double_greeting(server):
+    # Two messages arriving together for the SAME conversation must be serialized
+    # by the per-conversation lock -> exactly one greeting (no drip race).
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, dynamic_history=True)
+
+    async def two_at_once():
+        await asyncio.gather(
+            bs.process_incoming_message("Привіт", 601),
+            bs.process_incoming_message("Ще раз", 601),
+        )
+    asyncio.run(two_at_once())
+    greetings = [m for m in server.sent if m.startswith("Доброго дня! Вас вітає")]
+    assert len(greetings) == 1
 
 
 # -- payment hand-off: reply + tag "Замовлено" + never confirm via LLM ------
