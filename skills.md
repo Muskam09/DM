@@ -90,12 +90,19 @@ large-group override → route**.
 `ROOM_BOOKED`; fully booked → `SOLD_OUT_NEAREST`; a date outside the scrape window →
 `unknown` → quote proceeds (never block on missing data).
 
-### Drip consolidation
+### Drip consolidation & UX routing
 Slots are merged across the WHOLE history; `topic`/`faq_template` follow the LAST
 question (except the large-group override). "двоє дорослих" → `adults=2,
-children_ages=[]` (no re-asking about kids); a known month + guests (even with no
-exact days) → monthly `PRICE_*` (or `OFF_SEASON` if unpriced), never the
-`QUESTION_ALL_MISSING` fallback once guests are known.
+children_ages=[]` (no re-asking about kids). Routing (`dialogue_engine.plan`):
+* Ask ONLY what's missing — guests known/dates missing → `ASK_DATES_ONLY`; dates
+  known/guests missing → `ASK_GUESTS_ONLY`; `QUESTION_ALL_MISSING` only on first contact.
+* **FAQ priority** (`bot_logic.faq_override`): a clear FAQ in the current message is
+  answered immediately (+ `FAQ_DATE_NUDGE` if booking incomplete).
+* **Fuzzy date** (`rooms[].fuzzy_date`, e.g. "початок серпня") → `ACKNOWLEDGE_FUZZY`
+  (echo + ask exact dates); fuzzy off-season month → `OFF_SEASON`.
+* **Exact dates + guests** = always a calendar quote: chosen room → `finalize_quote`;
+  no room → `finalize_quote_all` (prices every available type). The monthly `PRICE_*`
+  range templates are no longer used.
 
 ## 2. Parsing the hotel calendar JSON ("Шахівниця")
 
