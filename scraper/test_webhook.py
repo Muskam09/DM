@@ -128,6 +128,18 @@ def test_looks_like_large_group(text, expected):
     assert bot_logic.looks_like_large_group(text) is expected
 
 
+@pytest.mark.parametrize("text,expected", [
+    ("Де саме знаходиться готель?", True),
+    ("Де ви розташовані?", True),
+    ("Яка ваша адреса?", True),
+    ("Як до Вас добратися ?", False),     # directions -> HOW_TO_GET_THERE
+    ("Як доїхати потягом?", False),
+    ("Стандарт на 5-7 липня", False),
+])
+def test_is_location_question(text, expected):
+    assert bot_logic.is_location_question(text) is expected
+
+
 def test_new_templates_content():
     assert "0673445220" in templates.LARGE_GROUPS_EVENTS
     assert "350" in templates.FOOD_PRICES and "1100" in templates.FOOD_PRICES
@@ -328,6 +340,15 @@ def test_e2e_faq_routes_to_template(server):
                           history=_bot_spoke())
     _run(bs.process_incoming_message("а з песиком можна?", 306))
     assert server.sent == [templates.PETS]
+
+
+def test_e2e_location_question_pinned_to_place(server):
+    # Even if the extractor mislabels it GENERAL_INFORMATION, "де знаходиться" -> PLACE.
+    bs = server.configure(
+        slots={"topic": "faq", "faq_template": "GENERAL_INFORMATION", "rooms": []},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("Де саме знаходиться готель?", 501))
+    assert server.sent == [templates.PLACE]
 
 
 # -- payment hand-off: reply + tag "Замовлено" + never confirm via LLM ------

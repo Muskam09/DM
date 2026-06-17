@@ -270,6 +270,10 @@ async def process_incoming_message(user_message: str, conversation_id: int,
     # regardless of what the LLM classified (the rule is too important to guess).
     if bot_logic.looks_like_large_group(f"{dialogue_history}\n{user_message}"):
         slots["topic"] = "group_event"
+    # "Де знаходиться готель?" is a top intent the LLM keeps mislabelling -> pin PLACE.
+    elif bot_logic.is_location_question(user_message):
+        slots["topic"] = "faq"
+        slots["faq_template"] = "PLACE"
     print(f"[i] Slots: {slots}")
 
     # 2) DETERMINISTIC ROUTING — Python decides everything below.

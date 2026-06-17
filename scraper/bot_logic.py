@@ -153,6 +153,23 @@ def looks_like_large_group(text: str) -> bool:
     return any(w in t for w in _EVENT_WORDS)
 
 
+# Directions ("how to get there") -> HOW_TO_GET_THERE, NOT the location/maps answer.
+_DIRECTIONS_MARKERS = ["добра", "доїх", "дістат", "маршрут", "трансфер", "автобус",
+                       "потяг", "залізн", "як до вас", "звідки їхати"]
+
+
+def is_location_question(text: str) -> bool:
+    """True for "where is the hotel?" (-> PLACE / maps). A top intent the LLM keeps
+    mislabelling as GENERAL_INFORMATION, so we pin it deterministically. Excludes
+    "how do I get there?" (that is HOW_TO_GET_THERE)."""
+    t = (text or "").lower()
+    if any(k in t for k in _DIRECTIONS_MARKERS):
+        return False
+    if "де" in t and ("знаход" in t or "розташ" in t):
+        return True
+    return any(k in t for k in ["адрес", "локац", "на карті", "де ви є", "де ви знаход"])
+
+
 # --- phone-number capture ---------------------------------------------------
 # A customer who leaves a phone number is handed to a human (reply PHONE_RECEIVED,
 # stop). Match a token with >= 9 digits (UA: 0XXXXXXXXX / +380XXXXXXXXX), which
