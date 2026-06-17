@@ -220,7 +220,8 @@ def test_e2e_price_quote_deterministic_total(server):
 
 # -- availability gating: sold out -> Polite Close, no price ----------------
 
-def test_e2e_sold_out_polite_close(server):
+def test_e2e_sold_out_offers_nearest_dates(server):
+    # Fully booked -> offer nearest dates (Case 5), NOT instant close, NOT a price.
     bs = server.configure(
         slots={"topic": "price_quote", "rooms": [
             {"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
@@ -229,8 +230,24 @@ def test_e2e_sold_out_polite_close(server):
         availability=_raw({"Стандарт": {"2026-07-05": 3, "2026-07-06": 0}}),  # 6th booked
     )
     _run(bs.process_incoming_message("Стандарт на 5-7 липня", 303))
-    assert any(templates.POLITE_CLOSE == m for m in server.sent)
+    assert any(templates.SOLD_OUT_NEAREST == m for m in server.sent)
+    assert not any(templates.POLITE_CLOSE == m for m in server.sent)
     assert not any("грн" in m for m in server.sent)           # never quoted a price
+
+
+def test_e2e_greeting_then_wait_then_result_order(server):
+    # Fix 1: first turn order must be Greeting -> "Секундочку…" -> result.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": []}]},
+        history=[],  # first turn
+        availability=_raw({"Стандарт": {"2026-07-06": 3}}),
+    )
+    _run(bs.process_incoming_message("Стандарт на 6-7 липня для двох", 312))
+    assert server.sent[0].startswith("Доброго дня! Вас вітає D&T Hotel")
+    assert "Секундочку" in server.sent[1]
+    assert "грн" in server.sent[2]
 
 
 # -- multi-room: per-room lines + Загальна вартість -------------------------

@@ -209,7 +209,14 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
 
         status = bot_logic.is_room_available(simplified_availability, room_type, nights)
         if status == "sold_out":
-            return templates.POLITE_CLOSE
+            # Case 4: other room types are still free on these dates -> offer them.
+            # Case 5: nothing free at all -> offer to find the nearest free dates.
+            free = bot_logic.free_room_types(simplified_availability, nights)
+            if free:
+                return (templates.ROOM_BOOKED
+                        .replace("{тип номеру}", room_type)
+                        .replace("{вільні_номери}", ", ".join(free)))
+            return templates.SOLD_OUT_NEAREST
 
         adults = r.get("adults") or 0
         children_ages = r.get("children_ages") or []

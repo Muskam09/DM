@@ -101,6 +101,14 @@ def test_plan_complete_requests_quote():
     assert out["action"] == "quote" and len(out["rooms"]) == 1
 
 
+def test_plan_guests_known_does_not_fall_back_to_all_missing():
+    # Fix 4: adults given (no children) -> ask only for dates, never QUESTION_ALL_MISSING.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": None, "checkout": None,
+                              "adults": 2, "children_ages": []}]})
+    assert out["reply"] != templates.QUESTION_ALL_MISSING
+    assert out["reply"] == templates.QUESTION_MISSING_DATES
+
+
 # --- finalize_quote: pricing is deterministic (the July-5 bug fix) ----------
 
 AVAIL_OPEN = {  # everything free on the relevant July nights
@@ -141,24 +149,25 @@ def test_finalize_multi_room_with_total():
 
 # --- AVAILABILITY GATING (directive 2) -------------------------------------
 
-def test_finalize_sold_out_returns_polite_close():
-    avail = {"Стандарт": {"2026-07-05": 3, "2026-07-06": 0}}  # 6th is booked
+def test_finalize_full_sold_out_offers_nearest_dates():
+    # Case 5: only room is fully booked on a night -> offer nearest dates (NOT close).
+    avail = {"Стандарт": {"2026-07-05": 3, "2026-07-06": 0}}
     reply = de.finalize_quote(
         [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
           "adults": 2, "children_ages": []}], avail)
-    assert reply == templates.POLITE_CLOSE
+    assert reply == templates.SOLD_OUT_NEAREST
+    assert reply != templates.POLITE_CLOSE
 
 
-def test_finalize_multiroom_one_sold_out_blocks_whole_quote():
-    rooms = [
-        {"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
-         "adults": 2, "children_ages": []},
-        {"room_type": "Напівлюкс", "checkin": "2026-07-05", "checkout": "2026-07-07",
-         "adults": 2, "children_ages": []},
-    ]
-    avail = {"Стандарт": {"2026-07-05": 3, "2026-07-06": 3},
-             "Напівлюкс": {"2026-07-05": 0, "2026-07-06": 0}}
-    assert de.finalize_quote(rooms, avail) == templates.POLITE_CLOSE
+def test_finalize_partial_overbooking_offers_other_rooms():
+    # Case 4: chosen room is full but another category is free -> ROOM_BOOKED.
+    avail = {"Стандарт": {"2026-07-05": 0, "2026-07-06": 0},
+             "Напівлюкс": {"2026-07-05": 2, "2026-07-06": 2}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+          "adults": 2, "children_ages": []}], avail)
+    assert "Напівлюкс" in reply and "заброньовані" in reply
+    assert reply != templates.SOLD_OUT_NEAREST
 
 
 def test_finalize_unknown_room_in_availability_still_quotes():

@@ -134,8 +134,10 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - checkout = дата ВИЇЗДУ (остання ніч НЕ включається). "5-7 липня" => checkin 2026-07-05, checkout 2026-07-07.
 - Якщо дано дату заїзду + кількість ночей — обчисли checkout = заїзд + ночі.
 - Відносні дати ("завтра", "післязавтра", "на вихідних") рахуй від %%TODAY%%.
-- children_ages — лише відомі віки дітей (цілі числа). Якщо вік невідомий — НЕ вигадуй.
-- adults — кількість дорослих (ціле). Якщо не вказано і немає дітей — постав 0.
+- adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" => 3; одна особа => 1.
+- children_ages — лише ВІДОМІ віки дітей (цілі числа). Якщо вік невідомий — НЕ вигадуй.
+- ВАЖЛИВО: якщо названо лише дорослих і про дітей НЕ згадано — це означає, що дітей НЕМАЄ: постав children_ages=[]. НЕ повертайся до питання про дітей, якщо кількість дорослих уже відома.
+- Якщо взагалі не вказано ні дорослих, ні дітей — постав adults=0, children_ages=[].
 
 ІСТОРІЯ ДІАЛОГУ:
 %%HISTORY%%
@@ -171,6 +173,13 @@ def route_simple_topic(slots: dict):
             return getattr(templates, name)
         return templates.GENERAL_INFORMATION
     return None  # price_quote / general_price / greeting -> booking path
+
+
+async def _deliver(conversation_id: int, text: str):
+    """Send `text` to Chatwoot, split on [SPLIT], with a human-like 1.5s pause."""
+    for msg in bot_logic.split_messages(text):
+        await asyncio.to_thread(send_chatwoot_message, conversation_id, msg)
+        await asyncio.sleep(1.5)
 
 
 async def process_incoming_message(user_message: str, conversation_id: int):
@@ -220,7 +229,12 @@ async def process_incoming_message(user_message: str, conversation_id: int):
     if reply is None:
         decision = dialogue_engine.plan(slots)
         if decision["action"] == "quote":
-            # AVAILABILITY GATING: check the calendar BEFORE pricing.
+            # Fix 1 — correct ORDER on the first turn: greet FIRST, then the scrape
+            # notice, then the result. So greet BEFORE calling the scraper.
+            if not bot_has_spoken:
+                await _deliver(conversation_id, bot_logic.GREETING)
+                bot_has_spoken = True
+            # AVAILABILITY GATING: check the calendar BEFORE pricing (sends "Секундочку…").
             availability_data = await get_hotel_data_cached(conversation_id)
             if not availability_data:
                 await asyncio.to_thread(send_chatwoot_message, conversation_id,
@@ -234,9 +248,7 @@ async def process_incoming_message(user_message: str, conversation_id: int):
     # 3) SEND — replies are UA templates / Python-formatted text by construction.
     try:
         reply = bot_logic.prepend_greeting_if_needed(reply, bot_has_spoken)
-        for msg in bot_logic.split_messages(reply):
-            await asyncio.to_thread(send_chatwoot_message, conversation_id, msg)
-            await asyncio.sleep(1.5)
+        await _deliver(conversation_id, reply)
     except Exception as e:
         print(f"[-] Помилка надсилання: {e}")
 
