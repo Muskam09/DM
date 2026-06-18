@@ -15,9 +15,10 @@ Pure: stdlib + templates + pricing_engine + bot_logic (no FastAPI / google-genai
 """
 from __future__ import annotations
 
+import calendar
 import json
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Dict, List, Optional
 
 import bot_logic
@@ -128,6 +129,51 @@ OFFERABLE_ROOMS = ["Стандарт", "Стандарт +", "Напівлюкс
 _ROOM_EMOJI = {"Стандарт": "🏔", "Стандарт +": "🌿", "Напівлюкс": "✨"}
 _OFFSEASON_WORDS = ["січ", "лют", "берез", "квіт", "трав", "верес", "жовт", "листопад", "груд"]
 
+# Default scan year for fuzzy periods (bookings are 2026; only summer is priced).
+_FUZZY_YEAR = 2026
+# Longest stems first so "серпн" wins before "серп", etc.
+_PRICED_MONTH_STEMS = [("червн", 6), ("черв", 6), ("липн", 7), ("лип", 7),
+                       ("серпн", 8), ("серп", 8)]
+
+
+def _fuzzy_month(text: str) -> Optional[int]:
+    for stem, month in _PRICED_MONTH_STEMS:
+        if stem in text:
+            return month
+    return None
+
+
+def fuzzy_period_range(fuzzy: str, year: int = _FUZZY_YEAR):
+    """Map a fuzzy Ukrainian period to an inclusive ('YYYY-MM-DD', 'YYYY-MM-DD')
+    window so the proactive scan (Fix 1) stays inside the month/part the client
+    actually named ("початок серпня" -> 1–10 Aug, "друга половина липня" -> 16–31 Jul).
+
+    Returns None when no priced month can be identified (scan left unconstrained).
+    """
+    t = (fuzzy or "").lower()
+    month = _fuzzy_month(t)
+    if not month:
+        return None
+    last = calendar.monthrange(year, month)[1]
+    start_day, end_day = 1, last
+    if "перш" in t and "половин" in t:
+        start_day, end_day = 1, 15
+    elif "друг" in t and "половин" in t:
+        start_day, end_day = 16, last
+    elif "початок" in t or "на початку" in t or "початку" in t:
+        start_day, end_day = 1, 10
+    elif "середин" in t:
+        start_day, end_day = 11, 20
+    elif "кінец" in t or "кінці" in t or "наприкінці" in t:
+        start_day, end_day = max(1, last - 10), last
+    m_after = re.search(r"післ\w*\s*(\d{1,2})", t)   # "після 6 серпня" -> from the 6th
+    if m_after:
+        start_day = max(start_day, min(int(m_after.group(1)), last))
+    if start_day > end_day:
+        start_day, end_day = 1, last
+    return (date(year, month, start_day).isoformat(),
+            date(year, month, end_day).isoformat())
+
 
 def _has_dates(room: Dict) -> bool:
     return bool(room.get("checkin") and room.get("checkout"))
@@ -179,16 +225,10 @@ def find_nearest_window(availability, room_type, after, nights, room_count=1, ho
     return None
 
 
-def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
-    """A3: scan the calendar for continuous free stretches (>= the requested nights)
-    and propose up to `count` of them; NEAREST_NONE if nothing fits."""
-    room = spec.get("room_type") or OFFERABLE_ROOMS[0]
-    room_count = spec.get("room_count") or 1
-    min_nights = spec.get("nights") or 3
-    key = bot_logic.match_availability_key(availability, room)
-    avail = (availability.get(key) or {}) if key else {}
+def _free_windows(avail: Dict, dates: List[str], min_nights: int, room_count: int):
+    """Maximal continuous free stretches (>= min_nights) within `dates` (sorted)."""
     windows, run, prev = [], [], None
-    for d in sorted(avail.keys()):
+    for d in dates:
         if avail.get(d, 0) < room_count:
             if len(run) >= min_nights:
                 windows.append((run[0], run[-1]))
@@ -203,11 +243,40 @@ def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
         prev = cur
     if len(run) >= min_nights:
         windows.append((run[0], run[-1]))
+    return windows
+
+
+def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
+    """Fix 1 — proactive exploratory scan. Client gave a fuzzy period + guests, so
+    we scan the calendar WITHIN that period for continuous free stretches and offer
+    real windows (never bounce back asking for exact dates).
+
+    Unknown nights -> default to 2-night blocks. If nothing is free inside the named
+    period, fall back to scanning the whole visible window forward (never give up,
+    Fix 2); only NEAREST_NONE when the entire visible calendar is full.
+    """
+    room = spec.get("room_type") or OFFERABLE_ROOMS[0]
+    room_count = spec.get("room_count") or 1
+    min_nights = spec.get("nights") or 2     # Fix 1: default 2–3-night blocks
+    fuzzy = spec.get("fuzzy_date") or ""
+    key = bot_logic.match_availability_key(availability, room)
+    avail = (availability.get(key) or {}) if key else {}
+
+    period = fuzzy_period_range(fuzzy)
+    in_period = sorted(d for d in avail.keys()
+                       if period is None or period[0] <= d <= period[1])
+    windows = _free_windows(avail, in_period, min_nights, room_count)
+    if not windows and period is not None:
+        # Named period is full / out of the visible window -> scan everything forward.
+        windows = _free_windows(avail, sorted(avail.keys()), min_nights, room_count)
     windows = windows[:count]
     if not windows:
         return templates.NEAREST_NONE
     parts = [dates_phrase(w[0], w[1]) for w in windows]
-    return templates.PROPOSE_WINDOWS.replace("{вікна}", ", або ".join(parts))
+    period_label = fuzzy if fuzzy else "найближчий період"
+    return (templates.PROPOSE_WINDOWS
+            .replace("{fuzzy_date}", period_label)
+            .replace("{found_dates}", ", або ".join(parts)))
 
 
 def plan(slots: Dict) -> Dict:
@@ -253,18 +322,21 @@ def plan(slots: Dict) -> Dict:
 
     # No exact dates, guests known.
     if any_guests:
-        if ages_missing:   # Fix 2: never scan with unknown child ages -> ask ages first.
+        nights = max((_nights(r) or 0 for r in rooms), default=0)
+        if fuzzy:
+            # Fix 1: guests + a fuzzy period -> PROACTIVELY scan that period NOW. Never
+            # bounce back asking for exact dates. Unknown nights -> the scan defaults to
+            # 2–3-night blocks (propose_windows). If a child's age is still missing, ask
+            # ONLY the age (not dates) — dates come from the proposed windows.
+            if ages_missing:
+                return {"action": "reply", "reply": templates.QUESTION_MISSING_AGE}
+            fuzzy_room = next((r for r in rooms if r.get("fuzzy_date")), rooms[0])
+            spec = {**fuzzy_room, "nights": nights or 0, "fuzzy_date": fuzzy}
+            return {"action": "explore", "spec": spec}
+        if ages_missing:   # No period to scan -> we genuinely need both dates AND ages.
             return {"action": "reply", "reply":
                     (templates.QUESTION_MISSING_DATES_1_CHILD if cc == 1
                      else templates.QUESTION_MISSING_DATES_CHILDREN)}
-        nights = max((_nights(r) or 0 for r in rooms), default=0)
-        if fuzzy:
-            # A3 proactive scan ONLY if we know how many nights (Fix 2). Otherwise
-            # acknowledge the period once and ask for exact dates (which give nights).
-            if nights:
-                return {"action": "explore", "spec": {**rooms[0], "nights": nights}}
-            return {"action": "reply",
-                    "reply": templates.ACKNOWLEDGE_FUZZY.replace("{fuzzy_date}", fuzzy)}
         return {"action": "reply", "reply": templates.QUESTION_ONLY_DATES}   # A1: dates only
 
     # No guests. A fuzzy period -> acknowledge once; else the full first-contact question.
@@ -272,6 +344,28 @@ def plan(slots: Dict) -> Dict:
         return {"action": "reply",
                 "reply": templates.ACKNOWLEDGE_FUZZY.replace("{fuzzy_date}", fuzzy)}
     return {"action": "reply", "reply": templates.QUESTION_ALL_MISSING}
+
+
+def faq_followup(slots: Dict) -> str:
+    """Fix 3 — what to append after answering an FAQ mid-dialogue, WITHOUT wiping
+    the booking state already collected.
+
+    * nothing gathered yet            -> a gentle "which dates?" nudge;
+    * partial booking (some slots)    -> ask ONLY the still-missing piece (never the
+                                         monolithic all-missing question, never re-ask
+                                         info the client already gave);
+    * enough info to price            -> offer to continue (no surprise re-scrape).
+    """
+    rooms = slots.get("rooms") or []
+    if not bot_logic.has_booking_context({"rooms": rooms}):
+        return templates.FAQ_DATE_NUDGE
+    decision = plan(slots)
+    if decision.get("action") == "reply":
+        q = decision.get("reply", "")
+        # Never dump the first-contact monolith or off-season pitch right after an FAQ.
+        if q and q not in (templates.QUESTION_ALL_MISSING, templates.OFF_SEASON):
+            return "\n\n" + q
+    return templates.FAQ_CONTINUE_NUDGE
 
 
 # --- finalisation (availability gate -> price -> exact format) -------------

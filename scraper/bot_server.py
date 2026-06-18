@@ -136,12 +136,13 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 
 Поверни ВИКЛЮЧНО JSON (без markdown, без пояснень) такої структури:
 {
-  "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting>",
+  "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting | unknown>",
   "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "nights": <ціле|null>, "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
   "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
 
 Дати/гостей/номери збирай з УСІЄЇ історії. Якщо обрано topic=faq — faq_template обирай за ОСТАННІМ (поточним) питанням клієнта.
+ВАЖЛИВО (анти-амнезія): навіть якщо topic=faq, ОБОВ'ЯЗКОВО заповни rooms[] усіма вже відомими даними бронювання (дати, гості, ночі, номер, нечіткий період) з УСІЄЇ історії. Відповідь на FAQ НЕ повинна стирати раніше надані клієнтом дані.
 
 Значення topic:
 - group_event (НАЙВИЩИЙ ПРІОРИТЕТ): якщо у БУДЬ-ЯКОМУ повідомленні (навіть ранньому) згадано 40+ осіб / велику групу / табір / тур / спортивні збори / весілля / банкет / корпоратив / захід — ЗАВЖДИ став topic=group_event, незалежно від того, про що останнє повідомлення.
@@ -154,7 +155,8 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - booking_confirm: ТІЛЬКИ якщо клієнт погоджується бронювати ПІСЛЯ озвученої ціни ("так, бронюю", "давайте оформлюємо"). "Хочу забронювати" / "вільні дати для бронювання" / "забронювати номер" БЕЗ попередньої ціни — це НЕ booking_confirm (це початок збору даних: greeting/price_quote).
 - fuzzy_dates: згадує період БЕЗ конкретних дат ("на літо", "десь у серпні").
 - nearest_dates: погоджується пошукати найближчі вільні дати після відмови.
-- greeting: привітання / немає корисних даних / незрозуміло.
+- greeting: привітання / клієнт хоче бронювати чи питати про готель, але ще не дав даних.
+- unknown: повідомлення ВЗАГАЛІ не стосується готелю, бронювання чи FAQ і незрозуміле (НЕ привітання, НЕ бронювання, НЕ питання про готель). Став РІДКО — лише коли жоден інший topic не підходить.
 
 Правила заповнення rooms:
 - Для general_price (є дати+гості, без номеру) додай ОДИН об'єкт з room_type=null.
@@ -162,6 +164,15 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - checkout = дата ВИЇЗДУ (остання ніч НЕ включається). "5-7 липня" => checkin 2026-07-05, checkout 2026-07-07.
 - Якщо дано дату заїзду + кількість ночей — обчисли checkout = заїзд + ночі.
 - Відносні дати ("завтра", "післязавтра", "на вихідних") рахуй від %%TODAY%%.
+- ВІДНОСНІ ДНІ ТИЖНЯ → ТОЧНІ ДАТИ (ОБОВ'ЯЗКОВО): якщо клієнт називає день/дні тижня
+  ("п'ятниця", "субота", "неділя", "понеділок", "із суботи на неділю", "виїзд у неділю")
+  і є будь-який орієнтир часу (місяць, діапазон чисел типу "23-27", "після N", "наступного
+  тижня", або %%TODAY%%) — РОЗРАХУЙ конкретні дати YYYY-MM-DD у 2026 році і заповни
+  checkin/checkout. НЕ лишай рядком, НЕ став fuzzy_date, НЕ перепитуй.
+  • "п'ятниця, виїзд у неділю (після 23-27 червня)" => 26 червня 2026 — п'ятниця,
+    28 червня — неділя => checkin 2026-06-26, checkout 2026-06-28.
+  • "із суботи на неділю в липні" => найближча Сб→Нд у липні 2026 (заїзд Сб, виїзд Нд).
+  • "заїзд у п'ятницю на 2 ночі в серпні" => обери п'ятницю серпня і додай 2 ночі.
 - ТОЧНІ vs НЕЧІТКІ дати (ВАЖЛИВО):
   • ТОЧНИЙ діапазон (конкретні числа заїзду+виїзду АБО дата+кількість ночей, напр. "з 22.06 по 02.07", "17-19 липня", "20.07 на 3 ночі") => заповни checkin/checkout, fuzzy_date=null, і topic="price_quote" (НІКОЛИ не "general_price"). Слова "орієнтовно"/"приблизно"/"десь" ПЕРЕД конкретними числами НЕ роблять дати нечіткими ("орієнтовно 2-7 липня" = ТОЧНІ дати 2026-07-02..2026-07-07).
   • НЕЧІТКИЙ період ("початок серпня", "друга половина липня", "у серпні", "влітку", "кінець місяця", "після 6 серпня") => fuzzy_date="<текст періоду клієнта>", checkin=null, checkout=null.
@@ -207,10 +218,11 @@ def route_simple_topic(slots: dict):
         reply = (getattr(templates, name)
                  if isinstance(name, str) and hasattr(templates, name)
                  else templates.GENERAL_INFORMATION)
-        # FAQ answered mid-booking (no exact dates yet) -> gently nudge for dates.
-        if slots.get("_faq_override") and not any(
-                r.get("checkin") and r.get("checkout") for r in slots.get("rooms", [])):
-            reply = reply + templates.FAQ_DATE_NUDGE
+        # Fix 3: an FAQ answered mid-booking must NOT wipe the gathered state. Append a
+        # state-aware follow-up that asks ONLY what's still missing (never the all-missing
+        # monolith, never info the client already gave).
+        if slots.get("_faq_override") or bot_logic.has_booking_context(slots):
+            reply = reply + dialogue_engine.faq_followup(slots)
         return reply
     return None  # price_quote / general_price / greeting -> booking path
 
@@ -323,6 +335,15 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             slots["faq_template"] = faq_tmpl
             slots["_faq_override"] = True
     print(f"[i] Slots: {slots}")
+
+    # Fix 2: a COMPLETELY unrecognized intent is the only manager hand-off (date
+    # searches never hand off). Reply once, tag the conversation Instagram, stop.
+    if slots.get("topic") == "unknown":
+        print(f"[i] Невпізнаний намір -> менеджер, тег '{bot_logic.INSTAGRAM_LABEL}'")
+        if not _superseded(conversation_id, seq):
+            await _deliver(conversation_id, templates.MANAGER_HANDOFF)
+            await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
+        return
 
     # 2) DETERMINISTIC ROUTING — Python decides everything below.
     reply = route_simple_topic(slots)

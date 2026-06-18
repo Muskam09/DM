@@ -376,6 +376,48 @@ def test_e2e_location_question_pinned_to_place(server):
     assert len(server.sent) == 1 and server.sent[0].startswith(templates.PLACE)
 
 
+def test_e2e_faq_midbooking_preserves_state(server):
+    # Fix 3: user is mid-booking (dates+guests known) and asks an FAQ. The bot answers
+    # WITHOUT wiping state: no scrape, no QUESTION_ALL_MISSING, offers to continue.
+    bs = server.configure(
+        slots={"topic": "faq", "faq_template": "HOW_TO_GET_THERE", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("а як до вас добратися?", 351))
+    full = "\n".join(server.sent)
+    assert templates.HOW_TO_GET_THERE in full
+    assert templates.FAQ_CONTINUE_NUDGE.strip() in full       # state-aware continuation
+    assert templates.QUESTION_ALL_MISSING not in full         # never re-asks from scratch
+    assert server.state["scraped"] is False                   # an FAQ never scrapes
+
+
+def test_e2e_fuzzy_with_guests_proactively_scans(server):
+    # Fix 1: fuzzy period + guests (no exact dates) -> scrape and propose REAL windows,
+    # never bounce back asking for exact dates.
+    bs = server.configure(
+        slots={"topic": "fuzzy_dates", "rooms": [
+            {"room_type": None, "fuzzy_date": "початок липня", "nights": None,
+             "checkin": None, "checkout": None, "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(),
+        availability=_raw({"Стандарт": {f"2026-07-0{d}": 2 for d in range(1, 7)}}),
+    )
+    _run(bs.process_incoming_message("плануємо на початок липня, нас двоє", 352))
+    assert server.state["scraped"] is True
+    full = "\n".join(server.sent)
+    assert "вільні віконця" in full and "1 - 6 липня" in full
+    assert "напишіть, будь ласка, точні дати" not in full      # killed the fuzzy loop
+
+
+def test_e2e_unknown_intent_hands_off_with_instagram_label(server):
+    # Fix 2: a COMPLETELY unrecognized intent is the only manager hand-off, tagged Instagram.
+    bs = server.configure(slots={"topic": "unknown", "rooms": []}, history=_bot_spoke())
+    _run(bs.process_incoming_message("асдфгхй ???", 353))
+    assert server.sent == [templates.MANAGER_HANDOFF]
+    assert server.added_labels == [bot_logic.INSTAGRAM_LABEL]
+    assert server.state["scraped"] is False
+
+
 def test_e2e_concurrent_drip_no_double_greeting(server):
     # Two messages arriving together for the SAME conversation must be serialized
     # by the per-conversation lock -> exactly one greeting (no drip race).

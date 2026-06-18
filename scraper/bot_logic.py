@@ -196,6 +196,20 @@ def faq_override(text: str):
     return None
 
 
+def has_booking_context(slots) -> bool:
+    """Fix 3 — True if the slots already carry ANY booking data (dates, fuzzy period,
+    room, nights, or guests). An FAQ answered mid-booking must preserve this state,
+    so the bot can resume by asking only what is still missing — never from scratch.
+    """
+    for r in slots.get("rooms") or []:
+        if (r.get("checkin") or r.get("checkout") or r.get("fuzzy_date")
+                or r.get("room_type") or r.get("nights")
+                or (r.get("adults") or 0) >= 1
+                or r.get("children_count") or r.get("children_ages")):
+            return True
+    return False
+
+
 # --- phone-number capture ---------------------------------------------------
 # A customer who leaves a phone number is handed to a human (reply PHONE_RECEIVED,
 # stop). Match a token with >= 9 digits (UA: 0XXXXXXXXX / +380XXXXXXXXX), which
@@ -215,6 +229,10 @@ def contains_phone_number(text: str) -> bool:
 # fake screenshot). A payment signal -> hand off to a human admin + tag + mute.
 ORDER_LABEL = "Замовлено"                 # Chatwoot label that mutes the bot
 MUTE_LABELS = [ORDER_LABEL]               # any of these means a human has taken over
+
+# Fix 2: a completely unrecognized intent is the ONLY thing handed to a manager
+# (date searches never are). Such conversations are tagged for human follow-up.
+INSTAGRAM_LABEL = "Instagram"
 
 # Completed-action signals only — NOT the bare noun "оплата" (a client ASKING
 # "Яка оплата?" must not be mistaken for a submitted payment).
