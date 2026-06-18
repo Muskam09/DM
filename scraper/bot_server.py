@@ -357,6 +357,13 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     if _superseded(conversation_id, seq):
         print(f"[i] {conversation_id}: msg #{seq} superseded mid-processing -> suppress reply.")
         return
+    # Anti-spam: never send the SAME message twice in a row. When a client keeps
+    # sending vague fragments, we ask once and then stay quiet until they add info.
+    last_bot = next((m.get("content", "").strip() for m in reversed(raw_history)
+                     if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
+    if last_bot and reply.strip() == last_bot:
+        print(f"[i] {conversation_id}: reply identical to previous -> suppress (anti-spam).")
+        return
     try:
         reply = bot_logic.prepend_greeting_if_needed(reply, bot_has_spoken)
         await _deliver(conversation_id, reply)

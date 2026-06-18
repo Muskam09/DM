@@ -405,6 +405,15 @@ def test_e2e_drip_burst_emits_exactly_one_reply(server):
     assert len(questions) == 1   # one reply for the whole burst, not three
 
 
+def test_e2e_no_repeated_identical_reply(server):
+    # Vague messages in a row -> ask ONCE, then suppress the identical repeat (no spam).
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, dynamic_history=True)
+    _run(bs.process_incoming_message("Привіт", 801))
+    _run(bs.process_incoming_message("Ну то що?", 802))    # still vague -> same question
+    _run(bs.process_incoming_message("Агов", 803))         # and again
+    assert len([m for m in server.sent if m == templates.QUESTION_ALL_MISSING]) == 1
+
+
 # -- payment hand-off: reply + tag "Замовлено" + never confirm via LLM ------
 
 def test_e2e_payment_keyword_handoff_and_label(server):
