@@ -137,7 +137,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 Поверни ВИКЛЮЧНО JSON (без markdown, без пояснень) такої структури:
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting>",
-  "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "adults": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
+  "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
   "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
 
@@ -151,7 +151,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - presentation: просить розказати про номери / які є номери.
 - thinking: каже, що подумає / порадиться / відпише пізніше.
 - reject_dates: не може змінити дати, а все зайнято.
-- booking_confirm: погоджується бронювати ("так, бронюю", "давайте").
+- booking_confirm: ТІЛЬКИ якщо клієнт погоджується бронювати ПІСЛЯ озвученої ціни ("так, бронюю", "давайте оформлюємо"). "Хочу забронювати" / "вільні дати для бронювання" / "забронювати номер" БЕЗ попередньої ціни — це НЕ booking_confirm (це початок збору даних: greeting/price_quote).
 - fuzzy_dates: згадує період БЕЗ конкретних дат ("на літо", "десь у серпні").
 - nearest_dates: погоджується пошукати найближчі вільні дати після відмови.
 - greeting: привітання / немає корисних даних / незрозуміло.
@@ -163,13 +163,14 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - Якщо дано дату заїзду + кількість ночей — обчисли checkout = заїзд + ночі.
 - Відносні дати ("завтра", "післязавтра", "на вихідних") рахуй від %%TODAY%%.
 - ТОЧНІ vs НЕЧІТКІ дати (ВАЖЛИВО):
-  • ТОЧНИЙ діапазон (конкретні числа заїзду+виїзду АБО дата+кількість ночей, напр. "з 22.06 по 02.07", "17-19 липня", "20.07 на 3 ночі") => заповни checkin/checkout, fuzzy_date=null, і topic="price_quote" (НІКОЛИ не "general_price").
+  • ТОЧНИЙ діапазон (конкретні числа заїзду+виїзду АБО дата+кількість ночей, напр. "з 22.06 по 02.07", "17-19 липня", "20.07 на 3 ночі") => заповни checkin/checkout, fuzzy_date=null, і topic="price_quote" (НІКОЛИ не "general_price"). Слова "орієнтовно"/"приблизно"/"десь" ПЕРЕД конкретними числами НЕ роблять дати нечіткими ("орієнтовно 2-7 липня" = ТОЧНІ дати 2026-07-02..2026-07-07).
   • НЕЧІТКИЙ період ("початок серпня", "друга половина липня", "у серпні", "влітку", "кінець місяця", "після 6 серпня") => fuzzy_date="<текст періоду клієнта>", checkin=null, checkout=null.
   • НЕ підставляй "перше число місяця" як checkin для нечітких періодів — став fuzzy_date.
 - adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" => 3; одна особа => 1.
-- children_ages — лише ВІДОМІ віки дітей (цілі числа). Якщо вік невідомий — НЕ вигадуй.
-- ВАЖЛИВО: якщо названо лише дорослих і про дітей НЕ згадано — це означає, що дітей НЕМАЄ: постав children_ages=[]. НЕ повертайся до питання про дітей, якщо кількість дорослих уже відома.
-- Якщо взагалі не вказано ні дорослих, ні дітей — постав adults=0, children_ages=[].
+- children_count — ЗАГАЛЬНА кількість дітей (навіть якщо вік невідомий). children_ages — лише ВІДОМІ віки (цілі), вік не вигадуй.
+- ЗАКРИВАЙ слот дітей: "лише дорослі" / "X дорослих" / "всі дорослі" / "дорослі всі" / "на двох/трьох" БЕЗ згадки дітей => children_count=0, children_ages=[]. НІКОЛИ не перепитуй про дітей, якщо кількість дорослих відома, а дітей не згадано.
+- Якщо згадано N дітей без віку => children_count=N, children_ages=[]. Якщо вказані віки => children_count=кількість, children_ages=[віки].
+- Якщо взагалі не вказано ні дорослих, ні дітей — adults=0, children_count=0, children_ages=[].
 - ubd — true ЛИШЕ якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових для ЦЬОГО номеру; інакше false. Якщо просять знижку УБД "на один номер" — постав ubd=true тільки для одного (першого) номеру.
 
 FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY.
@@ -188,7 +189,6 @@ _SIMPLE_TOPIC_TEMPLATE = {
     "reject_dates": "POLITE_CLOSE",
     "booking_confirm": "BOOK_ROOM",
     "presentation": "PRESENTATION_ROOMS",
-    "nearest_dates": "NEAREST_DATES",
 }
 
 
@@ -311,22 +311,27 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     reply = route_simple_topic(slots)
     if reply is None:
         decision = dialogue_engine.plan(slots)
-        if decision["action"] in ("quote", "quote_all"):
+        if decision["action"] in ("quote", "quote_all", "explore", "nearest"):
             # Greet FIRST on the first turn, then the scrape notice, then the result.
             if not bot_has_spoken:
                 await _deliver(conversation_id, bot_logic.GREETING)
                 bot_has_spoken = True
-            # AVAILABILITY GATING: check the calendar BEFORE pricing (sends "Секундочку…").
+            # Check the calendar BEFORE answering (sends "Секундочку…").
             availability_data = await get_hotel_data_cached(conversation_id)
             if not availability_data:
                 await asyncio.to_thread(send_chatwoot_message, conversation_id,
                                         "Вибачте, технічна затримка бази. Менеджер вже підключається.")
                 return
             simplified = bot_logic.build_simplified_availability(availability_data)
-            if decision["action"] == "quote":
+            act = decision["action"]
+            if act == "quote":
                 reply = dialogue_engine.finalize_quote(decision["rooms"], simplified)
-            else:  # quote_all — exact dates, no chosen room -> price every type
+            elif act == "quote_all":   # exact dates, no chosen room -> price every type
                 reply = dialogue_engine.finalize_quote_all(decision["spec"], simplified)
+            elif act == "explore":     # A3: unsure dates -> propose available windows
+                reply = dialogue_engine.propose_windows(decision["spec"], simplified)
+            else:                      # A2 Step 3: nearest dates for a chosen room
+                reply = dialogue_engine.nearest_reply(decision["spec"], simplified)
         else:
             reply = decision["reply"]
 

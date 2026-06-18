@@ -295,10 +295,11 @@ def test_e2e_sold_out_offers_nearest_dates(server):
             {"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
              "adults": 2, "children_ages": []}]},
         history=_bot_spoke(),
-        availability=_raw({"Стандарт": {"2026-07-05": 3, "2026-07-06": 0}}),  # 6th booked
+        availability=_raw({"Стандарт": {"2026-07-05": 0, "2026-07-06": 0,
+                                         "2026-07-08": 2, "2026-07-09": 2}}),
     )
     _run(bs.process_incoming_message("Стандарт на 5-7 липня", 303))
-    assert any(templates.SOLD_OUT_NEAREST == m for m in server.sent)
+    assert any("Найближчі вільні дати" in m for m in server.sent)   # real forward-scan dates
     assert not any(templates.POLITE_CLOSE == m for m in server.sent)
     assert not any("грн" in m for m in server.sent)           # never quoted a price
 

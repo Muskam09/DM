@@ -76,15 +76,21 @@ def test_plan_fuzzy_off_season():
     assert out["reply"] == templates.OFF_SEASON
 
 
-def test_plan_fuzzy_priced_month_acknowledges():
-    # Fix 3: "початок серпня" (fuzzy, priced) -> acknowledge + ask exact dates.
+def test_plan_fuzzy_no_guests_acknowledges_once():
+    # Fuzzy + NO guests -> acknowledge the period, ask for exact dates.
     out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "початок серпня",
-                              "checkin": None, "checkout": None, "adults": 2, "children_ages": []}]})
+                              "checkin": None, "checkout": None, "adults": 0, "children_ages": []}]})
     assert "початок серпня" in out["reply"] and "точні дати" in out["reply"]
 
 
+def test_plan_fuzzy_with_guests_explores():
+    # A3: fuzzy/unsure dates + guests known -> proactive calendar scan (explore).
+    out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "друга половина липня",
+                              "checkin": None, "checkout": None, "adults": 2, "children_ages": []}]})
+    assert out["action"] == "explore"
+
+
 def test_plan_exact_dates_no_room_quotes_all():
-    # Fix 4: exact dates + guests, no chosen room -> price every type (quote_all).
     out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06",
                               "checkout": "2026-07-08", "adults": 2, "children_ages": []}]})
     assert out["action"] == "quote_all"
@@ -96,19 +102,36 @@ def test_plan_exact_dates_with_room_quotes():
     assert out["action"] == "quote" and len(out["rooms"]) == 1
 
 
-def test_plan_dates_only_asks_guests_only():
-    # Fix 1: exact dates but no guests -> ask ONLY for guests.
+def test_plan_exact_dates_no_guests_asks_guests():
     out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06",
                               "checkout": "2026-07-08", "adults": 0, "children_ages": []}]})
-    assert out["reply"] == templates.ASK_GUESTS_ONLY
+    assert out["reply"] == templates.QUESTION_MISSING_GUESTS
 
 
-def test_plan_guests_only_asks_dates_only():
-    # Fix 1: guests known, no dates -> ask ONLY for dates (not the monolith).
+def test_plan_guests_known_only_dates_missing_uses_only_dates():
+    # A1: guests 100% known, no fuzzy, only dates missing -> QUESTION_ONLY_DATES.
     out = de.plan({"rooms": [{"room_type": None, "checkin": None, "checkout": None,
-                              "adults": 2, "children_ages": []}]})
-    assert out["reply"] == templates.ASK_DATES_ONLY
-    assert out["reply"] != templates.QUESTION_ALL_MISSING
+                              "adults": 4, "children_count": 0, "children_ages": []}]})
+    assert out["reply"] == templates.QUESTION_ONLY_DATES
+
+
+def test_plan_child_age_missing_asks_age():
+    # #2: 2 adults + 1 child (age unknown) + exact dates -> QUESTION_MISSING_AGE.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
+                              "adults": 2, "children_count": 1, "children_ages": []}]})
+    assert out["reply"] == templates.QUESTION_MISSING_AGE
+
+
+def test_find_nearest_window_forward_scan():
+    avail = {"Стандарт": {"2026-07-06": 0, "2026-07-07": 0, "2026-07-08": 2, "2026-07-09": 2}}
+    win = de.find_nearest_window(avail, "Стандарт", "2026-07-05", nights=2)
+    assert win == ("2026-07-08", "2026-07-10")
+
+
+def test_propose_windows_lists_free_stretches():
+    avail = {"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(10, 16)}}  # 6-day free run
+    reply = de.propose_windows({"room_type": "Стандарт"}, avail)
+    assert "липня" in reply and "Який період" in reply
 
 
 def test_finalize_quote_all_lists_available_types():
@@ -162,14 +185,24 @@ def test_finalize_multi_room_with_total():
 
 # --- AVAILABILITY GATING (directive 2) -------------------------------------
 
-def test_finalize_full_sold_out_offers_nearest_dates():
-    # Case 5: only room is fully booked on a night -> offer nearest dates (NOT close).
-    avail = {"Стандарт": {"2026-07-05": 3, "2026-07-06": 0}}
+def test_finalize_full_sold_out_forward_scans_to_real_dates():
+    # Case 5 / A2 Step 2: fully booked -> forward-scan THIS room to real nearest dates.
+    avail = {"Стандарт": {"2026-07-05": 0, "2026-07-06": 0,
+                          "2026-07-08": 2, "2026-07-09": 2, "2026-07-10": 2}}
     reply = de.finalize_quote(
         [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
           "adults": 2, "children_ages": []}], avail)
-    assert reply == templates.SOLD_OUT_NEAREST
+    assert "Найближчі вільні дати" in reply and "8 - 10 липня" in reply
     assert reply != templates.POLITE_CLOSE
+
+
+def test_finalize_full_sold_out_no_window_hands_off():
+    # Nothing free in the horizon -> NEAREST_NONE (manager hand-off).
+    avail = {"Стандарт": {"2026-07-05": 0, "2026-07-06": 0}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+          "adults": 2, "children_ages": []}], avail)
+    assert reply == templates.NEAREST_NONE
 
 
 def test_finalize_partial_overbooking_offers_other_rooms():
