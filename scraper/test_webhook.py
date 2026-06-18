@@ -218,6 +218,7 @@ def server(monkeypatch):
     monkeypatch.setattr(bot_server.asyncio, "sleep", _fast_sleep)
     bot_server.AVAILABILITY_CACHE.clear()
     bot_server._conv_locks.clear()   # fresh per-conversation locks per test/event-loop
+    bot_server._conv_seq.clear()
 
     def configure(slots=None, slots_text=None, history=None, availability=None,
                   labels=None, dynamic_history=False):
@@ -299,7 +300,7 @@ def test_e2e_sold_out_offers_nearest_dates(server):
                                          "2026-07-08": 2, "2026-07-09": 2}}),
     )
     _run(bs.process_incoming_message("Стандарт на 5-7 липня", 303))
-    assert any("Найближчі вільні дати" in m for m in server.sent)   # real forward-scan dates
+    assert any("всі номери зайняті" in m and "8 - 10 липня" in m for m in server.sent)  # SOLD_OUT_FOUND_NEAREST
     assert not any(templates.POLITE_CLOSE == m for m in server.sent)
     assert not any("грн" in m for m in server.sent)           # never quoted a price
 
@@ -388,6 +389,20 @@ def test_e2e_concurrent_drip_no_double_greeting(server):
     asyncio.run(two_at_once())
     greetings = [m for m in server.sent if m.startswith("Доброго дня! Вас вітає")]
     assert len(greetings) == 1
+
+
+def test_e2e_drip_burst_emits_exactly_one_reply(server):
+    # Fix 4: a 3-message drip-burst must yield ONE reply (superseded ones suppressed),
+    # never the same message 3x.
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, dynamic_history=True)
+
+    async def burst():
+        await asyncio.gather(*[bs.process_incoming_message(f"msg{i}", 701) for i in range(3)])
+    asyncio.run(burst())
+    greetings = [m for m in server.sent if m.startswith("Доброго дня! Вас вітає")]
+    questions = [m for m in server.sent if m == templates.QUESTION_ALL_MISSING]
+    assert len(greetings) == 1
+    assert len(questions) == 1   # one reply for the whole burst, not three
 
 
 # -- payment hand-off: reply + tag "Замовлено" + never confirm via LLM ------

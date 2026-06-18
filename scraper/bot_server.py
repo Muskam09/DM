@@ -137,7 +137,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 Поверни ВИКЛЮЧНО JSON (без markdown, без пояснень) такої структури:
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting>",
-  "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
+  "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "nights": <ціле|null>, "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
   "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
 
@@ -166,6 +166,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
   • ТОЧНИЙ діапазон (конкретні числа заїзду+виїзду АБО дата+кількість ночей, напр. "з 22.06 по 02.07", "17-19 липня", "20.07 на 3 ночі") => заповни checkin/checkout, fuzzy_date=null, і topic="price_quote" (НІКОЛИ не "general_price"). Слова "орієнтовно"/"приблизно"/"десь" ПЕРЕД конкретними числами НЕ роблять дати нечіткими ("орієнтовно 2-7 липня" = ТОЧНІ дати 2026-07-02..2026-07-07).
   • НЕЧІТКИЙ період ("початок серпня", "друга половина липня", "у серпні", "влітку", "кінець місяця", "після 6 серпня") => fuzzy_date="<текст періоду клієнта>", checkin=null, checkout=null.
   • НЕ підставляй "перше число місяця" як checkin для нечітких періодів — став fuzzy_date.
+- nights — кількість ночей, ЛИШЕ якщо названо ОДНЕ чітке число ("на 3 ночі"=3, "тиждень"=7, "на 5 діб"=5, "2 ночі"=2). ДІАПАЗОН ("3-5 діб", "на 3-4 ночі") або невідомо => nights=null. Для точних дат nights можна лишити null (порахується з checkin/checkout).
 - adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" => 3; одна особа => 1.
 - children_count — ЗАГАЛЬНА кількість дітей (навіть якщо вік невідомий). children_ages — лише ВІДОМІ віки (цілі), вік не вигадуй.
 - ЗАКРИВАЙ слот дітей: "лише дорослі" / "X дорослих" / "всі дорослі" / "дорослі всі" / "на двох/трьох" БЕЗ згадки дітей => children_count=0, children_ages=[]. НІКОЛИ не перепитуй про дітей, якщо кількість дорослих відома, а дітей не згадано.
@@ -222,6 +223,7 @@ async def _deliver(conversation_id: int, text: str):
 
 
 _conv_locks: dict = {}
+_conv_seq: dict = {}      # conv_id -> latest incoming sequence (drip-burst dedup)
 
 
 def _lock_for(conversation_id):
@@ -232,17 +234,32 @@ def _lock_for(conversation_id):
     return lock
 
 
+def _next_seq(conversation_id):
+    _conv_seq[conversation_id] = _conv_seq.get(conversation_id, 0) + 1
+    return _conv_seq[conversation_id]
+
+
+def _superseded(conversation_id, seq):
+    """True if a NEWER message has arrived for this conversation, so this one must NOT
+    reply — the newest task will, using the full consolidated history."""
+    return seq != _conv_seq.get(conversation_id, seq)
+
+
 async def process_incoming_message(user_message: str, conversation_id: int,
-                                   has_attachment: bool = False):
-    # Serialize messages WITHIN one conversation so drip fragments are handled in
-    # order and we never send a double greeting when two arrive near-simultaneously.
-    # Different conversations still run in parallel.
+                                   has_attachment: bool = False, seq: int = None):
+    # Drip-burst dedup: number each incoming message; the per-conversation lock
+    # serializes processing, and ONLY the latest message in a burst emits a reply.
+    if seq is None:
+        seq = _next_seq(conversation_id)
     async with _lock_for(conversation_id):
-        await _handle_incoming(user_message, conversation_id, has_attachment)
+        if _superseded(conversation_id, seq):
+            print(f"[i] {conversation_id}: msg #{seq} superseded -> skip (newer drip pending).")
+            return
+        await _handle_incoming(user_message, conversation_id, has_attachment, seq)
 
 
 async def _handle_incoming(user_message: str, conversation_id: int,
-                           has_attachment: bool = False):
+                           has_attachment: bool = False, seq: int = 0):
     # 0) MUTE SWITCH: if a human admin has taken over the conversation (the
     #    "Замовлено" label, or any mute label), the bot stays COMPLETELY silent —
     #    no labels query beyond this, no LLM, no reply.
@@ -335,7 +352,11 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         else:
             reply = decision["reply"]
 
-    # 3) SEND — replies are UA templates / Python-formatted text by construction.
+    # 3) SEND — but if a newer drip arrived WHILE we were processing (e.g. during a
+    #    20s scrape), suppress this reply so the burst yields exactly ONE final reply.
+    if _superseded(conversation_id, seq):
+        print(f"[i] {conversation_id}: msg #{seq} superseded mid-processing -> suppress reply.")
+        return
     try:
         reply = bot_logic.prepend_greeting_if_needed(reply, bot_has_spoken)
         await _deliver(conversation_id, reply)
@@ -356,8 +377,9 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
         has_attachment = bool(payload.get("attachments"))
 
         if conversation_id and (content or has_attachment):
+            seq = _next_seq(conversation_id)   # assign in ARRIVAL order (drip-burst dedup)
             background_tasks.add_task(process_incoming_message, content or "",
-                                      conversation_id, has_attachment)
+                                      conversation_id, has_attachment, seq)
 
     return {"status": "ok"}
 

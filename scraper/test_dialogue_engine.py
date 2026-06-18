@@ -83,11 +83,20 @@ def test_plan_fuzzy_no_guests_acknowledges_once():
     assert "початок серпня" in out["reply"] and "точні дати" in out["reply"]
 
 
-def test_plan_fuzzy_with_guests_explores():
-    # A3: fuzzy/unsure dates + guests known -> proactive calendar scan (explore).
+def test_plan_fuzzy_with_guests_and_nights_explores():
+    # A3: fuzzy dates + guests + KNOWN nights -> proactive calendar scan (explore).
     out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "друга половина липня",
-                              "checkin": None, "checkout": None, "adults": 2, "children_ages": []}]})
-    assert out["action"] == "explore"
+                              "nights": 4, "checkin": None, "checkout": None,
+                              "adults": 2, "children_ages": []}]})
+    assert out["action"] == "explore" and out["spec"]["nights"] == 4
+
+
+def test_plan_fuzzy_guests_no_nights_does_not_scan():
+    # Fix 2: fuzzy + guests but nights UNKNOWN -> do NOT scan; acknowledge + ask dates.
+    out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "початок серпня",
+                              "nights": None, "checkin": None, "checkout": None,
+                              "adults": 4, "children_count": 0, "children_ages": []}]})
+    assert out["action"] == "reply" and "початок серпня" in out["reply"]
 
 
 def test_plan_exact_dates_no_room_quotes_all():
@@ -192,7 +201,7 @@ def test_finalize_full_sold_out_forward_scans_to_real_dates():
     reply = de.finalize_quote(
         [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
           "adults": 2, "children_ages": []}], avail)
-    assert "Найближчі вільні дати" in reply and "8 - 10 липня" in reply
+    assert "всі номери зайняті" in reply and "8 - 10 липня" in reply   # SOLD_OUT_FOUND_NEAREST
     assert reply != templates.POLITE_CLOSE
 
 

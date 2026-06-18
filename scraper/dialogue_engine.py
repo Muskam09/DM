@@ -155,9 +155,17 @@ def has_off_season_dates(slots: Dict) -> bool:
     return False
 
 
-def find_nearest_window(availability, room_type, after, nights, room_count=1, horizon=14):
-    """Forward-scan up to `horizon` days after `after` for the first block of `nights`
-    consecutive dates where `room_type` has >= room_count free. (checkin, checkout) or None."""
+def _nights(room: Dict) -> Optional[int]:
+    """Number of nights from exact dates, else the `nights` slot, else None."""
+    if room.get("checkin") and room.get("checkout"):
+        return len(pricing_engine.night_dates(room["checkin"], room["checkout"]))
+    n = room.get("nights")
+    return n if isinstance(n, int) and n > 0 else None
+
+
+def find_nearest_window(availability, room_type, after, nights, room_count=1, horizon=90):
+    """Forward-scan up to `horizon` days (default 90) after `after` for the first block
+    of `nights` consecutive dates where `room_type` has >= room_count free."""
     key = bot_logic.match_availability_key(availability, room_type)
     if not key:
         return None
@@ -171,11 +179,12 @@ def find_nearest_window(availability, room_type, after, nights, room_count=1, ho
     return None
 
 
-def propose_windows(spec: Dict, availability: Dict, count: int = 2, min_nights: int = 3) -> str:
-    """A3: scan the calendar for continuous free stretches (>= min_nights) and propose
-    up to `count` of them; NEAREST_NONE if nothing fits."""
+def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
+    """A3: scan the calendar for continuous free stretches (>= the requested nights)
+    and propose up to `count` of them; NEAREST_NONE if nothing fits."""
     room = spec.get("room_type") or OFFERABLE_ROOMS[0]
     room_count = spec.get("room_count") or 1
+    min_nights = spec.get("nights") or 3
     key = bot_logic.match_availability_key(availability, room)
     avail = (availability.get(key) or {}) if key else {}
     windows, run, prev = [], [], None
@@ -244,12 +253,18 @@ def plan(slots: Dict) -> Dict:
 
     # No exact dates, guests known.
     if any_guests:
-        if ages_missing:
+        if ages_missing:   # Fix 2: never scan with unknown child ages -> ask ages first.
             return {"action": "reply", "reply":
                     (templates.QUESTION_MISSING_DATES_1_CHILD if cc == 1
                      else templates.QUESTION_MISSING_DATES_CHILDREN)}
+        nights = max((_nights(r) or 0 for r in rooms), default=0)
         if fuzzy:
-            return {"action": "explore", "spec": rooms[0]}          # A3: unsure -> scan & propose
+            # A3 proactive scan ONLY if we know how many nights (Fix 2). Otherwise
+            # acknowledge the period once and ask for exact dates (which give nights).
+            if nights:
+                return {"action": "explore", "spec": {**rooms[0], "nights": nights}}
+            return {"action": "reply",
+                    "reply": templates.ACKNOWLEDGE_FUZZY.replace("{fuzzy_date}", fuzzy)}
         return {"action": "reply", "reply": templates.QUESTION_ONLY_DATES}   # A1: dates only
 
     # No guests. A fuzzy period -> acknowledge once; else the full first-contact question.
@@ -284,10 +299,8 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
                         .replace("{вільні_номери}", ", ".join(free)))
             # Step 2: everything booked -> forward-scan THIS room for the nearest block.
             win = find_nearest_window(simplified_availability, room_type, checkin, len(nights))
-            if win:
-                return (templates.NEAREST_DATES
-                        .replace("{тип номеру}", room_type)
-                        .replace("{найближчі_дати}", dates_phrase(win[0], win[1])))
+            if win:  # exact dates were sold out -> "found nearest" wording (NOT "ще не визначились").
+                return templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1]))
             return templates.NEAREST_NONE
 
         adults = r.get("adults") or 0
@@ -354,13 +367,11 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
 def nearest_reply(spec: Dict, availability: Dict) -> str:
     """A2 Step 3: forward-scan for the chosen room and propose real nearest dates."""
     room = spec.get("room_type")
-    if not (room and spec.get("checkin")):
-        return propose_windows(spec, availability)
-    nights = (len(pricing_engine.night_dates(spec["checkin"], spec["checkout"]))
-              if spec.get("checkout") else 2)
-    win = find_nearest_window(availability, room, spec["checkin"], nights)
+    after = spec.get("checkin")
+    nights = _nights(spec)
+    if not (room and after and nights):   # Fix 2: need room + exact start + nights to scan
+        return templates.QUESTION_ONLY_DATES
+    win = find_nearest_window(availability, room, after, nights)
     if win:
-        return (templates.NEAREST_DATES
-                .replace("{тип номеру}", room)
-                .replace("{найближчі_дати}", dates_phrase(win[0], win[1])))
+        return templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1]))
     return templates.NEAREST_NONE
