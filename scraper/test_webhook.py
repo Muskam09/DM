@@ -120,12 +120,37 @@ def test_contains_phone_number(text, expected):
     ("нас 45 людей, корпоратив", True),
     ("Липень на 70-80 чол на 6 днів", True),
     ("весілля на 30 гостей", True),       # event word wins regardless of count
+    ("буде 22 гостей", True),             # 20+ threshold (lowered from 40)
+    ("приїде 20 осіб", True),             # boundary: 20 >= 20
     ("2 дорослих і дитина 8 років", False),
-    ("група 15 дітей, школа", False),     # 15 < 40, not an event
+    ("група 15 дітей, школа", False),     # 15 < 20, not an event
+    ("19 осіб у нас", False),             # 19 < 20, no event word
     ("Стандарт на 5-7 липня", False),
 ])
 def test_looks_like_large_group(text, expected):
     assert bot_logic.looks_like_large_group(text) is expected
+
+
+def test_merge_room_fills_missing_from_memory():
+    # Guests remembered, fresh turn dropped them -> restored; new values still win.
+    remembered = {"adults": 3, "children_count": 0, "children_ages": [], "room_type": "Стандарт"}
+    assert bot_logic.merge_room(remembered, {})["adults"] == 3
+    assert bot_logic.merge_room(remembered, {"adults": 2})["adults"] == 2     # fresh wins
+    # A fresh turn that mentions dates must NOT inherit stale dates.
+    remembered2 = {"checkin": "2026-07-01", "checkout": "2026-07-03", "adults": 2}
+    merged = bot_logic.merge_room(remembered2, {"fuzzy_date": "серпень"})
+    assert merged.get("checkin") is None and merged["fuzzy_date"] == "серпень"
+    # A fresh turn silent on dates inherits the remembered dates.
+    merged2 = bot_logic.merge_room(remembered2, {"room_type": "Напівлюкс"})
+    assert merged2["checkin"] == "2026-07-01" and merged2["room_type"] == "Напівлюкс"
+
+
+def test_slots_total_guests():
+    assert bot_logic.slots_total_guests({"rooms": [
+        {"adults": 10, "children_count": 12, "children_ages": []}]}) == 22
+    assert bot_logic.slots_total_guests({"rooms": [
+        {"adults": 2, "children_ages": [8]}, {"adults": 3, "children_count": 1}]}) == 7
+    assert bot_logic.slots_total_guests({"rooms": []}) == 0
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -219,6 +244,7 @@ def server(monkeypatch):
     bot_server.AVAILABILITY_CACHE.clear()
     bot_server._conv_locks.clear()   # fresh per-conversation locks per test/event-loop
     bot_server._conv_seq.clear()
+    bot_server._slot_memory.clear()  # fresh slot memory per test
 
     def configure(slots=None, slots_text=None, history=None, availability=None,
                   labels=None, dynamic_history=False):
@@ -347,6 +373,19 @@ def test_e2e_group_event_redirect(server):
     assert server.sent == [templates.LARGE_GROUPS_EVENTS]
 
 
+def test_e2e_large_group_by_slot_count_redirects(server):
+    # 20+ total guests split across fields ("10 + 12") -> the text regex wouldn't catch
+    # it, but the consolidated slot count does -> redirect to the co-owner, no scrape.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-10", "checkout": "2026-07-12",
+             "adults": 10, "children_count": 12, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("нас 10 дорослих і 12 дітей на 10-12 липня", 360))
+    assert server.sent == [templates.LARGE_GROUPS_EVENTS]
+    assert server.state["scraped"] is False
+
+
 def test_e2e_large_group_override_beats_llm(server):
     # Even when the extractor mislabels the last message, a 70-80 person inquiry
     # earlier in the thread is deterministically redirected.
@@ -390,6 +429,26 @@ def test_e2e_faq_midbooking_preserves_state(server):
     assert templates.FAQ_CONTINUE_NUDGE.strip() in full       # state-aware continuation
     assert templates.QUESTION_ALL_MISSING not in full         # never re-asks from scratch
     assert server.state["scraped"] is False                   # an FAQ never scrapes
+
+
+def test_e2e_slot_memory_restores_dropped_guests(server):
+    # Turn 1 the extractor captures 3 adults. Turn 2 (a pet FAQ) the extractor DROPS the
+    # guests (LLM variance). Slot memory must restore them so the bot asks only for the
+    # missing dates — never the all-missing monolith, never re-asking guests.
+    bs = server.configure(
+        slots={"topic": "general_price", "rooms": [
+            {"room_type": None, "checkin": None, "checkout": None,
+             "adults": 3, "children_count": 0, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("Яка ціна за трьох?", 370))
+    server.sent.clear()
+    server.configure(slots={"topic": "faq", "faq_template": "PETS", "rooms": []},
+                     history=_bot_spoke())
+    _run(bs.process_incoming_message("+ собачка", 370))
+    joined = "\n".join(server.sent)
+    assert templates.PETS.split("\n")[0] in joined          # answered the pet FAQ
+    assert templates.QUESTION_ALL_MISSING not in joined     # never re-asks from scratch
+    assert templates.QUESTION_ONLY_DATES in joined          # asks ONLY the missing dates
 
 
 def test_e2e_fuzzy_with_guests_proactively_scans(server):

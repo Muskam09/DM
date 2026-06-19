@@ -261,22 +261,35 @@ def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
     fuzzy = spec.get("fuzzy_date") or ""
     key = bot_logic.match_availability_key(availability, room)
     avail = (availability.get(key) or {}) if key else {}
+    all_dates = sorted(avail.keys())
+
+    def _offer(windows):
+        parts = [dates_phrase(w[0], w[1]) for w in windows[:count]]
+        return (templates.PROPOSE_WINDOWS
+                .replace("{fuzzy_date}", fuzzy or "найближчий період")
+                .replace("{found_dates}", ", або ".join(parts)))
 
     period = fuzzy_period_range(fuzzy)
-    in_period = sorted(d for d in avail.keys()
-                       if period is None or period[0] <= d <= period[1])
+    in_period = [d for d in all_dates if period is None or period[0] <= d <= period[1]]
     windows = _free_windows(avail, in_period, min_nights, room_count)
-    if not windows and period is not None:
-        # Named period is full / out of the visible window -> scan everything forward.
-        windows = _free_windows(avail, sorted(avail.keys()), min_nights, room_count)
-    windows = windows[:count]
-    if not windows:
-        return templates.NEAREST_NONE
-    parts = [dates_phrase(w[0], w[1]) for w in windows]
-    period_label = fuzzy if fuzzy else "найближчий період"
-    return (templates.PROPOSE_WINDOWS
-            .replace("{fuzzy_date}", period_label)
-            .replace("{found_dates}", ", або ".join(parts)))
+    if windows:
+        return _offer(windows)
+
+    # Nothing free inside the VISIBLE part of the named period.
+    vis_max = all_dates[-1] if all_dates else None
+    if period is not None and vis_max is not None and period[1] > vis_max:
+        # The named period EXTENDS beyond the open calendar window (OtelMS shows only
+        # ~6-7 weeks ahead) and the visible slice has nothing free — we cannot honestly
+        # scan the rest. Ask for exact dates instead of proposing dates from the wrong
+        # month; exact out-of-window dates still quote via the 'unknown' path.
+        return templates.ACKNOWLEDGE_FUZZY.replace("{fuzzy_date}", fuzzy or "ці дати")
+
+    # The period is fully visible but booked there -> offer the nearest real window.
+    nearest = _free_windows(avail, all_dates, min_nights, room_count)
+    if nearest:
+        w = nearest[0]
+        return templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(w[0], w[1]))
+    return templates.NEAREST_NONE
 
 
 def plan(slots: Dict) -> Dict:

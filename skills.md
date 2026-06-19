@@ -81,7 +81,8 @@ large-group override → route**.
   → send `PAYMENT_RECEIVED_HANDOFF`, add the `Замовлено` label, go silent. The bot
   **never auto-confirms a booking**.
 * **Phone (`contains_phone_number`):** ≥9 digits → `PHONE_RECEIVED`, hand to manager.
-* **Large group (`looks_like_large_group`):** 40+ people / event keyword anywhere →
+* **Large group (`looks_like_large_group` / `slots_total_guests` ≥ `LARGE_GROUP_MIN`):**
+  20+ people (by text OR consolidated adults+children) / event keyword anywhere →
   force `group_event` → `LARGE_GROUPS_EVENTS` redirect.
 
 ### Availability gating (Cases 4 & 5)

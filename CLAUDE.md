@@ -73,8 +73,9 @@ incoming → spam? phone? (deterministic guards) → LLM EXTRACTION (returns JSO
    and **never quotes a sold-out room**. Sold out + other categories free →
    `ROOM_BOOKED` (Case 4); fully booked → `SOLD_OUT_NEAREST` (Case 5). A date
    **outside** the scrape window is `unknown` (not sold out) → quote proceeds.
-   Large groups (40+) / events are redirected deterministically
-   (`bot_logic.looks_like_large_group`), not left to the LLM.
+   Large groups (20+ guests, by text or consolidated slot count) / events are
+   redirected deterministically (`bot_logic.looks_like_large_group` +
+   `bot_logic.slots_total_guests` ≥ `LARGE_GROUP_MIN`), not left to the LLM.
 1c. **Guard order in `process_incoming_message`:** `mute (Замовлено label) → spam →
    payment → phone → extraction → large-group override → route`. The first four are
    deterministic short-circuits (no LLM).

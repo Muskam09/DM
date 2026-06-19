@@ -129,8 +129,9 @@ def is_spam(text: str) -> bool:
 
 
 # --- large-group / event detection (deterministic, not left to the LLM) -----
-# Big groups (40+) and events must ALWAYS be redirected to the co-owner — too
+# Big groups (20+) and events must ALWAYS be redirected to the co-owner — too
 # important to rely on fuzzy classification, so we detect it in code.
+LARGE_GROUP_MIN = 20   # 20+ guests (or any event/banquet) => redirect to the co-owner
 _GROUP_NUM_RE = re.compile(
     r"(\d{2,3})\s*[-–—+]?\s*\d{0,3}\s*(?:осіб|чол|людей|людин|дітей|діток|гостей|дорослих|учн)",
     re.IGNORECASE,
@@ -142,15 +143,27 @@ _EVENT_WORDS = [
 
 
 def looks_like_large_group(text: str) -> bool:
-    """True if the conversation is clearly a 40+ group or an event/banquet."""
+    """True if the conversation is clearly a 20+ group or an event/banquet."""
     t = (text or "").lower()
     for m in _GROUP_NUM_RE.finditer(t):
         try:
-            if int(m.group(1)) >= 40:
+            if int(m.group(1)) >= LARGE_GROUP_MIN:
                 return True
         except ValueError:
             pass
     return any(w in t for w in _EVENT_WORDS)
+
+
+def slots_total_guests(slots) -> int:
+    """Total guests across all rooms in the extracted slots (adults + children).
+    Used to redirect 20+ bookings even when the count is split over fields/rooms
+    ("10 дорослих і 12 дітей" => 22) and the text regex alone wouldn't catch it."""
+    total = 0
+    for r in (slots.get("rooms") or []):
+        total += (r.get("adults") or 0)
+        cc = r.get("children_count")
+        total += cc if cc is not None else len(r.get("children_ages") or [])
+    return total
 
 
 # Directions ("how to get there") -> HOW_TO_GET_THERE, NOT the location/maps answer.
@@ -194,6 +207,40 @@ def faq_override(text: str):
         if any(k in t for k in keywords):
             return template
     return None
+
+
+# --- per-conversation slot memory (robust to extractor variance) ------------
+# The extractor (a small LLM) sometimes DROPS a slot the client already gave when
+# the next message switches topic (e.g. an FAQ). Rather than trust the LLM to
+# re-consolidate every turn, Python remembers the booking slots per conversation
+# and fills any field the fresh extraction left empty. New non-empty values always
+# win; only empty/zero/None fields fall back to memory.
+MERGE_FIELDS = ("checkin", "checkout", "fuzzy_date", "nights",
+                "room_type", "adults", "children_count", "children_ages", "ubd")
+
+
+def merge_room(remembered, fresh) -> Dict:
+    """Fill MISSING booking fields in `fresh` from `remembered` so a dropped slot
+    doesn't make the bot re-ask. Dates are only inherited when the fresh turn says
+    NOTHING about dates (so a new/changed date request always overrides cleanly)."""
+    out = dict(fresh or {})
+    rem = remembered or {}
+    fresh_mentions_dates = bool(out.get("checkin") or out.get("checkout") or out.get("fuzzy_date"))
+    if not fresh_mentions_dates:
+        for f in ("checkin", "checkout", "fuzzy_date", "nights"):
+            if not out.get(f) and rem.get(f):
+                out[f] = rem[f]
+    for f in ("room_type", "adults", "children_count", "children_ages"):
+        if not out.get(f) and rem.get(f):
+            out[f] = rem[f]
+    if not out.get("ubd") and rem.get("ubd"):
+        out["ubd"] = rem["ubd"]
+    return out
+
+
+def remember_room(room) -> Dict:
+    """Project a room dict down to the carried-over booking fields (for storage)."""
+    return {f: (room or {}).get(f) for f in MERGE_FIELDS}
 
 
 def has_booking_context(slots) -> bool:

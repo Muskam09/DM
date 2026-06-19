@@ -166,12 +166,31 @@ def test_propose_windows_constrained_to_named_period():
     assert "20 - 25" not in reply       # outside the named period -> not offered
 
 
-def test_propose_windows_falls_back_when_period_out_of_window():
-    # Named period (серпень) isn't in the scraped data, but July is free -> still
-    # propose real windows (never give up, Fix 2), not NEAREST_NONE.
+def test_propose_windows_period_beyond_visible_window_asks_dates():
+    # Named period (серпень) is BEYOND the visible calendar (only July scraped). We
+    # can't honestly scan it -> ask for exact dates, never propose wrong-month windows.
     avail = {"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(10, 16)}}
     reply = de.propose_windows({"room_type": "Стандарт", "fuzzy_date": "серпень"}, avail)
-    assert "липня" in reply and reply != templates.NEAREST_NONE
+    assert "серпень" in reply and "точні дати" in reply   # ACKNOWLEDGE_FUZZY
+    assert "липня" not in reply                            # never proposes the wrong period
+
+
+def test_propose_windows_partial_overlap_visible_full_asks_dates():
+    # "початок серпня" = Aug 1-10, but the calendar only reaches Aug 3 and those are
+    # booked. Don't propose July; ask for exact dates (most of the period is unseeable).
+    avail = {"Стандарт": {**{f"2026-07-{d:02d}": 2 for d in range(10, 16)},   # July free
+                          "2026-08-01": 0, "2026-08-02": 0, "2026-08-03": 0}}  # window ends Aug 3, booked
+    reply = de.propose_windows({"room_type": "Стандарт", "fuzzy_date": "початок серпня"}, avail)
+    assert "серпн" in reply and "точні дати" in reply
+    assert "липня" not in reply       # never proposes the wrong month
+
+
+def test_propose_windows_period_busy_offers_nearest():
+    # Period overlaps the window but is booked there -> offer the nearest real window.
+    avail = {"Стандарт": {"2026-07-10": 0, "2026-07-11": 0,        # early July booked
+                          "2026-07-20": 2, "2026-07-21": 2, "2026-07-22": 2}}
+    reply = de.propose_windows({"room_type": "Стандарт", "fuzzy_date": "початок липня"}, avail)
+    assert "20 - 22 липня" in reply
 
 
 # --- Fix 3: FAQ mid-booking must not wipe the gathered state -----------------

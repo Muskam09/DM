@@ -142,10 +142,10 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 }
 
 Дати/гостей/номери збирай з УСІЄЇ історії. Якщо обрано topic=faq — faq_template обирай за ОСТАННІМ (поточним) питанням клієнта.
-ВАЖЛИВО (анти-амнезія): навіть якщо topic=faq, ОБОВ'ЯЗКОВО заповни rooms[] усіма вже відомими даними бронювання (дати, гості, ночі, номер, нечіткий період) з УСІЄЇ історії. Відповідь на FAQ НЕ повинна стирати раніше надані клієнтом дані.
+ВАЖЛИВО (анти-амнезія): на БУДЬ-ЯКОМУ ході (не лише FAQ) ОБОВ'ЯЗКОВО заповнюй rooms[] усіма вже відомими даними бронювання (дати, гості, ночі, номер, нечіткий період) з УСІЄЇ історії. Відповідь на FAQ НЕ повинна стирати раніше надані клієнтом дані. Якщо клієнт раніше назвав дати — ЗБЕРІГАЙ їх у checkin/checkout, навіть якщо ці дати виявились зайняті або бот запропонував інші; скидай/змінюй дату ЛИШЕ коли клієнт сам назве нову.
 
 Значення topic:
-- group_event (НАЙВИЩИЙ ПРІОРИТЕТ): якщо у БУДЬ-ЯКОМУ повідомленні (навіть ранньому) згадано 40+ осіб / велику групу / табір / тур / спортивні збори / весілля / банкет / корпоратив / захід — ЗАВЖДИ став topic=group_event, незалежно від того, про що останнє повідомлення.
+- group_event (НАЙВИЩИЙ ПРІОРИТЕТ): якщо у БУДЬ-ЯКОМУ повідомленні (навіть ранньому) згадано 20+ осіб (сумарно дорослі+діти) / велику групу / табір / тур / спортивні збори / весілля / банкет / корпоратив / захід — ЗАВЖДИ став topic=group_event, незалежно від того, про що останнє повідомлення.
 - price_quote: клієнт обрав КОНКРЕТНИЙ номер і є дати+гості, АБО змінює дати/ночі для вже обраного номеру.
 - general_price: є дати і гості, але конкретний номер НЕ обрано.
 - faq: загальне питання (тоді заповни faq_template). "розваги / активності / що робити / що входить у вартість" -> INCLUDED_IN_THE_PRICE.
@@ -178,7 +178,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
   • НЕЧІТКИЙ період ("початок серпня", "друга половина липня", "у серпні", "влітку", "кінець місяця", "після 6 серпня") => fuzzy_date="<текст періоду клієнта>", checkin=null, checkout=null.
   • НЕ підставляй "перше число місяця" як checkin для нечітких періодів — став fuzzy_date.
 - nights — кількість ночей, ЛИШЕ якщо названо ОДНЕ чітке число ("на 3 ночі"=3, "тиждень"=7, "на 5 діб"=5, "2 ночі"=2). ДІАПАЗОН ("3-5 діб", "на 3-4 ночі") або невідомо => nights=null. Для точних дат nights можна лишити null (порахується з checkin/checkout).
-- adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" => 3; одна особа => 1.
+- adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" / "за трьох" / "на трьох" / "для трьох" / "трьох" => adults=3; "четверо" / "за чотирьох" => 4; одна особа => 1. Якщо клієнт лише УТОЧНЮЄ "дорослі всі" / "всі дорослі" / "дорослі" — кількість дорослих БЕРИ з попередніх повідомлень (напр., раніше "за трьох" => adults=3) і НЕ скидай у 0.
 - children_count — ЗАГАЛЬНА кількість дітей (навіть якщо вік невідомий). children_ages — лише ВІДОМІ віки (цілі), вік не вигадуй.
 - ЗАКРИВАЙ слот дітей: "лише дорослі" / "X дорослих" / "всі дорослі" / "дорослі всі" / "на двох/трьох" БЕЗ згадки дітей => children_count=0, children_ages=[]. НІКОЛИ не перепитуй про дітей, якщо кількість дорослих відома, а дітей не згадано.
 - Якщо згадано N дітей без віку => children_count=N, children_ages=[]. Якщо вказані віки => children_count=кількість, children_ages=[віки].
@@ -236,6 +236,7 @@ async def _deliver(conversation_id: int, text: str):
 
 _conv_locks: dict = {}
 _conv_seq: dict = {}      # conv_id -> latest incoming sequence (drip-burst dedup)
+_slot_memory: dict = {}   # conv_id -> last-known booking slots (robust to extractor drops)
 
 
 def _lock_for(conversation_id):
@@ -323,8 +324,26 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         print(f"[-] Помилка екстракції: {e}")
         return
 
+    # SLOT MEMORY: the extractor sometimes drops a slot the client already gave (LLM
+    # variance), causing the bot to re-ask. Python remembers the booking slots per
+    # conversation and refills anything the fresh extraction left empty (new values win).
+    mem = _slot_memory.get(conversation_id)
+    rooms = slots.get("rooms") or []
+    if rooms:
+        merged = bot_logic.merge_room(mem, rooms[0])
+        slots["rooms"][0] = merged
+    elif mem:
+        merged = dict(mem)
+        slots["rooms"] = [merged]
+    else:
+        merged = None
+    if merged and any(merged.get(f) for f in bot_logic.MERGE_FIELDS):
+        _slot_memory[conversation_id] = bot_logic.remember_room(merged)
+
     # DETERMINISTIC overrides (too important / too often mislabelled to leave to the LLM):
-    if bot_logic.looks_like_large_group(f"{dialogue_history}\n{user_message}"):
+    # Large group = 20+ guests (by text OR consolidated slot count) or any event.
+    if (bot_logic.looks_like_large_group(f"{dialogue_history}\n{user_message}")
+            or bot_logic.slots_total_guests(slots) >= bot_logic.LARGE_GROUP_MIN):
         slots["topic"] = "group_event"
     else:
         # FAQ ABSOLUTE PRIORITY: a clear FAQ (location/pets/food/transport/…) is
