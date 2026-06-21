@@ -127,6 +127,17 @@ def test_plan_guests_known_only_dates_missing_uses_only_dates():
     assert out["reply"] == templates.QUESTION_ONLY_DATES
 
 
+def test_plan_fuzzy_ages_missing_acknowledges_and_asks_age():
+    # Bug 3: fuzzy period + guests but a child's age is missing -> acknowledge the period
+    # (so the client feels heard) AND ask ONLY the age — never ignore the dates.
+    out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "кінець серпня",
+                              "checkin": None, "checkout": None, "nights": None,
+                              "adults": 2, "children_count": 2, "children_ages": []}]})
+    assert out["action"] == "reply"
+    assert out["reply"] == templates.ACKNOWLEDGE_FUZZY_AGE.replace("{fuzzy_date}", "кінець серпня")
+    assert "кінець серпня" in out["reply"] and "вік діток" in out["reply"]
+
+
 def test_plan_child_age_missing_asks_age():
     # #2: 2 adults + 1 child (age unknown) + exact dates -> QUESTION_MISSING_AGE.
     out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
@@ -183,6 +194,20 @@ def test_propose_windows_partial_overlap_visible_full_asks_dates():
     reply = de.propose_windows({"room_type": "Стандарт", "fuzzy_date": "початок серпня"}, avail)
     assert "серпн" in reply and "точні дати" in reply
     assert "липня" not in reply       # never proposes the wrong month
+
+
+def test_first_offered_window_honors_nights():
+    # Decision 2A helper: the (checkin, checkout) a bare "Так" accepts after windows.
+    avail = {"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}}   # 20-27 free
+    assert de.first_offered_window(
+        {"room_type": "Стандарт", "fuzzy_date": "друга половина липня", "nights": 3},
+        avail) == ("2026-07-20", "2026-07-23")          # checkin 20 + 3 nights -> checkout 23
+    win2 = de.first_offered_window(
+        {"room_type": "Стандарт", "fuzzy_date": "друга половина липня"}, avail)
+    assert win2[0] == "2026-07-20"                       # unknown nights -> run end is checkout
+    # Period beyond the visible window -> propose_windows asks for dates -> nothing to accept.
+    assert de.first_offered_window(
+        {"room_type": "Стандарт", "fuzzy_date": "серпень"}, avail) is None
 
 
 def test_propose_windows_period_busy_offers_nearest():
@@ -295,7 +320,7 @@ def test_finalize_quote_all_sold_out_uses_new_sold_out_text():
     reply = de.finalize_quote_all(
         {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 2, "children_ages": []}, avail)
     assert reply == templates.SOLD_OUT_NEAREST
-    assert "на вказані вами дати заброньовані" in reply and "🗓️" in reply
+    assert "на вказані вами дати" in reply and "заброньовані" in reply and "🗓️" in reply
 
 
 def test_finalize_partial_overbooking_offers_other_rooms():

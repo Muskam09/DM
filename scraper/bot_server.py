@@ -113,6 +113,20 @@ async def get_hotel_data_cached(conversation_id: int):
         print(f"[-] Помилка скрапера: {e}")
         return None
 
+
+def peek_cached_availability(conversation_id: int):
+    """Return fresh cached availability WITHOUT scraping (no Playwright, no
+    "Секундочку"). Lets an FAQ reply be combined with a pending booking answer when
+    a scrape already ran this conversation (Bug 1: an FAQ during a scrape must not
+    drop the calendar result)."""
+    entry = AVAILABILITY_CACHE.get(conversation_id)
+    if not entry:
+        return None
+    data, ts = entry
+    if time.time() - ts < CACHE_TTL:
+        return data
+    return None
+
 async def generate_with_retry(prompt: str, retries: int = 3, delay: int = 2):
     for attempt in range(retries):
         try:
@@ -168,9 +182,15 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
   ("п'ятниця", "субота", "неділя", "понеділок", "із суботи на неділю", "виїзд у неділю")
   і є будь-який орієнтир часу (місяць, діапазон чисел типу "23-27", "після N", "наступного
   тижня", або %%TODAY%%) — РОЗРАХУЙ конкретні дати YYYY-MM-DD у 2026 році і заповни
-  checkin/checkout. НЕ лишай рядком, НЕ став fuzzy_date, НЕ перепитуй.
-  • "п'ятниця, виїзд у неділю (після 23-27 червня)" => 26 червня 2026 — п'ятниця,
-    28 червня — неділя => checkin 2026-06-26, checkout 2026-06-28.
+  checkin/checkout. НЕ лишай рядком, НЕ став fuzzy_date, НЕ перепитуй. Місяць бери з
+  КОНТЕКСТУ попередніх повідомлень, якщо в цьому повідомленні його не названо.
+  ⚠ ПРАВИЛО ДІАПАЗОНУ: якщо названо діапазон чисел (напр. "23-27") РАЗОМ із днями тижня
+  (п'ятниця→неділя), знайди саме ту П'ЯТНИЦЮ і ту НЕДІЛЮ, що ПОПАДАЮТЬ УСЕРЕДИНУ цього
+  діапазону чисел. НЕ бери межі діапазону (23 і 27) як дати!
+  • Контекст — липень. "п'ятниця, виїзд в неділю (після 23-27)" => у липні 2026: 24 —
+    п'ятниця, 26 — неділя => checkin 2026-07-24, checkout 2026-07-26 (А НЕ 23-25!).
+  • "п'ятниця, виїзд у неділю (після 23-27 червня)" => 26 червня — п'ятниця, 28 — неділя
+    => checkin 2026-06-26, checkout 2026-06-28.
   • "із суботи на неділю в липні" => найближча Сб→Нд у липні 2026 (заїзд Сб, виїзд Нд).
   • "заїзд у п'ятницю на 2 ночі в серпні" => обери п'ятницю серпня і додай 2 ночі.
 - ТОЧНІ vs НЕЧІТКІ дати (ВАЖЛИВО):
@@ -227,6 +247,25 @@ def route_simple_topic(slots: dict):
     return None  # price_quote / general_price / greeting -> booking path
 
 
+_SCRAPE_ACTIONS = ("quote", "quote_all", "explore", "nearest")
+
+
+def build_booking_reply(decision: dict, simplified: dict):
+    """Turn a deterministic scrape-path decision + availability into the client text.
+    Pure dispatch over dialogue_engine; shared by the live scrape path and the
+    FAQ-combines-with-cached-calendar path (Bug 1)."""
+    act = decision.get("action")
+    if act == "quote":
+        return dialogue_engine.finalize_quote(decision["rooms"], simplified)
+    if act == "quote_all":
+        return dialogue_engine.finalize_quote_all(decision["spec"], simplified)
+    if act == "explore":
+        return dialogue_engine.propose_windows(decision["spec"], simplified)
+    if act == "nearest":
+        return dialogue_engine.nearest_reply(decision["spec"], simplified)
+    return None
+
+
 async def _deliver(conversation_id: int, text: str):
     """Send `text` to Chatwoot, split on [SPLIT], with a human-like 1.5s pause."""
     for msg in bot_logic.split_messages(text):
@@ -236,7 +275,9 @@ async def _deliver(conversation_id: int, text: str):
 
 _conv_locks: dict = {}
 _conv_seq: dict = {}      # conv_id -> latest incoming sequence (drip-burst dedup)
-_slot_memory: dict = {}   # conv_id -> last-known booking slots (robust to extractor drops)
+_slot_memory: dict = {}   # conv_id -> list of last-known booking rooms (robust to extractor drops)
+_greeted: set = set()     # conv_ids already greeted (idempotent vs Chatwoot read-after-write lag)
+_pending_window: dict = {}  # conv_id -> (checkin, checkout) of the first proposed free window
 
 
 def _lock_for(conversation_id):
@@ -302,6 +343,11 @@ async def _handle_incoming(user_message: str, conversation_id: int,
 
     raw_history = get_chatwoot_history(conversation_id)
     bot_has_spoken = any(msg.get("message_type") in ["outgoing", 1] for msg in raw_history)
+    # Idempotent greeting: if we already greeted this conversation, trust that over the
+    # history (Chatwoot read-after-write lag can hide a just-sent greeting and cause a
+    # double-greet when an FAQ interrupts the first scrape).
+    if conversation_id in _greeted:
+        bot_has_spoken = True
 
     dialogue_history = ""
     for msg in raw_history:
@@ -324,21 +370,22 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         print(f"[-] Помилка екстракції: {e}")
         return
 
-    # SLOT MEMORY: the extractor sometimes drops a slot the client already gave (LLM
-    # variance), causing the bot to re-ask. Python remembers the booking slots per
-    # conversation and refills anything the fresh extraction left empty (new values win).
-    mem = _slot_memory.get(conversation_id)
-    rooms = slots.get("rooms") or []
-    if rooms:
-        merged = bot_logic.merge_room(mem, rooms[0])
-        slots["rooms"][0] = merged
-    elif mem:
-        merged = dict(mem)
-        slots["rooms"] = [merged]
-    else:
-        merged = None
-    if merged and any(merged.get(f) for f in bot_logic.MERGE_FIELDS):
-        _slot_memory[conversation_id] = bot_logic.remember_room(merged)
+    # SLOT MEMORY (multi-room): the extractor sometimes drops a slot the client already
+    # gave (LLM variance), causing the bot to re-ask / forget a 2nd room. Python remembers
+    # the booking rooms per conversation and refills anything the fresh extraction left
+    # empty, BY INDEX (new values win; un-mentioned rooms are preserved — never forget).
+    prev_mem = _slot_memory.get(conversation_id)
+    merged_rooms = bot_logic.merge_rooms(prev_mem, slots.get("rooms") or [])
+    slots["rooms"] = merged_rooms
+    new_mem = bot_logic.remember_rooms(merged_rooms)
+    if any(any(r.get(f) for f in bot_logic.MERGE_FIELDS) for r in new_mem):
+        _slot_memory[conversation_id] = new_mem
+
+    # Bug 2: did THIS turn actually CHANGE the booking state? Compared against the prior
+    # memory AFTER the merge — robust even when the extractor (per the anti-amnesia rule)
+    # re-emits the same slots on a chit-chat turn. If nothing changed, the message added
+    # no new booking info -> it must NOT launch a redundant calendar search.
+    slots_changed = (new_mem != (prev_mem or []))
 
     # DETERMINISTIC overrides (too important / too often mislabelled to leave to the LLM):
     # Large group = 20+ guests (by text OR consolidated slot count) or any event.
@@ -353,6 +400,24 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             slots["topic"] = "faq"
             slots["faq_template"] = faq_tmpl
             slots["_faq_override"] = True
+    # Decision 2: a bare confirmation ("Так" / "Давайте") means different things by the
+    # bot's PREVIOUS message — accept the first proposed window, or proceed to payment.
+    if bot_logic.is_bare_confirmation(user_message):
+        last_bot_msg = next((m.get("content", "") for m in reversed(raw_history)
+                             if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
+        if bot_logic.is_quote_message(last_bot_msg):
+            slots["topic"] = "booking_confirm"            # Context B: ready to pay -> BOOK_ROOM
+            print(f"[i] {conversation_id}: bare 'Так' after a quote -> booking_confirm")
+        elif bot_logic.is_window_offer_message(last_bot_msg) and _pending_window.get(conversation_id):
+            ci, co = _pending_window[conversation_id]      # Context A: accept the FIRST window
+            base = (slots.get("rooms") or [{}])[0]
+            room0 = dict(base); room0["checkin"] = ci; room0["checkout"] = co; room0["fuzzy_date"] = None
+            slots["rooms"] = [room0] + (slots.get("rooms") or [])[1:]
+            slots["topic"] = "price_quote"
+            _slot_memory[conversation_id] = bot_logic.remember_rooms(slots["rooms"])
+            _pending_window.pop(conversation_id, None)
+            slots_changed = True                           # dates changed -> the quote scrape may run
+            print(f"[i] {conversation_id}: bare 'Так' accepts window {ci}..{co}")
     print(f"[i] Slots: {slots}")
 
     # Fix 2: a COMPLETELY unrecognized intent is the only manager hand-off (date
@@ -365,48 +430,106 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         return
 
     # 2) DETERMINISTIC ROUTING — Python decides everything below.
+    is_faq_reply = (slots.get("topic") == "faq")
     reply = route_simple_topic(slots)
     if reply is None:
         decision = dialogue_engine.plan(slots)
-        if decision["action"] in ("quote", "quote_all", "explore", "nearest"):
-            # Greet FIRST on the first turn, then the scrape notice, then the result.
-            if not bot_has_spoken:
-                await _deliver(conversation_id, bot_logic.GREETING)
-                bot_has_spoken = True
-            # Check the calendar BEFORE answering (sends "Секундочку…").
-            availability_data = await get_hotel_data_cached(conversation_id)
-            if not availability_data:
-                await asyncio.to_thread(send_chatwoot_message, conversation_id,
-                                        "Вибачте, технічна затримка бази. Менеджер вже підключається.")
-                return
-            simplified = bot_logic.build_simplified_availability(availability_data)
-            act = decision["action"]
-            if act == "quote":
-                reply = dialogue_engine.finalize_quote(decision["rooms"], simplified)
-            elif act == "quote_all":   # exact dates, no chosen room -> price every type
-                reply = dialogue_engine.finalize_quote_all(decision["spec"], simplified)
-            elif act == "explore":     # A3: unsure dates -> propose available windows
-                reply = dialogue_engine.propose_windows(decision["spec"], simplified)
-            else:                      # A2 Step 3: nearest dates for a chosen room
-                reply = dialogue_engine.nearest_reply(decision["spec"], simplified)
+        if decision["action"] in _SCRAPE_ACTIONS:
+            if not slots_changed and slots.get("topic") != "nearest_dates":
+                # Bug 2: this turn added NO new booking info -> never re-scan (chit-chat
+                # just repeats — or flips — a prior result). Robust to the extractor
+                # re-emitting known slots. "Search nearest dates" is exempt above.
+                if slots.get("topic") in ("price_quote", "general_price"):
+                    # Decision 1: a price re-ask must NOT go silent.
+                    cached = peek_cached_availability(conversation_id)
+                    if cached is None:
+                        reply = templates.PRICE_NEED_DETAILS
+                    elif decision["action"] == "explore":
+                        # No exact dates yet -> explain we need details + RE-SHOW the windows.
+                        simplified = bot_logic.build_simplified_availability(cached)
+                        reply = (templates.PRICE_NEED_DETAILS + "\n\n"
+                                 + dialogue_engine.propose_windows(decision["spec"], simplified))
+                        win = dialogue_engine.first_offered_window(decision["spec"], simplified)
+                        if win:
+                            _pending_window[conversation_id] = win
+                    else:
+                        # Exact dates ARE known -> just re-quote from cache (we have details).
+                        reply = build_booking_reply(
+                            decision, bot_logic.build_simplified_availability(cached))
+                else:
+                    print(f"[i] {conversation_id}: booking unchanged by '{user_message[:40]}' -> no re-scan (silent).")
+                    return
+            else:
+                # Greet FIRST on the first turn, then the scrape notice, then the result.
+                if not bot_has_spoken:
+                    await _deliver(conversation_id, bot_logic.GREETING)
+                    _greeted.add(conversation_id)
+                    bot_has_spoken = True
+                # Check the calendar BEFORE answering (sends "Секундочку…").
+                availability_data = await get_hotel_data_cached(conversation_id)
+                if not availability_data:
+                    if not _superseded(conversation_id, seq):
+                        await asyncio.to_thread(send_chatwoot_message, conversation_id,
+                                                "Вибачте, технічна затримка бази. Менеджер вже підключається.")
+                    return
+                simplified = bot_logic.build_simplified_availability(availability_data)
+                reply = build_booking_reply(decision, simplified)
+                # Decision 2A: remember the first proposed window so a later "Так" accepts it.
+                if decision["action"] == "explore":
+                    win = dialogue_engine.first_offered_window(decision["spec"], simplified)
+                    if win:
+                        _pending_window[conversation_id] = win
         else:
             reply = decision["reply"]
 
-    # 3) SEND — but if a newer drip arrived WHILE we were processing (e.g. during a
-    #    20s scrape), suppress this reply so the burst yields exactly ONE final reply.
+    # 3) SEND. A newer drip that arrived while we were processing supersedes this reply,
+    #    so a burst collapses to ONE consolidated reply AND a mid-scrape correction wins
+    #    (no stale/double quote). A scrape still populated the cache for the next turn.
     if _superseded(conversation_id, seq):
         print(f"[i] {conversation_id}: msg #{seq} superseded mid-processing -> suppress reply.")
         return
-    # Anti-spam: never send the SAME message twice in a row. When a client keeps
-    # sending vague fragments, we ask once and then stay quiet until they add info.
+
+    # Bug 1: an FAQ answered while a scrape was in flight must not drop the booking
+    #    answer. The (prior/superseded) scrape populated the cache, so COMBINE: deliver
+    #    the FAQ reply, then the pending booking result FROM CACHE — no new scrape, latest
+    #    slots (never stale), one turn (never double).
+    booking_extra = None
+    if is_faq_reply:
+        cached = peek_cached_availability(conversation_id)
+        if cached is not None:
+            d2 = dialogue_engine.plan(slots)
+            if d2.get("action") in _SCRAPE_ACTIONS:
+                simplified = bot_logic.build_simplified_availability(cached)
+                booking_extra = build_booking_reply(d2, simplified)
+                if d2.get("action") == "explore":
+                    win = dialogue_engine.first_offered_window(d2["spec"], simplified)
+                    if win:
+                        _pending_window[conversation_id] = win
+    if booking_extra:
+        reply = reply.replace(templates.FAQ_CONTINUE_NUDGE, "")  # send the real result, not the nudge
+
+    # Anti-spam: never send the SAME message twice in a row (across both emits this turn).
     last_bot = next((m.get("content", "").strip() for m in reversed(raw_history)
                      if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
-    if last_bot and reply.strip() == last_bot:
-        print(f"[i] {conversation_id}: reply identical to previous -> suppress (anti-spam).")
-        return
+
+    async def _emit(text):
+        nonlocal last_bot, bot_has_spoken
+        if not text or not text.strip():
+            return
+        if last_bot and text.strip() == last_bot:
+            print(f"[i] {conversation_id}: reply identical to previous -> suppress (anti-spam).")
+            return
+        out = bot_logic.prepend_greeting_if_needed(text, bot_has_spoken)
+        if out != text:                       # greeting was prepended this emit
+            _greeted.add(conversation_id)
+        await _deliver(conversation_id, out)
+        bot_has_spoken = True
+        last_bot = text.strip()
+
     try:
-        reply = bot_logic.prepend_greeting_if_needed(reply, bot_has_spoken)
-        await _deliver(conversation_id, reply)
+        await _emit(reply)
+        if booking_extra:
+            await _emit(booking_extra)
     except Exception as e:
         print(f"[-] Помилка надсилання: {e}")
 

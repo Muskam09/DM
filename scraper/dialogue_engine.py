@@ -292,6 +292,43 @@ def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
     return templates.NEAREST_NONE
 
 
+def first_offered_window(spec: Dict, availability: Dict):
+    """The (checkin, checkout) a bare 'Так' should accept after `propose_windows` showed
+    free віконця — the first concrete free window, honoring the requested nights when
+    known (else the displayed run). Returns None when no window would have been offered
+    (e.g. the period is beyond the visible calendar)."""
+    room = spec.get("room_type") or OFFERABLE_ROOMS[0]
+    room_count = spec.get("room_count") or 1
+    min_nights = spec.get("nights") or 2
+    fuzzy = spec.get("fuzzy_date") or ""
+    key = bot_logic.match_availability_key(availability, room)
+    avail = (availability.get(key) or {}) if key else {}
+    all_dates = sorted(avail.keys())
+    period = fuzzy_period_range(fuzzy)
+    in_period = [d for d in all_dates if period is None or period[0] <= d <= period[1]]
+    windows = _free_windows(avail, in_period, min_nights, room_count)
+    if not windows:
+        vis_max = all_dates[-1] if all_dates else None
+        if period is not None and vis_max is not None and period[1] > vis_max:
+            return None    # propose_windows asks for exact dates here -> nothing to accept
+        windows = _free_windows(avail, all_dates, min_nights, room_count)
+    if not windows:
+        return None
+    run0, run_last = windows[0]
+    ci = pricing_engine._as_date(run0)
+    last = pricing_engine._as_date(run_last)
+    nights = spec.get("nights")
+    if isinstance(nights, int) and nights > 0:
+        co = ci + timedelta(days=nights)
+        if co > last:
+            co = last
+    else:
+        co = last
+    if co <= ci:
+        co = ci + timedelta(days=1)
+    return (run0, co.isoformat())
+
+
 def plan(slots: Dict) -> Dict:
     """Slots -> decision. action in {reply, quote, quote_all, explore, nearest}."""
     rooms = slots.get("rooms") or []
@@ -339,10 +376,11 @@ def plan(slots: Dict) -> Dict:
         if fuzzy:
             # Fix 1: guests + a fuzzy period -> PROACTIVELY scan that period NOW. Never
             # bounce back asking for exact dates. Unknown nights -> the scan defaults to
-            # 2–3-night blocks (propose_windows). If a child's age is still missing, ask
-            # ONLY the age (not dates) — dates come from the proposed windows.
+            # 2–3-night blocks (propose_windows). Bug 3: if a child's age is still missing,
+            # ACKNOWLEDGE the period (so the client feels heard) and ask ONLY the age.
             if ages_missing:
-                return {"action": "reply", "reply": templates.QUESTION_MISSING_AGE}
+                return {"action": "reply",
+                        "reply": templates.ACKNOWLEDGE_FUZZY_AGE.replace("{fuzzy_date}", fuzzy)}
             fuzzy_room = next((r for r in rooms if r.get("fuzzy_date")), rooms[0])
             spec = {**fuzzy_room, "nights": nights or 0, "fuzzy_date": fuzzy}
             return {"action": "explore", "spec": spec}

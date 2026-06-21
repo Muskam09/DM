@@ -243,6 +243,66 @@ def remember_room(room) -> Dict:
     return {f: (room or {}).get(f) for f in MERGE_FIELDS}
 
 
+def merge_rooms(remembered_list, fresh_list) -> List[Dict]:
+    """Multi-room slot memory: merge fresh rooms with remembered rooms BY INDEX. Each
+    room's missing fields are filled from the same-index remembered room; remembered
+    rooms the fresh turn didn't re-mention are PRESERVED (the bot must never forget a
+    second/third room across a chit-chat or FAQ turn)."""
+    rem = remembered_list or []
+    fresh = fresh_list or []
+    n = max(len(rem), len(fresh))
+    out = []
+    for i in range(n):
+        f = fresh[i] if i < len(fresh) else {}
+        r = rem[i] if i < len(rem) else {}
+        out.append(merge_room(r, f))
+    return out
+
+
+def remember_rooms(rooms_list) -> List[Dict]:
+    """Project a full multi-room booking down to carried-over fields (for storage)."""
+    return [remember_room(r) for r in (rooms_list or [])]
+
+
+# --- bare confirmations ("Так" / "Давайте") — handled by CONTEXT ------------
+# A bare yes means different things depending on what the bot just said: accept the
+# proposed dates, or proceed to payment. Detection is deterministic; the meaning is
+# decided from the previous bot message (see bot_server).
+_CONFIRM_WORDS = {
+    "так", "ага", "ок", "окей", "окк", "добре", "гаразд", "давайте", "давай", "згоден",
+    "згодна", "згода", "погоджуюсь", "погоджуюся", "підходить", "влаштовує", "беремо",
+    "бронюю", "бронюємо", "бронюйте", "оформлюйте", "оформлюємо", "оформляйте", "ok", "yes",
+}
+
+
+def is_bare_confirmation(text: str) -> bool:
+    """True when the message is essentially just an affirmation ("так", "давайте",
+    "добре, бронюємо") with no new data (no digits). Combined with the previous bot
+    message in bot_server to decide what the client is agreeing to."""
+    t = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in (text or "").lower())
+    t = t.strip()
+    if not t or any(c.isdigit() for c in t):
+        return False
+    words = t.split()
+    if not words or len(words) > 4:
+        return False
+    return any(w in _CONFIRM_WORDS for w in words)
+
+
+def is_quote_message(text: str) -> bool:
+    """True if the bot's previous message was a price quote that ended with
+    'Бажаєте забронювати?' — so a bare 'Так' means: proceed to payment."""
+    t = (text or "").lower()
+    return "буде вартувати" in t or "загальна вартість" in t
+
+
+def is_window_offer_message(text: str) -> bool:
+    """True if the bot's previous message proposed concrete free date window(s) — so a
+    bare 'Так' means: accept the FIRST proposed window."""
+    t = (text or "").lower()
+    return "вільні віконця" in t or "найближче вільне віконце" in t
+
+
 def has_booking_context(slots) -> bool:
     """Fix 3 — True if the slots already carry ANY booking data (dates, fuzzy period,
     room, nights, or guests). An FAQ answered mid-booking must preserve this state,

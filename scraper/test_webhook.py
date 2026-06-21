@@ -153,6 +153,41 @@ def test_slots_total_guests():
     assert bot_logic.slots_total_guests({"rooms": []}) == 0
 
 
+def test_merge_rooms_multi_room_preserves_unmentioned():
+    # Decision 3: a 2nd room the fresh turn didn't re-mention must be preserved.
+    prev = [{"room_type": "Стандарт", "adults": 2, "checkin": "2026-07-05", "checkout": "2026-07-07"},
+            {"room_type": "Напівлюкс", "adults": 3, "checkin": "2026-07-05", "checkout": "2026-07-07"}]
+    merged = bot_logic.merge_rooms(prev, [{"room_type": "Стандарт", "adults": 2}])
+    assert len(merged) == 2
+    assert merged[1]["room_type"] == "Напівлюкс" and merged[1]["checkin"] == "2026-07-05"
+    # A brand-new 2nd room is appended; index-0 fields merge.
+    merged2 = bot_logic.merge_rooms([{"room_type": "Стандарт", "adults": 2}],
+                                    [{"room_type": "Стандарт"}, {"room_type": "Напівлюкс"}])
+    assert len(merged2) == 2 and merged2[1]["room_type"] == "Напівлюкс"
+    assert merged2[0]["adults"] == 2     # inherited from memory
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Так", True), ("так, давайте", True), ("Давайте", True), ("Добре, бронюємо", True),
+    ("ок", True), ("Погоджуюсь", True),
+    ("так, на 5-7 липня", False),    # has digits -> new info, not a bare yes
+    ("Стандарт +", False),
+    ("а скільки коштує?", False),
+    ("", False),
+])
+def test_is_bare_confirmation(text, expected):
+    assert bot_logic.is_bare_confirmation(text) is expected
+
+
+def test_message_context_helpers():
+    assert bot_logic.is_quote_message(
+        "Вартість номеру типу Стандарт ... буде вартувати - 4400 грн. Бажаєте забронювати? 💙") is True
+    assert bot_logic.is_window_offer_message(
+        "Я перевірив календар ... маємо вільні віконця: 23 - 26 липня. Які дати?") is True
+    assert bot_logic.is_quote_message("Підкажіть, будь ласка, дати") is False
+    assert bot_logic.is_window_offer_message("Підкажіть, будь ласка, дати") is False
+
+
 @pytest.mark.parametrize("text,expected", [
     ("Де саме знаходиться готель?", True),
     ("Де ви розташовані?", True),
@@ -245,6 +280,8 @@ def server(monkeypatch):
     bot_server._conv_locks.clear()   # fresh per-conversation locks per test/event-loop
     bot_server._conv_seq.clear()
     bot_server._slot_memory.clear()  # fresh slot memory per test
+    bot_server._greeted.clear()      # fresh greeting state per test
+    bot_server._pending_window.clear()  # fresh pending-window state per test
 
     def configure(slots=None, slots_text=None, history=None, availability=None,
                   labels=None, dynamic_history=False):
@@ -449,6 +486,143 @@ def test_e2e_slot_memory_restores_dropped_guests(server):
     assert templates.PETS.split("\n")[0] in joined          # answered the pet FAQ
     assert templates.QUESTION_ALL_MISSING not in joined     # never re-asks from scratch
     assert templates.QUESTION_ONLY_DATES in joined          # asks ONLY the missing dates
+
+
+def test_e2e_superseded_scrape_suppressed_but_cached(server):
+    # Bug 1 (revised): a scrape superseded mid-flight is SUPPRESSED (so a newer message
+    # — a date correction — wins; no stale/double quote), BUT it still populated the
+    # cache so the next/latest turn can deliver the result without a re-scrape.
+    bs = server.configure(
+        slots={"topic": "general_price", "rooms": [
+            {"room_type": None, "fuzzy_date": "друга половина липня", "nights": 3,
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(),
+        availability=_raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}}))
+    bs._conv_seq[902] = 5   # a newer message arrived while this one scraped
+    _run(bs._handle_incoming("друга половина липня", 902, seq=1))
+    assert server.state["scraped"] is True
+    assert not any("вільні віконця" in m for m in server.sent)   # superseded -> suppressed
+    assert bs.peek_cached_availability(902) is not None          # cache populated for next turn
+
+
+def test_e2e_cheap_reply_suppressed_when_superseded(server):
+    # A CHEAP reply IS superseded by a newer drip, so a burst collapses to one reply.
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, history=_bot_spoke())
+    bs._conv_seq[903] = 5
+    _run(bs._handle_incoming("привіт", 903, seq=1))
+    assert server.sent == []
+
+
+def test_e2e_faq_during_scrape_combines_with_cached_booking(server):
+    # Bug 1: an FAQ asked while a scrape was in flight must not drop the booking answer.
+    # The (prior/superseded) scrape populated the cache -> the FAQ turn answers the FAQ
+    # AND delivers the pending calendar result FROM CACHE (no new scrape).
+    import time as _t
+    bs = server.configure(
+        slots={"topic": "faq", "faq_template": "FOOD_PRICES", "rooms": [
+            {"room_type": None, "fuzzy_date": "друга половина липня", "nights": 3,
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke())
+    bs.AVAILABILITY_CACHE[905] = (
+        _raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}}), _t.time())
+    _run(bs.process_incoming_message("а харчування є?", 905))
+    joined = "\n".join(server.sent)
+    assert templates.FOOD_PRICES.split("\n")[0] in joined       # FAQ answered
+    assert "вільні віконця" in joined                           # + calendar result from cache
+    assert server.state["scraped"] is False                     # used cache, no new scrape
+
+
+def test_e2e_greeting_idempotent_across_history_lag(server):
+    # An FAQ interrupting the first scrape must not double-greet even if Chatwoot's
+    # history hasn't yet recorded the just-sent greeting (read-after-write lag).
+    avail = _raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}})
+    bs = server.configure(
+        slots={"topic": "general_price", "rooms": [
+            {"room_type": None, "fuzzy_date": "друга половина липня", "nights": 3,
+             "adults": 2, "children_ages": []}]},
+        history=[], availability=avail)               # first turn -> greets
+    _run(bs.process_incoming_message("друга половина липня, на двох", 907))
+    assert any(m.startswith("Доброго дня! Вас вітає") for m in server.sent)
+    server.sent.clear()
+    server.configure(slots={"topic": "faq", "faq_template": "PETS", "rooms": []},
+                     history=[], availability=avail)  # lag: history STILL hides the greeting
+    _run(bs.process_incoming_message("а з собакою можна?", 907))
+    assert not any(m.startswith("Доброго дня! Вас вітає") for m in server.sent)   # no double greeting
+
+
+def test_e2e_filler_with_refilled_slots_no_rescan(server):
+    # Bug 2 (robust): even when the well-behaved extractor RE-EMITS the known slots on a
+    # chit-chat turn (per the anti-amnesia rule), an UNCHANGED booking must NOT re-scan.
+    avail = _raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}})
+    room = {"room_type": None, "fuzzy_date": "друга половина липня", "nights": 3,
+            "adults": 2, "children_ages": []}
+    bs = server.configure(slots={"topic": "fuzzy_dates", "rooms": [dict(room)]},
+                          history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("друга половина липня, на двох", 906))   # establishes memory + scrapes
+    assert server.state["scraped"] is True
+    server.state["scraped"] = False
+    server.sent.clear()
+    # filler turn: extractor RE-EMITS the SAME slots (not empty) -> slots_changed must be False
+    server.configure(slots={"topic": "fuzzy_dates", "rooms": [dict(room)]},
+                     history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("Але відпочинок просто необхідний!", 906))
+    assert server.state["scraped"] is False    # unchanged booking -> no re-scan
+    assert server.sent == []                    # silent
+    assert 906 in bs._slot_memory               # slot memory preserved
+
+
+def test_e2e_bare_yes_after_quote_triggers_booking(server):
+    # Decision 2B: the bot's last message was a price quote -> a bare "Так" means the
+    # client is ready to pay -> BOOK_ROOM (IBAN/payment) flow.
+    bs = server.configure(
+        slots={"topic": "greeting", "rooms": []},
+        history=[{"id": 1, "message_type": "outgoing",
+                  "content": "Вартість номеру типу Стандарт, для 2 дорослих, на 2 ночі "
+                             "(5 - 7 липня), буде вартувати - 4400 грн\nБажаєте забронювати? 💙"}])
+    _run(bs.process_incoming_message("Так", 410))
+    assert any("IBAN" in m for m in server.sent)        # BOOK_ROOM payment details
+
+
+def test_e2e_bare_yes_after_windows_accepts_first(server):
+    # Decision 2A: the bot proposed windows (stored _pending_window) -> a bare "Так"
+    # applies the first window's dates and proceeds to a quote.
+    avail = _raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}})
+    bs = server.configure(
+        slots={"topic": "fuzzy_dates", "rooms": [
+            {"room_type": None, "fuzzy_date": "друга половина липня", "nights": 3,
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("друга половина липня, на двох", 411))   # proposes + stores window
+    assert 411 in bs._pending_window
+    server.sent.clear()
+    server.state["scraped"] = False
+    server.configure(slots={"topic": "greeting", "rooms": []},
+                     history=[{"id": 9, "message_type": "outgoing",
+                               "content": "маємо вільні віконця: 20 - 23 липня. Які дати вам підходять?"}],
+                     availability=avail)
+    _run(bs.process_incoming_message("Так", 411))
+    assert any("грн" in m for m in server.sent)         # window accepted -> quote produced
+    assert 411 not in bs._pending_window                # pending window consumed
+
+
+def test_e2e_price_reask_without_dates_reshows_windows(server):
+    # Decision 1: a price re-ask with no new info must NOT go silent -> explain + re-show
+    # the proposed windows (from cache, no new scrape).
+    avail = _raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}})
+    room = {"room_type": None, "fuzzy_date": "друга половина липня", "nights": 3,
+            "adults": 2, "children_ages": []}
+    bs = server.configure(slots={"topic": "fuzzy_dates", "rooms": [dict(room)]},
+                          history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("друга половина липня, на двох", 412))   # proposes windows + caches
+    server.sent.clear()
+    server.state["scraped"] = False
+    server.configure(slots={"topic": "general_price", "rooms": [dict(room)]},
+                     history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("а скільки вартість доби?", 412))
+    full = "\n".join(server.sent)
+    assert "Для точного розрахунку вартості доби" in full   # PRICE_NEED_DETAILS
+    assert "вільні віконця" in full                         # + re-shown windows
+    assert server.state["scraped"] is False                 # used cache, no new scrape
 
 
 def test_e2e_fuzzy_with_guests_proactively_scans(server):
