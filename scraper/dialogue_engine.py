@@ -94,11 +94,18 @@ def dates_phrase(checkin, checkout) -> str:
     return f"{ci.day} {_GEN_MONTHS[ci.month]} - {co.day} {_GEN_MONTHS[co.month]}"
 
 
+def room_count_phrase(n: int) -> str:
+    return f"{n} {_ua_plural(n, 'номера', 'номери', 'номерів')}"
+
+
 def quote_line(room_type, adults, children_ages, checkin, checkout, nights, price,
-               ubd=False) -> str:
-    """The single, rigid quote format mandated by the business."""
+               ubd=False, room_count=1) -> str:
+    """The single, rigid quote format. For >1 room of the SAME type it states the count
+    explicitly ("Вартість за 2 номери типу …") and `price` is the combined total."""
+    head = (f"Вартість за {room_count_phrase(room_count)} типу {room_type}, "
+            if room_count > 1 else f"Вартість номеру типу {room_type}, ")
     line = (
-        f"Вартість номеру типу {room_type}, для {guests_phrase(adults, children_ages)}, "
+        head + f"для {guests_phrase(adults, children_ages)}, "
         f"на {nights_phrase(nights)} ({dates_phrase(checkin, checkout)}), "
         f"буде вартувати - {price} грн"
     )
@@ -108,15 +115,34 @@ def quote_line(room_type, adults, children_ages, checkin, checkout, nights, pric
 
 
 def build_quote_reply(priced_rooms: List[Dict]) -> str:
-    lines = [
-        quote_line(r["room_type"], r["adults"], r["children_ages"],
-                   r["checkin"], r["checkout"], r["nights"], r["price"], r.get("ubd", False))
-        for r in priced_rooms
-    ]
+    """Render the quote(s). Identical rooms (same type/dates/guests) COLLAPSE into one
+    "за N номери типу X" line with the combined price (Bug 3, Fix A). The grand total sums
+    only DISTINCT room groups — the same room is never counted twice (type ALTERNATIVES
+    arrive via finalize_quote_all, not here, so they are never summed)."""
+    def sig(r):
+        return (r["room_type"], r["checkin"], r["checkout"], r["adults"],
+                tuple(r.get("children_ages") or []), bool(r.get("ubd")))
+
+    groups: List[List[Dict]] = []
+    for r in priced_rooms:
+        for g in groups:
+            if sig(g[0]) == sig(r):
+                g.append(r)
+                break
+        else:
+            groups.append([r])
+
+    lines, total = [], 0
+    for g in groups:
+        per, cnt = g[0], len(g)
+        group_price = per["price"] * cnt
+        total += group_price
+        lines.append(quote_line(per["room_type"], per["adults"], per["children_ages"],
+                                per["checkin"], per["checkout"], per["nights"], group_price,
+                                per.get("ubd", False), room_count=cnt))
     if len(lines) == 1:
         reply = lines[0] + "\nБажаєте забронювати? 💙"
     else:
-        total = sum(r["price"] for r in priced_rooms)
         reply = "\n".join(lines) + f"\n\nЗагальна вартість: {total} грн\nБажаєте забронювати? 💙"
     if any(r.get("ubd") for r in priced_rooms):
         reply += "\n\n" + templates.MILITARY
@@ -264,10 +290,12 @@ def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
     all_dates = sorted(avail.keys())
 
     def _offer(windows):
-        parts = [dates_phrase(w[0], w[1]) for w in windows[:count]]
-        return (templates.PROPOSE_WINDOWS
-                .replace("{fuzzy_date}", fuzzy or "найближчий період")
-                .replace("{found_dates}", ", або ".join(parts)))
+        found = ", або ".join(dates_phrase(w[0], w[1]) for w in windows[:count])
+        if fuzzy:
+            return (templates.PROPOSE_WINDOWS
+                    .replace("{fuzzy_date}", fuzzy).replace("{found_dates}", found))
+        # No named period (client said "дати ще не знаю") -> open-calendar phrasing.
+        return templates.PROPOSE_WINDOWS_OPEN.replace("{found_dates}", found)
 
     period = fuzzy_period_range(fuzzy)
     in_period = [d for d in all_dates if period is None or period[0] <= d <= period[1]]
@@ -329,11 +357,20 @@ def first_offered_window(spec: Dict, availability: Dict):
     return (run0, co.isoformat())
 
 
+def nearest_window_any(availability: Dict, after, nights: int, room_count: int = 1):
+    """Earliest free window across ANY offerable room type — for auto-proposing the
+    nearest dates when the client's exact dates are sold out (Bug 2: don't ask permission)."""
+    cands = [find_nearest_window(availability, rt, after, nights, room_count)
+             for rt in OFFERABLE_ROOMS]
+    cands = [c for c in cands if c]
+    return min(cands, key=lambda w: w[0]) if cands else None
+
+
 def offered_window(decision: Dict, availability: Dict):
     """The (checkin, checkout) the bot is offering in a window-offer reply, for ANY
-    decision path (explore windows, a chosen room's SOLD_OUT_FOUND_NEAREST, or nearest).
-    Stored as `_pending_window` so a later bare 'Так' quotes EXACTLY these dates instead
-    of re-searching. None when the reply isn't a concrete window."""
+    decision path (explore windows, a chosen room's SOLD_OUT_FOUND_NEAREST, quote_all
+    sold-out, or nearest). Stored as `_pending_window` so a later bare 'Так' quotes EXACTLY
+    these dates instead of re-searching. None when the reply isn't a concrete window."""
     act = decision.get("action")
     if act == "explore":
         return first_offered_window(decision.get("spec") or {}, availability)
@@ -352,6 +389,12 @@ def offered_window(decision: Dict, availability: Dict):
             if bot_logic.is_room_available(availability, rt, nights) == "sold_out" \
                     and not bot_logic.free_room_types(availability, nights):
                 return find_nearest_window(availability, rt, ci, len(nights))
+        return None
+    if act == "quote_all":
+        spec = decision.get("spec") or {}
+        ci, co = spec.get("checkin"), spec.get("checkout")
+        if ci and co:
+            return nearest_window_any(availability, ci, len(pricing_engine.night_dates(ci, co)))
         return None
     return None
 
@@ -526,7 +569,12 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
         lines.append(f"{_ROOM_EMOJI.get(room_type, '•')} {room_type} — {price} грн")
 
     if not lines:
-        return templates.SOLD_OUT_NEAREST
+        # Bug 2: everything sold out -> AUTO-propose the nearest free window (don't ask
+        # permission). Only fall back to NEAREST_NONE if nothing free in the whole window.
+        win = nearest_window_any(simplified_availability, checkin, len(nights))
+        if win:
+            return templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1]))
+        return templates.NEAREST_NONE
 
     header = (f"На дати {dates_phrase(checkin, checkout)} ({nights_phrase(len(nights))}) "
               f"для {guests_phrase(adults, children_ages)} доступні такі номери:")

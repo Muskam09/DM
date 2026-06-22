@@ -184,7 +184,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 
 Правила заповнення rooms:
 - Для general_price (є дати+гості, без номеру) додай ОДИН об'єкт з room_type=null.
-- Для кількох номерів — окремий об'єкт на КОЖЕН номер.
+- КІЛЬКА НОМЕРІВ — окремий об'єкт у rooms[] на КОЖЕН номер ТІЛЬКИ якщо клієнт ЯВНО просить кілька номерів ("2 номери", "два номери", "дві сім'ї", "1 Стандарт і 1 Напівлюкс"). Якщо клієнт називає лише КІЛЬКІСТЬ ОСІБ ("4 дорослих", "нас 5", "на шістьох") — це ОДИН об'єкт rooms[] з відповідними adults/children. НЕ розбивай гостей на кілька номерів і НЕ присвоюй різні типи номерів сам — покажемо варіанти і клієнт обере.
 - checkout = дата ВИЇЗДУ (остання ніч НЕ включається). "5-7 липня" => checkin 2026-07-05, checkout 2026-07-07.
 - Якщо дано дату заїзду + кількість ночей — обчисли checkout = заїзд + ночі.
 - Відносні дати ("завтра", "післязавтра", "на вихідних") рахуй від %%TODAY%%.
@@ -289,6 +289,7 @@ _conv_seq: dict = {}      # conv_id -> latest incoming sequence (drip-burst dedu
 _slot_memory: dict = {}   # conv_id -> list of last-known booking rooms (robust to extractor drops)
 _greeted: set = set()     # conv_ids already greeted (idempotent vs Chatwoot read-after-write lag)
 _pending_window: dict = {}  # conv_id -> (checkin, checkout) of the first proposed free window
+_no_dates_mode: set = set() # conv_ids where the client said they don't know dates yet
 
 
 def _lock_for(conversation_id):
@@ -407,6 +408,14 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     # no new booking info -> it must NOT launch a redundant calendar search.
     slots_changed = (new_mem != (prev_mem or []))
 
+    # Bug 1: track "client doesn't know dates yet" so a later guests-only turn proactively
+    # SCANS the calendar instead of looping the date question. Exit the mode once any dates
+    # (exact OR fuzzy) appear.
+    if bot_logic.says_no_dates(user_message):
+        _no_dates_mode.add(conversation_id)
+    if any((r.get("checkin") or r.get("checkout") or r.get("fuzzy_date")) for r in merged_rooms):
+        _no_dates_mode.discard(conversation_id)
+
     # DETERMINISTIC overrides (too important / too often mislabelled to leave to the LLM):
     # Large group = 20+ guests (by text OR consolidated slot count) or any event.
     if (bot_logic.looks_like_large_group(f"{dialogue_history}\n{user_message}")
@@ -467,6 +476,17 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     reply = route_simple_topic(slots)
     if reply is None:
         decision = dialogue_engine.plan(slots)
+        # Bug 1: guests are known and the client already said they don't know dates ->
+        # PROACTIVELY scan the open calendar and propose windows, instead of looping
+        # QUESTION_ONLY_DATES (which the anti-spam guard would then suppress -> silence).
+        if (decision.get("action") == "reply" and decision.get("reply") == templates.QUESTION_ONLY_DATES
+                and conversation_id in _no_dates_mode):
+            spec = next((r for r in (slots.get("rooms") or [])
+                         if (r.get("adults") or 0) >= 1 or r.get("children_ages") or r.get("children_count")),
+                        (slots.get("rooms") or [{}])[0])
+            decision = {"action": "explore", "spec": {**spec, "fuzzy_date": ""}}
+            slots_changed = True   # a deliberate proactive scan -> bypass the filler guard
+            print(f"[i] {conversation_id}: no-dates mode + guests known -> proactive open-calendar scan")
         if decision["action"] in _SCRAPE_ACTIONS:
             if not slots_changed and slots.get("topic") != "nearest_dates":
                 # Bug 2: this turn added NO new booking info -> never re-scan (chit-chat
@@ -526,6 +546,7 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         prev = last_bot_msg.strip()
         if prev == templates.QUESTION_ALL_MISSING.strip():
             reply = templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS
+            _no_dates_mode.add(conversation_id)   # asking guests because dates are unknown
             print(f"[i] {conversation_id}: QUESTION_ALL_MISSING would repeat -> pivot to ASK_GUESTS")
         elif prev == templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS.strip():
             reply = templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS  # already pivoted -> anti-spam silences

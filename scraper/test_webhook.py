@@ -309,6 +309,7 @@ def server(monkeypatch):
     bot_server._slot_memory.clear()  # fresh slot memory per test
     bot_server._greeted.clear()      # fresh greeting state per test
     bot_server._pending_window.clear()  # fresh pending-window state per test
+    bot_server._no_dates_mode.clear()   # fresh no-dates mode per test
 
     def configure(slots=None, slots_text=None, history=None, availability=None,
                   labels=None, dynamic_history=False):
@@ -390,7 +391,7 @@ def test_e2e_sold_out_offers_nearest_dates(server):
                                          "2026-07-08": 2, "2026-07-09": 2}}),
     )
     _run(bs.process_incoming_message("Стандарт на 5-7 липня", 303))
-    assert any("всі номери зайняті" in m and "8 - 10 липня" in m for m in server.sent)  # SOLD_OUT_FOUND_NEAREST
+    assert any("всі номери заброньовані" in m and "8 - 10 липня" in m for m in server.sent)  # SOLD_OUT_FOUND_NEAREST
     assert not any(templates.POLITE_CLOSE == m for m in server.sent)
     assert not any("грн" in m for m in server.sent)           # never quoted a price
 
@@ -630,6 +631,29 @@ def test_e2e_bare_yes_after_windows_accepts_first(server):
     _run(bs.process_incoming_message("Так", 411))
     assert any("грн" in m for m in server.sent)         # window accepted -> quote produced
     assert 411 not in bs._pending_window                # pending window consumed
+
+
+def test_e2e_no_dates_then_guests_triggers_explore(server):
+    # Bug 1: client said they don't know dates (mode set), then gives guests -> proactively
+    # SCAN the open calendar and propose windows, NOT loop QUESTION_ONLY_DATES.
+    avail = _raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}})
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": None, "checkout": None, "fuzzy_date": None,
+             "adults": 0, "children_count": 0, "children_ages": []}]},
+        history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("Цікавить ціна, дати ще не можу сказати", 180))  # sets no-dates mode
+    server.sent.clear()
+    server.state["scraped"] = False
+    server.configure(slots={"topic": "price_quote", "rooms": [
+        {"room_type": None, "checkin": None, "checkout": None, "fuzzy_date": None,
+         "adults": 2, "children_count": 0, "children_ages": []}]},
+        history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("Для 2 осіб", 180))
+    assert server.state["scraped"] is True
+    full = "\n".join(server.sent)
+    assert "вільні віконця" in full and "Оскільки ви ще не визначились" in full   # PROPOSE_WINDOWS_OPEN
+    assert templates.QUESTION_ONLY_DATES not in full        # did NOT loop the date question
 
 
 def test_e2e_no_dates_breaks_question_loop(server):

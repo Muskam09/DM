@@ -316,6 +316,23 @@ def is_bare_confirmation(text: str) -> bool:
     return any(w in _CONFIRM_WORDS for w in words)
 
 
+_NO_DATES_MARKERS = [
+    "дати ще не", "дати поки не", "дати не знаю", "не знаю дат", "ще не знаю дат",
+    "ще не знаю", "поки не знаю", "не можу сказати дат", "не можу назвати дат",
+    "ще не визначил", "не визначились з дат", "не визначилися з дат", "без конкретних дат",
+    "поки без дат", "дати не визначен", "ще не вирішили коли", "коли точно не знаю",
+    "ще не визначились", "ще не вирішили",
+]
+
+
+def says_no_dates(text: str) -> bool:
+    """True when the client signals they DON'T know their dates yet ("дати ще не можу
+    сказати", "ще не знаю"). Used to switch to a PROACTIVE calendar scan once guests are
+    known, instead of looping the date question."""
+    t = (text or "").lower()
+    return any(m in t for m in _NO_DATES_MARKERS)
+
+
 def is_quote_message(text: str) -> bool:
     """True if the bot's previous message was a price quote that ended with
     'Бажаєте забронювати?' — so a bare 'Так' means: proceed to payment."""

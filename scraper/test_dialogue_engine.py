@@ -312,7 +312,7 @@ def test_finalize_full_sold_out_forward_scans_to_real_dates():
     reply = de.finalize_quote(
         [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
           "adults": 2, "children_ages": []}], avail)
-    assert "всі номери зайняті" in reply and "8 - 10 липня" in reply   # SOLD_OUT_FOUND_NEAREST
+    assert "всі номери заброньовані" in reply and "8 - 10 липня" in reply   # SOLD_OUT_FOUND_NEAREST
     assert reply != templates.POLITE_CLOSE
 
 
@@ -327,15 +327,51 @@ def test_finalize_full_sold_out_no_window_keeps_dialogue_open():
     assert "менеджер" not in reply.lower()
 
 
-def test_finalize_quote_all_sold_out_uses_new_sold_out_text():
-    # Fix 5: exact dates, no room chosen, everything booked -> the updated SOLD_OUT_NEAREST.
+def test_finalize_quote_all_sold_out_auto_proposes_nearest():
+    # Bug 2: exact dates sold out, no room chosen -> AUTO-propose the nearest free window
+    # (do NOT ask permission). SOLD_OUT_NEAREST is no longer used here.
+    avail = {"Стандарт": {"2026-07-06": 0, "2026-07-07": 0, "2026-07-09": 2, "2026-07-10": 2},
+             "Стандарт +": {"2026-07-06": 0, "2026-07-07": 0},
+             "Напівлюкс": {"2026-07-06": 0, "2026-07-07": 0}}
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 2, "children_ages": []}, avail)
+    assert "вказані вами дати всі номери заброньовані" in reply   # SOLD_OUT_FOUND_NEAREST
+    assert "9 - 10 липня" in reply
+    assert reply != templates.SOLD_OUT_NEAREST
+
+
+def test_finalize_quote_all_sold_out_no_window_nearest_none():
+    # Nothing free anywhere in the visible window -> NEAREST_NONE (still no permission ask).
     avail = {"Стандарт": {"2026-07-06": 0, "2026-07-07": 0},
              "Стандарт +": {"2026-07-06": 0, "2026-07-07": 0},
              "Напівлюкс": {"2026-07-06": 0, "2026-07-07": 0}}
     reply = de.finalize_quote_all(
         {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 2, "children_ages": []}, avail)
-    assert reply == templates.SOLD_OUT_NEAREST
-    assert "на вказані вами дати" in reply and "заброньовані" in reply and "🗓️" in reply
+    assert reply == templates.NEAREST_NONE
+
+
+def test_build_quote_reply_groups_identical_rooms():
+    # Bug 3: two identical rooms collapse into ONE "за 2 номери типу X" line (combined
+    # price), not two summed lines.
+    room = {"room_type": "Стандарт", "adults": 2, "children_ages": [], "checkin": "2026-07-06",
+            "checkout": "2026-07-08", "nights": 2, "price": 5000, "ubd": False}
+    reply = de.build_quote_reply([dict(room), dict(room)])
+    assert "за 2 номери типу Стандарт" in reply
+    assert "10000 грн" in reply
+    assert reply.count("Вартість") == 1            # one collapsed line, no grand-total block
+
+
+def test_build_quote_reply_distinct_rooms_sum():
+    # Genuinely different rooms still get per-room lines + a grand total.
+    rooms = [
+        {"room_type": "Стандарт", "adults": 2, "children_ages": [], "checkin": "2026-07-06",
+         "checkout": "2026-07-08", "nights": 2, "price": 5000, "ubd": False},
+        {"room_type": "Напівлюкс", "adults": 2, "children_ages": [8], "checkin": "2026-07-06",
+         "checkout": "2026-07-08", "nights": 2, "price": 7000, "ubd": False},
+    ]
+    reply = de.build_quote_reply(rooms)
+    assert "Загальна вартість: 12000 грн" in reply
+    assert reply.count("Вартість номеру типу") == 2
 
 
 def test_finalize_partial_overbooking_offers_other_rooms():
