@@ -127,19 +127,29 @@ def peek_cached_availability(conversation_id: int):
         return data
     return None
 
-async def generate_with_retry(prompt: str, retries: int = 3, delay: int = 2):
+def _is_retryable_llm_error(exc) -> bool:
+    """Transient Gemini errors worth retrying (overload / rate limit / timeout)."""
+    s = str(exc).lower()
+    return any(k in s for k in (
+        "503", "429", "unavailable", "resource_exhausted", "overloaded",
+        "high demand", "timeout", "timed out", "deadline", "internal error", "500"))
+
+
+async def generate_with_retry(prompt: str, retries: int = 3, base_delay: int = 2):
+    """Call the extractor LLM with exponential backoff on TRANSIENT failures (503/429/…):
+    wait 2s, then 4s, then give up. Non-transient errors raise immediately so the caller
+    can degrade gracefully (ERROR_LLM_DOWN) without wasting time."""
     for attempt in range(retries):
         try:
-            response = await ai_client.aio.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt
-            )
-            return response
+            return await ai_client.aio.models.generate_content(
+                model=MODEL_NAME, contents=prompt)
         except Exception as e:
-            if attempt < retries - 1:
-                await asyncio.sleep(delay)
+            if attempt < retries - 1 and _is_retryable_llm_error(e):
+                wait = base_delay * (2 ** attempt)        # 2s, 4s
+                print(f"[i] LLM transient error ({str(e)[:60]}) -> retry {attempt + 1}/{retries - 1} in {wait}s")
+                await asyncio.sleep(wait)
             else:
-                raise e
+                raise
 
 # The LLM does EXTRACTION ONLY — it never computes prices, dates or weekdays and
 # never writes the client-facing text. It returns structured slots as JSON; all
@@ -368,7 +378,16 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         extraction = await generate_with_retry(prompt)
         slots = dialogue_engine.parse_slots(extraction.text)
     except Exception as e:
-        print(f"[-] Помилка екстракції: {e}")
+        # GRACEFUL DEGRADATION: the LLM provider is down (503/429 after retries). NEVER
+        # leave the client hanging — send a holding message once and hand off to a manager.
+        print(f"[-] Помилка екстракції (LLM недоступний): {e}")
+        if _superseded(conversation_id, seq):
+            return
+        last_bot = next((m.get("content", "").strip() for m in reversed(raw_history)
+                         if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
+        if last_bot != templates.ERROR_LLM_DOWN.strip():   # don't repeat the holding message
+            await _deliver(conversation_id, templates.ERROR_LLM_DOWN)
+            await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
         return
 
     # SLOT MEMORY (multi-room): the extractor sometimes drops a slot the client already

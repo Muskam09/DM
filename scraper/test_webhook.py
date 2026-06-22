@@ -724,6 +724,53 @@ def test_e2e_unknown_intent_hands_off_with_instagram_label(server):
     assert server.state["scraped"] is False
 
 
+def test_is_retryable_llm_error(server):
+    import bot_server
+    assert bot_server._is_retryable_llm_error(RuntimeError("503 UNAVAILABLE high demand")) is True
+    assert bot_server._is_retryable_llm_error(RuntimeError("429 RESOURCE_EXHAUSTED")) is True
+    assert bot_server._is_retryable_llm_error(RuntimeError("400 INVALID_ARGUMENT")) is False
+
+
+def test_generate_with_retry_backoff_then_succeeds(server):
+    # Transient 503s are retried (asyncio.sleep is patched no-op by the fixture) and the
+    # eventual success is returned. Use bot_server directly so the REAL generate_with_retry
+    # runs (configure() would replace it with the fake LLM).
+    import bot_server
+    from types import SimpleNamespace
+    calls = {"n": 0}
+    async def gen(model, contents):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("503 UNAVAILABLE — high demand")
+        return SimpleNamespace(text="{}")
+    bot_server.ai_client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=gen)))
+    res = _run(bot_server.generate_with_retry("p"))
+    assert calls["n"] == 3 and res.text == "{}"
+
+
+def test_e2e_llm_down_sends_fallback_and_tags(server):
+    # LLM provider down (503 after retries) -> bot must NOT stay silent: send the holding
+    # message ONCE and hand off to a manager (Instagram label).
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, history=[])
+    async def boom(prompt, *a, **k):
+        raise RuntimeError("503 UNAVAILABLE high demand")
+    bs.generate_with_retry = boom
+    _run(bs.process_incoming_message("Дізнатися вартість", 170))
+    assert server.sent == [templates.ERROR_LLM_DOWN]
+    assert server.added_labels == [bot_logic.INSTAGRAM_LABEL]
+
+
+def test_e2e_llm_down_not_repeated(server):
+    # On a follow-up while still down, don't repeat the holding message (history shows it).
+    bs = server.configure(slots={"topic": "greeting", "rooms": []},
+                          history=[{"id": 1, "message_type": "outgoing", "content": templates.ERROR_LLM_DOWN}])
+    async def boom(prompt, *a, **k):
+        raise RuntimeError("503 UNAVAILABLE")
+    bs.generate_with_retry = boom
+    _run(bs.process_incoming_message("ще раз", 171))
+    assert server.sent == []        # already told them -> stay quiet
+
+
 def test_e2e_concurrent_drip_no_double_greeting(server):
     # Two messages arriving together for the SAME conversation must be serialized
     # by the per-conversation lock -> exactly one greeting (no drip race).
