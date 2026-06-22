@@ -408,16 +408,20 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         if bot_logic.is_quote_message(last_bot_msg):
             slots["topic"] = "booking_confirm"            # Context B: ready to pay -> BOOK_ROOM
             print(f"[i] {conversation_id}: bare 'Так' after a quote -> booking_confirm")
-        elif bot_logic.is_window_offer_message(last_bot_msg) and _pending_window.get(conversation_id):
-            ci, co = _pending_window[conversation_id]      # Context A: accept the FIRST window
+        elif bot_logic.is_window_offer_message(last_bot_msg):
+            # Context A: accept the offered window. Prefer the stored window; else use the
+            # dates the extractor parsed from the bot's offer. Force a QUOTE (never let it
+            # become nearest_dates -> re-search the dates we just offered).
             base = (slots.get("rooms") or [{}])[0]
-            room0 = dict(base); room0["checkin"] = ci; room0["checkout"] = co; room0["fuzzy_date"] = None
-            slots["rooms"] = [room0] + (slots.get("rooms") or [])[1:]
-            slots["topic"] = "price_quote"
-            _slot_memory[conversation_id] = bot_logic.remember_rooms(slots["rooms"])
-            _pending_window.pop(conversation_id, None)
-            slots_changed = True                           # dates changed -> the quote scrape may run
-            print(f"[i] {conversation_id}: bare 'Так' accepts window {ci}..{co}")
+            ci, co = _pending_window.get(conversation_id, (base.get("checkin"), base.get("checkout")))
+            if ci and co:
+                room0 = dict(base); room0["checkin"] = ci; room0["checkout"] = co; room0["fuzzy_date"] = None
+                slots["rooms"] = [room0] + (slots.get("rooms") or [])[1:]
+                slots["topic"] = "price_quote"
+                _slot_memory[conversation_id] = bot_logic.remember_rooms(slots["rooms"])
+                _pending_window.pop(conversation_id, None)
+                slots_changed = True                       # dates changed -> the quote scrape may run
+                print(f"[i] {conversation_id}: bare 'Так' accepts window {ci}..{co}")
     print(f"[i] Slots: {slots}")
 
     # Fix 2: a COMPLETELY unrecognized intent is the only manager hand-off (date

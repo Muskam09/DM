@@ -605,6 +605,23 @@ def test_e2e_bare_yes_after_windows_accepts_first(server):
     assert 411 not in bs._pending_window                # pending window consumed
 
 
+def test_e2e_bare_yes_after_soldout_nearest_quotes_offered(server):
+    # Live-QA bug: "Так" after a SOLD_OUT_FOUND_NEAREST offer must QUOTE the offered
+    # window (using the dates the extractor parsed from the offer), not re-search.
+    avail = _raw({"Стандарт +": {"2026-07-12": 2, "2026-07-13": 2}})
+    bs = server.configure(
+        slots={"topic": "nearest_dates", "rooms": [
+            {"room_type": "Стандарт +", "checkin": "2026-07-12", "checkout": "2026-07-13",
+             "adults": 2, "children_ages": []}]},
+        history=[{"id": 1, "message_type": "outgoing",
+                  "content": "На обрані вами дати всі номери зайняті 😔. Проте я підшукав "
+                             "найближче вільне віконце: 12 - 13 липня. Бажаєте, розрахую вартість?"}],
+        availability=avail)
+    _run(bs.process_incoming_message("Так", 420))
+    assert any("буде вартувати" in m for m in server.sent)        # quoted the offered window
+    assert not any("підшукав найближче" in m for m in server.sent)  # did NOT re-search
+
+
 def test_e2e_price_reask_without_dates_reshows_windows(server):
     # Decision 1: a price re-ask with no new info must NOT go silent -> explain + re-show
     # the proposed windows (from cache, no new scrape).
