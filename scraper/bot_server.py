@@ -193,6 +193,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
     => checkin 2026-06-26, checkout 2026-06-28.
   • "із суботи на неділю в липні" => найближча Сб→Нд у липні 2026 (заїзд Сб, виїзд Нд).
   • "заїзд у п'ятницю на 2 ночі в серпні" => обери п'ятницю серпня і додай 2 ночі.
+- "ДАТИ ЩЕ НЕ ЗНАЮ": фрази "дати ще не можу сказати", "поки не знаю дати", "ще не визначились" (БЕЗ названого періоду) — це НЕ reject_dates і НЕ нечіткий період. Залиш checkin=null, checkout=null, fuzzy_date=null; topic лишається price_quote/general_price (триває збір даних, клієнт просто ще не має дат).
 - ТОЧНІ vs НЕЧІТКІ дати (ВАЖЛИВО):
   • ТОЧНИЙ діапазон (конкретні числа заїзду+виїзду АБО дата+кількість ночей, напр. "з 22.06 по 02.07", "17-19 липня", "20.07 на 3 ночі") => заповни checkin/checkout, fuzzy_date=null, і topic="price_quote" (НІКОЛИ не "general_price"). Слова "орієнтовно"/"приблизно"/"десь" ПЕРЕД конкретними числами НЕ роблять дати нечіткими ("орієнтовно 2-7 липня" = ТОЧНІ дати 2026-07-02..2026-07-07).
   • НЕЧІТКИЙ період ("початок серпня", "друга половина липня", "у серпні", "влітку", "кінець місяця", "після 6 серпня") => fuzzy_date="<текст періоду клієнта>", checkin=null, checkout=null.
@@ -496,6 +497,19 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                         _pending_window[conversation_id] = win
         else:
             reply = decision["reply"]
+
+    # Anti-spam DEADLOCK breaker: the client wants a price but gave no dates/guests (e.g.
+    # "дати ще не можу сказати"), so we'd repeat QUESTION_ALL_MISSING — which the identical
+    # -reply guard would then suppress, leaving the client ignored. Pivot ONCE to asking
+    # guests; if we've already pivoted, fall back to ACKNOWLEDGE so anti-spam settles us
+    # into silence rather than ping-ponging the two prompts.
+    if reply == templates.QUESTION_ALL_MISSING:
+        prev = last_bot_msg.strip()
+        if prev == templates.QUESTION_ALL_MISSING.strip():
+            reply = templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS
+            print(f"[i] {conversation_id}: QUESTION_ALL_MISSING would repeat -> pivot to ASK_GUESTS")
+        elif prev == templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS.strip():
+            reply = templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS  # already pivoted -> anti-spam silences
 
     # 3) SEND. A newer drip that arrived while we were processing supersedes this reply,
     #    so a burst collapses to ONE consolidated reply AND a mid-scrape correction wins

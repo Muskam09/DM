@@ -632,6 +632,20 @@ def test_e2e_bare_yes_after_windows_accepts_first(server):
     assert 411 not in bs._pending_window                # pending window consumed
 
 
+def test_e2e_no_dates_breaks_question_loop(server):
+    # Anti-spam deadlock: client wants a price but has no dates/guests ("дати ще не можу
+    # сказати") and we already asked QUESTION_ALL_MISSING -> must pivot to asking guests,
+    # not repeat it (which the identical-reply guard would suppress, ignoring the client).
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": None, "checkout": None, "fuzzy_date": None,
+             "adults": 0, "children_count": 0, "children_ages": []}]},
+        history=[{"id": 1, "message_type": "outgoing", "content": templates.QUESTION_ALL_MISSING}])
+    _run(bs.process_incoming_message("Цікавить ціна, дати ще не можу сказати", 162))
+    assert any(m == templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS for m in server.sent)
+    assert not any(m == templates.QUESTION_ALL_MISSING for m in server.sent)
+
+
 def test_e2e_book_confirm_without_quote_no_iban(server):
     # Bug 3: "Так, бронюємо" after a cross-sell (NOT an exact quote) must NOT drop IBAN.
     bs = server.configure(
