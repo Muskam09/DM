@@ -196,6 +196,21 @@ def test_propose_windows_partial_overlap_visible_full_asks_dates():
     assert "липня" not in reply       # never proposes the wrong month
 
 
+def test_offered_window_covers_explore_and_soldout():
+    # Bug 1: the bot must remember the window it offered, for ANY path.
+    avail = {"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}}
+    assert de.offered_window(
+        {"action": "explore", "spec": {"room_type": "Стандарт",
+         "fuzzy_date": "друга половина липня", "nights": 3}}, avail) == ("2026-07-20", "2026-07-23")
+    # chosen room sold out, nothing else free -> the SOLD_OUT_FOUND_NEAREST window.
+    avail2 = {"Стандарт": {"2026-07-05": 0, "2026-07-06": 0,
+                           "2026-07-08": 2, "2026-07-09": 2}}
+    decision = {"action": "quote", "rooms": [
+        {"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+         "adults": 2, "children_ages": []}]}
+    assert de.offered_window(decision, avail2) == ("2026-07-08", "2026-07-10")
+
+
 def test_first_offered_window_honors_nights():
     # Decision 2A helper: the (checkin, checkout) a bare "Так" accepts after windows.
     avail = {"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}}   # 20-27 free

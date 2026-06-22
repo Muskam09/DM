@@ -52,6 +52,33 @@ def test_full_sold_out_detected():
     assert bot_logic.is_sold_out(simplified, DATES_28) is True
 
 
+def test_public_room_type_mapping():
+    # Bug 2: OtelMS internal sub-types fold into the 3 public categories.
+    assert bot_logic.public_room_type("Стандарт сімейний В+Д") == "Стандарт"
+    assert bot_logic.public_room_type("Стандарт 4х 2Л + Д") == "Стандарт"
+    assert bot_logic.public_room_type("Стандарт + Сімейний В+Д") == "Стандарт +"
+    assert bot_logic.public_room_type("Стандарт +") == "Стандарт +"
+    assert bot_logic.public_room_type("Напівлюкс") == "Напівлюкс"
+    assert bot_logic.public_room_type("Колиба") is None
+
+
+def test_build_simplified_folds_internal_names():
+    # Bug 2: internal names never reach the client; Стандарт-class availability is summed.
+    raw = {
+        "Стандарт": {"total_available": {"2026-07-10": 1}, "rooms": {}},
+        "Стандарт сімейний В+Д": {"total_available": {"2026-07-10": 2}, "rooms": {}},
+        "Стандарт 4х 2Л + Д": {"total_available": {"2026-07-10": 1}, "rooms": {}},
+        "Стандарт + Сімейний В+Д": {"total_available": {"2026-07-10": 3}, "rooms": {}},
+        "Напівлюкс": {"total_available": {"2026-07-10": 0}, "rooms": {}},
+        "Колиба": {"total_available": {"2026-07-10": 9}, "rooms": {}},   # blacklisted
+    }
+    s = bot_logic.build_simplified_availability(raw)
+    assert set(s) == {"Стандарт", "Стандарт +", "Напівлюкс"}     # ONLY public categories
+    assert s["Стандарт"]["2026-07-10"] == 4                       # 1+2+1 folded & summed
+    assert s["Стандарт +"]["2026-07-10"] == 3
+    assert bot_logic.free_room_types(s, ["2026-07-10"]) == ["Стандарт", "Стандарт +"]
+
+
 # -- availability gating helper (the new pricing gate) ----------------------
 
 def test_is_room_available_states():
@@ -605,6 +632,21 @@ def test_e2e_bare_yes_after_windows_accepts_first(server):
     assert 411 not in bs._pending_window                # pending window consumed
 
 
+def test_e2e_book_confirm_without_quote_no_iban(server):
+    # Bug 3: "Так, бронюємо" after a cross-sell (NOT an exact quote) must NOT drop IBAN.
+    bs = server.configure(
+        slots={"topic": "booking_confirm", "rooms": [
+            {"room_type": "Напівлюкс", "checkin": "2026-07-06", "checkout": "2026-07-08",
+             "adults": 2, "children_ages": []}]},
+        history=[{"id": 1, "message_type": "outgoing",
+                  "content": "На жаль, номери категорії Напівлюкс на ваші дати вже повністю "
+                             "заброньовані. Проте маємо вільні: Стандарт. Який варіант вам підходить?"}],
+        availability=_raw({"Стандарт": {"2026-07-06": 2, "2026-07-07": 2},
+                           "Напівлюкс": {"2026-07-06": 0, "2026-07-07": 0}}))
+    _run(bs.process_incoming_message("Так, бронюємо", 430))
+    assert not any("IBAN" in m for m in server.sent)        # no premature payment details
+
+
 def test_e2e_bare_yes_after_soldout_nearest_quotes_offered(server):
     # Live-QA bug: "Так" after a SOLD_OUT_FOUND_NEAREST offer must QUOTE the offered
     # window (using the dates the extractor parsed from the offer), not re-search.
@@ -817,3 +859,9 @@ def test_webhook_routing_schedules_only_incoming(server):
     # truly empty incoming (no text, no attachment) is ignored
     assert schedules({"event": "message_created", "message_type": "incoming",
                       "content": None, "conversation": {"id": 1}}) == 0
+    # Bug 5: WebWidget/other channels may send message_type as INT 0 -> still processed
+    assert schedules({"event": "message_created", "message_type": 0,
+                      "content": "Привіт з віджета", "conversation": {"id": 2}}) == 1
+    # private agent notes are ignored
+    assert schedules({"event": "message_created", "message_type": "incoming", "private": True,
+                      "content": "внутрішня нотатка", "conversation": {"id": 1}}) == 0

@@ -25,20 +25,47 @@ GREETING = (
 GREETING_MARKER = "Доброго дня! Вас вітає D&T Hotel"
 
 
+# The client ever sees ONLY these 3 public room categories. OtelMS exposes granular
+# internal sub-types ("Стандарт сімейний В+Д", "Стандарт 4х 2Л + Д", "Стандарт +
+# Сімейний В+Д"…) which must NEVER leak into a reply — they are folded into the public
+# type below.
+PUBLIC_ROOM_TYPES = ("Стандарт", "Стандарт +", "Напівлюкс")
+
+
+def public_room_type(name: str):
+    """Map any OtelMS category name to its public type, or None if it's not offerable.
+    '+' is checked before the bare 'Стандарт' so 'Стандарт + Сімейний' -> 'Стандарт +'."""
+    n = "".join((name or "").lower().split())
+    if n.startswith("напівлюкс") or n.startswith("напивлюкс"):
+        return "Напівлюкс"
+    if n.startswith("стандарт+"):
+        return "Стандарт +"
+    if n.startswith("стандарт"):
+        return "Стандарт"
+    return None
+
+
 def build_simplified_availability(
     availability_data: Dict, ignore_categories: List[str] = IGNORE_CATEGORIES
 ) -> Dict:
-    """Reduce raw scraper output to ``{room_type: {date: free_count}}``, dropping
-    any blacklisted category (Колиба / Басейн / Overbooking) so the bot can never
-    propose them as a room. ``free_count`` is the per-date "total_available" map
-    produced by the scraper.
+    """Reduce raw scraper output to ``{public_type: {date: free_count}}``. Blacklisted
+    categories (Колиба / Басейн / Overbooking) are dropped, and every OtelMS sub-type is
+    FOLDED into one of the 3 public categories (`public_room_type`) with per-date counts
+    SUMMED — so internal names never reach the client and Стандарт-class availability is
+    aggregated. ``free_count`` is the per-date "total_available" map from the scraper.
     """
     simplified: Dict = {}
     for room_type, r_data in (availability_data or {}).items():
         if any(ignore.lower() in room_type.lower() for ignore in ignore_categories):
             continue
-        if isinstance(r_data, dict) and "total_available" in r_data:
-            simplified[room_type] = r_data["total_available"]
+        if not (isinstance(r_data, dict) and "total_available" in r_data):
+            continue
+        pub = public_room_type(room_type)
+        if not pub:
+            continue
+        dest = simplified.setdefault(pub, {})
+        for d, cnt in (r_data["total_available"] or {}).items():
+            dest[d] = dest.get(d, 0) + (cnt or 0)
     return simplified
 
 

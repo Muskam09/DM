@@ -329,6 +329,33 @@ def first_offered_window(spec: Dict, availability: Dict):
     return (run0, co.isoformat())
 
 
+def offered_window(decision: Dict, availability: Dict):
+    """The (checkin, checkout) the bot is offering in a window-offer reply, for ANY
+    decision path (explore windows, a chosen room's SOLD_OUT_FOUND_NEAREST, or nearest).
+    Stored as `_pending_window` so a later bare 'Так' quotes EXACTLY these dates instead
+    of re-searching. None when the reply isn't a concrete window."""
+    act = decision.get("action")
+    if act == "explore":
+        return first_offered_window(decision.get("spec") or {}, availability)
+    if act == "nearest":
+        spec = decision.get("spec") or {}
+        room, after, n = spec.get("room_type"), spec.get("checkin"), _nights(spec)
+        if room and after and n:
+            return find_nearest_window(availability, room, after, n)
+        return None
+    if act == "quote":
+        for r in decision.get("rooms") or []:
+            rt, ci, co = r.get("room_type"), r.get("checkin"), r.get("checkout")
+            if not (rt and ci and co):
+                continue
+            nights = pricing_engine.night_dates(ci, co)
+            if bot_logic.is_room_available(availability, rt, nights) == "sold_out" \
+                    and not bot_logic.free_room_types(availability, nights):
+                return find_nearest_window(availability, rt, ci, len(nights))
+        return None
+    return None
+
+
 def plan(slots: Dict) -> Dict:
     """Slots -> decision. action in {reply, quote, quote_all, explore, nearest}."""
     rooms = slots.get("rooms") or []

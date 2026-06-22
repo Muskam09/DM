@@ -160,7 +160,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 
 Значення topic:
 - group_event (НАЙВИЩИЙ ПРІОРИТЕТ): якщо у БУДЬ-ЯКОМУ повідомленні (навіть ранньому) згадано 20+ осіб (сумарно дорослі+діти) / велику групу / табір / тур / спортивні збори / весілля / банкет / корпоратив / захід — ЗАВЖДИ став topic=group_event, незалежно від того, про що останнє повідомлення.
-- price_quote: клієнт обрав КОНКРЕТНИЙ номер і є дати+гості, АБО змінює дати/ночі для вже обраного номеру. ВАЖЛИВО: якщо клієнт НАЗИВАЄ або ЗМІНЮЄ дати (навіть "наші дати змінились на...", "краще...", "а якщо...", дні тижня) АБО ОБИРАЄ тип номеру ("Стандарт", "обидва Стандарт", "беремо Напівлюкс") — це price_quote (НЕ reject_dates), навіть якщо попередні дати були зайняті.
+- price_quote: клієнт обрав КОНКРЕТНИЙ номер і є дати+гості, АБО змінює дати/ночі для вже обраного номеру. ВАЖЛИВО: будь-яка ЗМІНА або НАЗИВАННЯ дат — це ОНОВЛЕННЯ бронювання (price_quote), а НЕ відмова. Фрази "давайте змінимо дати", "наші дати змінились", "змінюємо на...", "краще...", "а якщо...", "перенесемо на...", дні тижня — це price_quote. Так само ВИБІР типу номеру ("Стандарт", "обидва Стандарт", "беремо Напівлюкс") — price_quote. НІКОЛИ не став reject_dates лише тому, що попередні дати були зайняті чи клієнт хоче інші.
 - general_price: є дати і гості, але конкретний номер НЕ обрано.
 - faq: загальне питання (тоді заповни faq_template). "розваги / активності / що робити / що входить у вартість" -> INCLUDED_IN_THE_PRICE.
 - presentation: просить розказати про номери / які є номери.
@@ -400,11 +400,13 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             slots["topic"] = "faq"
             slots["faq_template"] = faq_tmpl
             slots["_faq_override"] = True
+    # The bot's most recent message — context for a bare "Так" and the payment guard.
+    last_bot_msg = next((m.get("content", "") for m in reversed(raw_history)
+                         if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
+
     # Decision 2: a bare confirmation ("Так" / "Давайте") means different things by the
     # bot's PREVIOUS message — accept the first proposed window, or proceed to payment.
     if bot_logic.is_bare_confirmation(user_message):
-        last_bot_msg = next((m.get("content", "") for m in reversed(raw_history)
-                             if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
         if bot_logic.is_quote_message(last_bot_msg):
             slots["topic"] = "booking_confirm"            # Context B: ready to pay -> BOOK_ROOM
             print(f"[i] {conversation_id}: bare 'Так' after a quote -> booking_confirm")
@@ -422,6 +424,13 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                 _pending_window.pop(conversation_id, None)
                 slots_changed = True                       # dates changed -> the quote scrape may run
                 print(f"[i] {conversation_id}: bare 'Так' accepts window {ci}..{co}")
+
+    # Bug 3: NEVER drop payment details (BOOK_ROOM) unless the bot ACTUALLY quoted an
+    # exact price last turn. A "Так, бронюємо" after a cross-sell / info / window offer
+    # must continue the booking (price_quote), not jump straight to the IBAN.
+    if slots.get("topic") == "booking_confirm" and not bot_logic.is_quote_message(last_bot_msg):
+        slots["topic"] = "price_quote"
+        print(f"[i] {conversation_id}: booking_confirm without a prior quote -> price_quote (no premature IBAN)")
     print(f"[i] Slots: {slots}")
 
     # Fix 2: a COMPLETELY unrecognized intent is the only manager hand-off (date
@@ -453,7 +462,7 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                         simplified = bot_logic.build_simplified_availability(cached)
                         reply = (templates.PRICE_NEED_DETAILS + "\n\n"
                                  + dialogue_engine.propose_windows(decision["spec"], simplified))
-                        win = dialogue_engine.first_offered_window(decision["spec"], simplified)
+                        win = dialogue_engine.offered_window(decision, simplified)
                         if win:
                             _pending_window[conversation_id] = win
                     else:
@@ -478,9 +487,11 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                     return
                 simplified = bot_logic.build_simplified_availability(availability_data)
                 reply = build_booking_reply(decision, simplified)
-                # Decision 2A: remember the first proposed window so a later "Так" accepts it.
-                if decision["action"] == "explore":
-                    win = dialogue_engine.first_offered_window(decision["spec"], simplified)
+                # Bug 1: remember WHATEVER window we offered (explore windows / a sold-out
+                # room's nearest / nearest) so a later bare "Так" quotes EXACTLY it and
+                # never re-searches the dates we just proposed.
+                if bot_logic.is_window_offer_message(reply or ""):
+                    win = dialogue_engine.offered_window(decision, simplified)
                     if win:
                         _pending_window[conversation_id] = win
         else:
@@ -505,8 +516,8 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             if d2.get("action") in _SCRAPE_ACTIONS:
                 simplified = bot_logic.build_simplified_availability(cached)
                 booking_extra = build_booking_reply(d2, simplified)
-                if d2.get("action") == "explore":
-                    win = dialogue_engine.first_offered_window(d2["spec"], simplified)
+                if bot_logic.is_window_offer_message(booking_extra or ""):
+                    win = dialogue_engine.offered_window(d2, simplified)
                     if win:
                         _pending_window[conversation_id] = win
     if booking_extra:
@@ -544,9 +555,18 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception:
         return {"status": "ignored"}
     
-    if payload.get("event") == "message_created" and payload.get("message_type") == "incoming":
+    event = payload.get("event")
+    mtype = payload.get("message_type")
+    # Bug 5: message_type may be a STRING ("incoming"/"outgoing") OR an INT (0/1)
+    # depending on the channel/Chatwoot version (the Website Widget sends incoming too).
+    # Accept BOTH incoming forms. We do NOT filter by inbox/channel, so every configured
+    # inbox (WebWidget, API, Instagram, …) is served the same way.
+    if event == "message_created" and mtype in ("incoming", 0):
+        if payload.get("private"):
+            return {"status": "ok"}                    # ignore private agent notes
         content = payload.get("content")
-        conversation_id = payload.get("conversation", {}).get("id")
+        conv = payload.get("conversation") or {}
+        conversation_id = conv.get("id") or payload.get("conversation_id")
         # A payment screenshot may arrive as an image with NO text -> still process.
         has_attachment = bool(payload.get("attachments"))
 
@@ -554,6 +574,10 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
             seq = _next_seq(conversation_id)   # assign in ARRIVAL order (drip-burst dedup)
             background_tasks.add_task(process_incoming_message, content or "",
                                       conversation_id, has_attachment, seq)
+        else:
+            print(f"[i] webhook incoming but skipped: conv={conversation_id} has_content={bool(content)} attach={has_attachment}")
+    elif event == "message_created":
+        print(f"[i] webhook ignored message_created: message_type={mtype!r}")
 
     return {"status": "ok"}
 
