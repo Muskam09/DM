@@ -114,14 +114,18 @@ def quote_line(room_type, adults, children_ages, checkin, checkout, nights, pric
     return line
 
 
-def build_quote_reply(priced_rooms: List[Dict]) -> str:
+def build_quote_reply(priced_rooms: List[Dict], ubd_booking: bool = False) -> str:
     """Render the quote(s). Identical rooms (same type/dates/guests) COLLAPSE into one
     "за N номери типу X" line with the combined price (Bug 3, Fix A). The grand total sums
     only DISTINCT room groups — the same room is never counted twice (type ALTERNATIVES
-    arrive via finalize_quote_all, not here, so they are never summed)."""
+    arrive via finalize_quote_all, not here, so they are never summed).
+
+    УБД (2026-06-23): the -20% discount applies to the ENTIRE booking total (all rooms),
+    not per room. So per-room lines stay at full price and the discount is shown on the
+    grand total (or, for a single room, on its only line)."""
     def sig(r):
         return (r["room_type"], r["checkin"], r["checkout"], r["adults"],
-                tuple(r.get("children_ages") or []), bool(r.get("ubd")))
+                tuple(r.get("children_ages") or []))
 
     groups: List[List[Dict]] = []
     for r in priced_rooms:
@@ -132,19 +136,35 @@ def build_quote_reply(priced_rooms: List[Dict]) -> str:
         else:
             groups.append([r])
 
-    lines, total = [], 0
+    meta = []  # (per, count, group_price)
+    total = 0
     for g in groups:
         per, cnt = g[0], len(g)
         group_price = per["price"] * cnt
         total += group_price
-        lines.append(quote_line(per["room_type"], per["adults"], per["children_ages"],
-                                per["checkin"], per["checkout"], per["nights"], group_price,
-                                per.get("ubd", False), room_count=cnt))
-    if len(lines) == 1:
-        reply = lines[0] + "\nБажаєте забронювати? 💙"
+        meta.append((per, cnt, group_price))
+
+    discounted_total = pricing_engine.apply_military_discount(total) if ubd_booking else total
+
+    if len(meta) == 1:
+        per, cnt, group_price = meta[0]
+        shown = discounted_total if ubd_booking else group_price
+        line = quote_line(per["room_type"], per["adults"], per["children_ages"],
+                          per["checkin"], per["checkout"], per["nights"], shown,
+                          ubd=ubd_booking, room_count=cnt)
+        reply = line + "\nБажаєте забронювати? 💙"
     else:
-        reply = "\n".join(lines) + f"\n\nЗагальна вартість: {total} грн\nБажаєте забронювати? 💙"
-    if any(r.get("ubd") for r in priced_rooms):
+        lines = [quote_line(per["room_type"], per["adults"], per["children_ages"],
+                            per["checkin"], per["checkout"], per["nights"], gp,
+                            ubd=False, room_count=cnt) for per, cnt, gp in meta]
+        if ubd_booking:
+            total_line = (f"Загальна вартість: {discounted_total} грн "
+                          f"(з урахуванням знижки УБД -20%)")
+        else:
+            total_line = f"Загальна вартість: {total} грн"
+        reply = "\n".join(lines) + f"\n\n{total_line}\nБажаєте забронювати? 💙"
+
+    if ubd_booking:
         reply += "\n\n" + templates.MILITARY
     return reply
 
@@ -212,6 +232,11 @@ def _has_guests(room: Dict) -> bool:
 def _child_count(room: Dict) -> int:
     cc = room.get("children_count")
     return cc if cc is not None else len(room.get("children_ages") or [])
+
+
+def _room_guests(room: Dict) -> int:
+    """Total guests in ONE room object (adults + children, babies included)."""
+    return (room.get("adults") or 0) + _child_count(room)
 
 
 def _fuzzy_offseason(fuzzy: str) -> bool:
@@ -422,6 +447,13 @@ def plan(slots: Dict) -> Dict:
 
     any_exact = any(_has_dates(r) for r in rooms)
     any_guests = any(_has_guests(r) for r in rooms)
+
+    # 6+ guests cannot share one room (max ~5 in Напівлюкс) -> ask how to distribute
+    # them BEFORE quoting (owner rule 2026-06-23). Only when the client packed everyone
+    # into ONE room object; an explicit multi-room request (>1 room) is already split.
+    if len(rooms) == 1 and _room_guests(rooms[0]) >= 6:
+        return {"action": "reply", "reply": templates.ASK_ROOM_DISTRIBUTION}
+
     cc = max((_child_count(r) for r in rooms), default=0)
     ages = max((len(r.get("children_ages") or []) for r in rooms), default=0)
     ages_missing = cc > ages
@@ -530,17 +562,16 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
         except KeyError:
             return templates.PRESENTATION_ROOMS  # unknown room type -> present options
 
-        # УБД (combat-veteran) 20% discount, deterministic, per requested room.
-        ubd = bool(r.get("ubd"))
-        price = pricing_engine.apply_military_discount(quote.total) if ubd else quote.total
-
         priced.append({
             "room_type": quote.room_type, "adults": adults, "children_ages": children_ages,
             "checkin": checkin, "checkout": checkout, "nights": quote.nights,
-            "price": price, "ubd": ubd,
+            "price": quote.total,
         })
 
-    return build_quote_reply(priced)
+    # УБД (2026-06-23): -20% applies to the WHOLE booking (a veteran's family), so a single
+    # flagged room discounts the entire total. The discount is rendered on the grand total.
+    ubd_booking = any(bool(r.get("ubd")) for r in rooms)
+    return build_quote_reply(priced, ubd_booking)
 
 
 def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE) -> str:
@@ -578,7 +609,19 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
 
     header = (f"На дати {dates_phrase(checkin, checkout)} ({nights_phrase(len(nights))}) "
               f"для {guests_phrase(adults, children_ages)} доступні такі номери:")
-    reply = header + "\n" + "\n".join(lines) + "\nЯкий тип номеру обираєте? 💙"
+
+    # Family recommendation (owner rule 2026-06-23): for a family of 4-5 (with children),
+    # prioritise Напівлюкс, then offer two separate rooms as a roomier alternative.
+    family_note = ""
+    if (adults + len(children_ages)) >= 4 and children_ages:
+        if any("Напівлюкс" in ln for ln in lines):
+            family_note = ("\n💡 Для родини найзручніший Напівлюкс. За бажанням можемо також "
+                           "запропонувати два окремі номери — буде ще просторіше.")
+        else:
+            family_note = ("\n💡 Для вашої родини комфортно підійдуть два окремі номери — "
+                           "підкажіть, і я підберу варіанти.")
+
+    reply = header + "\n" + "\n".join(lines) + family_note + "\nЯкий тип номеру обираєте? 💙"
     if ubd:
         reply += "\n\n" + templates.MILITARY
     return reply

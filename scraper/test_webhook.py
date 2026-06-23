@@ -132,6 +132,18 @@ def test_is_spam_false(text):
 
 
 @pytest.mark.parametrize("text,expected", [
+    ("Вітаю! Я блогер, пропоную співпрацю за бартер — рілс за проживання", True),
+    ("Знімаю контент за проживання, цікавить взаємопіар?", True),
+    ("Готові на колаборацію — огляд за проживання 🙌", True),
+    ("Доброго дня, є вільні номери на 6-8 липня?", False),
+    ("Скільки коштує сауна?", False),
+    ("Створюю чат-ботів, є пробний тариф", False),   # that's spam, not a wanted collab
+])
+def test_is_barter(text, expected):
+    assert bot_logic.is_barter(text) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
     ("0959224876 Аліна", True),
     ("+380987521919", True),
     ("мій телефон 067 344 52 20", True),
@@ -268,6 +280,22 @@ def test_new_templates_content():
     assert "WiFi" in templates.ROOM_AMENITIES
     assert "Стандарт +" in templates.SMOKING
     assert "Ворохта" in templates.HOW_TO_GET_THERE
+
+
+def test_owner_2026_06_23_templates():
+    # Owner's finalized business answers reflected in the templates.
+    assert "14:00" in templates.CHECK_IN_OUT and "12:00" in templates.CHECK_IN_OUT
+    assert "300 грн" in templates.PETS and "котик" in templates.PETS.lower()
+    assert "узгоджується" in templates.OFF_SEASON
+    assert "номер телефону" not in templates.OFF_SEASON      # no longer asks for a phone
+    assert "розселити" in templates.ASK_ROOM_DISTRIBUTION
+    assert "20%" in templates.MILITARY and "копію" in templates.MILITARY
+    assert "Парковка" in templates.TRANSFER_PARKING
+    assert "грудня" in templates.SAUNA_VATS
+    assert "72 годин" in templates.BOOK_ROOM
+    assert "дитяче місце" in templates.CHILDREN and "Від 12" in templates.CHILDREN
+    assert "ліжечок" in templates.CHILDREN_AMENITIES
+    assert "фіскальний чек" in templates.DOCUMENTS
 
 
 # -- payment hand-off & bot muting ------------------------------------------
@@ -796,6 +824,50 @@ def test_e2e_unknown_intent_hands_off_with_instagram_label(server):
     _run(bs.process_incoming_message("асдфгхй ???", 353))
     assert server.sent == [templates.MANAGER_HANDOFF]
     assert server.added_labels == [bot_logic.INSTAGRAM_LABEL]
+    assert server.state["scraped"] is False
+
+
+def test_e2e_barter_silent_and_labeled(server):
+    # Blogger/barter pitch -> bot stays SILENT but tags the conversation Instagram (the
+    # hotel WANTS the collab; a human negotiates). Detected deterministically before the LLM.
+    bs = server.configure(slots={"topic": "greeting", "rooms": []})
+    _run(bs.process_incoming_message("Вітаю! Я блогер, пропоную бартер — рілс за проживання", 440))
+    assert server.sent == []                                    # silent
+    assert server.added_labels == [bot_logic.INSTAGRAM_LABEL]   # tagged for the operator
+    assert server.prompts == []                                 # caught before extraction
+
+
+def test_e2e_barter_via_extractor_silent_and_labeled(server):
+    # When keywords miss it, the extractor's topic=barter still -> silent + Instagram tag.
+    bs = server.configure(slots={"topic": "barter", "rooms": []}, history=_bot_spoke())
+    _run(bs.process_incoming_message("пропоную взаємну рекламу нашим аудиторіям", 441))
+    assert server.sent == []
+    assert server.added_labels == [bot_logic.INSTAGRAM_LABEL]
+
+
+def test_e2e_six_plus_guests_asks_distribution(server):
+    # 6+ guests packed into one room -> ask HOW to distribute; no scrape, no premature quote.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
+             "adults": 6, "children_count": 0, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("нас 6, хочемо до вас на 6-8 липня", 450))
+    assert server.state["scraped"] is False
+    assert any(m == templates.ASK_ROOM_DISTRIBUTION for m in server.sent)
+
+
+def test_e2e_off_season_tags_instagram_no_phone_ask(server):
+    # Off-season (May) -> holding reply + Instagram tag for a human follow-up (owner rule):
+    # we DON'T reject and DON'T ask for a phone number.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-05-11", "checkout": "2026-05-13",
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("Стандарт 11-13 травня для двох", 460))
+    assert server.sent == [templates.OFF_SEASON]
+    assert bot_logic.INSTAGRAM_LABEL in server.added_labels
     assert server.state["scraped"] is False
 
 

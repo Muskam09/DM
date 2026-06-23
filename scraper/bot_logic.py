@@ -155,6 +155,24 @@ def is_spam(text: str) -> bool:
     return any(marker in t for marker in SPAM_MARKERS)
 
 
+# --- blogger / barter / PR collab detection ---------------------------------
+# Unlike spam, the hotel WANTS these deals (free stays for bloggers, взаємопіар).
+# The bot must NOT answer (a human negotiates), but it MUST tag the conversation
+# Instagram so the operator follows up — so barter is detected BEFORE spam and
+# routed to a silent hand-off-with-label (see bot_server).
+BARTER_MARKERS = [
+    "бартер", "блогер", "блогерк", "рілс", "reels", "взаємопіар", "взаємний піар",
+    "колаборац", "співпраця за проживання", "огляд за проживання", "проживання за рекламу",
+    "реклама за проживання", "запросити на огляд", "знімаю контент за", "обмін на проживання",
+]
+
+
+def is_barter(text: str) -> bool:
+    """Detect a blogger/PR/barter collaboration pitch (wanted, but human-handled)."""
+    t = (text or "").lower()
+    return any(marker in t for marker in BARTER_MARKERS)
+
+
 # --- large-group / event detection (deterministic, not left to the LLM) -----
 # Big groups (20+) and events must ALWAYS be redirected to the co-owner — too
 # important to rely on fuzzy classification, so we detect it in code.

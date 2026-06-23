@@ -160,9 +160,9 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 
 Поверни ВИКЛЮЧНО JSON (без markdown, без пояснень) такої структури:
 {
-  "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting | unknown>",
+  "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting | barter | unknown>",
   "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "nights": <ціле|null>, "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
-  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
+  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
 
 Дати/гостей/номери збирай з УСІЄЇ історії. Якщо обрано topic=faq — faq_template обирай за ОСТАННІМ (поточним) питанням клієнта.
@@ -180,6 +180,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - fuzzy_dates: згадує період БЕЗ конкретних дат ("на літо", "десь у серпні").
 - nearest_dates: погоджується пошукати найближчі вільні дати після відмови.
 - greeting: привітання / клієнт хоче бронювати чи питати про готель, але ще не дав даних.
+- barter: пропозиція співпраці від блогера / інфлюенсера / за БАРТЕР / рілс / огляд за проживання / взаємопіар / реклама за проживання. Це НЕ спам (готель хоче такі колаборації), але опрацьовує людина — став topic=barter.
 - unknown: повідомлення ВЗАГАЛІ не стосується готелю, бронювання чи FAQ і незрозуміле (НЕ привітання, НЕ бронювання, НЕ питання про готель). Став РІДКО — лише коли жоден інший topic не підходить.
 
 Правила заповнення rooms:
@@ -214,9 +215,10 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - ЗАКРИВАЙ слот дітей: "лише дорослі" / "X дорослих" / "всі дорослі" / "дорослі всі" / "на двох/трьох" БЕЗ згадки дітей => children_count=0, children_ages=[]. НІКОЛИ не перепитуй про дітей, якщо кількість дорослих відома, а дітей не згадано.
 - Якщо згадано N дітей без віку => children_count=N, children_ages=[]. Якщо вказані віки => children_count=кількість, children_ages=[віки].
 - Якщо взагалі не вказано ні дорослих, ні дітей — adults=0, children_count=0, children_ages=[].
-- ubd — true ЛИШЕ якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових для ЦЬОГО номеру; інакше false. Якщо просять знижку УБД "на один номер" — постав ubd=true тільки для одного (першого) номеру.
+- ubd — true якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових. Знижка діє на ВСЕ бронювання родини (-20% від загальної суми), тому постав ubd=true для УСІХ номерів у rooms[]; інакше false для всіх.
 
-FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY.
+FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; час заїзду/виїзду / о котрій заселення / до котрої звільнити номер -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS.
+ВАЖЛИВО: тенісного КОРТУ у готелі НЕМАЄ — НЕ пропонуй теніс як активність. Знижки 10% / "програми лояльності" бот НЕ рахує і НЕ обіцяє (це лише людина): на пряме питання про знижку 10% став faq_template=null.
 БАСЕЙН — РОЗРІЗНЯЙ ДВА ШАБЛОНИ:
 - GUEST_POOL: будь-яке питання про ЦІНУ/ВАРТІСТЬ басейну, про КУПАННЯ чи ВІДВІДУВАННЯ басейну БЕЗ проживання, "покупатись/поплавати в басейні", "скільки коштує басейн", "приїхати на басейн на день", "тільки/лише басейн", "можна просто скупатись".
 - POOL: ЗАГАЛЬНЕ питання про басейн як зручність для гостей ("чи є басейн", "він з підігрівом?", "графік/години роботи", "розмір/глибина", "чи входить басейн у вартість проживання").
@@ -335,6 +337,14 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     labels = await asyncio.to_thread(get_conversation_labels, conversation_id)
     if bot_logic.is_muted(labels):
         print(f"[i] Конверсація {conversation_id} під керуванням людини ({labels}); бот мовчить.")
+        return
+
+    # Блогер / бартер / PR-колаборація: готель ХОЧЕ такі угоди, але домовляється людина.
+    # Перевіряємо ПЕРЕД спамом, щоб бажану співпрацю не загубити мовчки — бот мовчить,
+    # але ТЕГУЄ конверсацію Instagram, щоб оператор опрацював (а не ігнорує, як спам).
+    if bot_logic.is_barter(user_message):
+        print(f"[i] Бартер/колаборація -> тег '{bot_logic.INSTAGRAM_LABEL}', бот мовчить: {user_message[:50]}")
+        await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
         return
 
     # B2B / реклама / спам -> повністю ігноруємо (НЕ відправляємо жодної відповіді).
@@ -465,6 +475,13 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         print(f"[i] {conversation_id}: booking_confirm without a prior quote -> price_quote (no premature IBAN)")
     print(f"[i] Slots: {slots}")
 
+    # Barter/PR collab the extractor caught (keywords missed it) -> silent + Instagram tag.
+    if slots.get("topic") == "barter":
+        print(f"[i] Бартер (екстрактор) -> тег '{bot_logic.INSTAGRAM_LABEL}', мовчимо")
+        if not _superseded(conversation_id, seq):
+            await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
+        return
+
     # Fix 2: a COMPLETELY unrecognized intent is the only manager hand-off (date
     # searches never hand off). Reply once, tag the conversation Instagram, stop.
     if slots.get("topic") == "unknown":
@@ -560,6 +577,12 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     if _superseded(conversation_id, seq):
         print(f"[i] {conversation_id}: msg #{seq} superseded mid-processing -> suppress reply.")
         return
+
+    # Off-season (price not set yet): we DON'T reject — we say it's being agreed and tag the
+    # conversation Instagram so a human manager follows up (owner rule 2026-06-23).
+    if reply is not None and reply.strip() == templates.OFF_SEASON.strip():
+        print(f"[i] {conversation_id}: міжсезоння -> тег '{bot_logic.INSTAGRAM_LABEL}' для менеджера")
+        await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
 
     # Anti-spam: never send the SAME message twice in a row (across both emits this turn).
     last_bot = next((m.get("content", "").strip() for m in reversed(raw_history)

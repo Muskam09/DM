@@ -13,14 +13,16 @@ Business rules (authoritative, see project_spec.md §5 and skills.md):
 * Weekday vs. weekend tariff is decided per night, by the day the guest SLEEPS:
     - "вихідні" (weekend rate): the night of Friday and the night of Saturday.
     - "будні"  (weekday rate): Sunday, Monday, Tuesday, Wednesday, Thursday.
-* Base room price ("вартість_кімнати") covers up to BASE_CAPACITY (2) paying guests.
-* Children / extra places (per night, added on top of the room price):
-    - age <= 6              -> FREE (0), shares the parents' bed.
-    - 7 <= age <= 12        -> charged "дитяче_місце"   (a 50% extra-bed rate).
-    - age > 12 OR an adult  -> charged "додаткове_місце" (full extra-bed rate),
+* Base room price ("вартість_кімнати") covers up to BASE_CAPACITY (2) paying guests
+  — for EVERY room type, including Напівлюкс (extra guests 3+ pay an extra place).
+* Children / extra places (per night, added on top of the room price). Owner rule
+  (2026-06-23):
+    - age < 6   (0–5)       -> FREE (0), shares the parents' bed.
+    - 6 <= age < 12 (6–11)  -> charged "дитяче_місце"   (a 50% extra-bed rate).
+    - age >= 12 OR an adult -> charged "додаткове_місце" (full extra-bed rate),
       but only for guests BEYOND the base capacity.
 * Single occupancy: when exactly one paying guest stays in a room that has an
-  "одномісне_поселення" rate, that rate replaces "вартість_кімнати".
+  "одномісне_поселення" rate, that rate ALWAYS replaces "вартість_кімнати".
 
 Only the summer months June/July/August ("Червень"/"Липень"/"Серпень") have a
 price table; other months raise a clear error.
@@ -37,6 +39,13 @@ from typing import Dict, List, Optional
 # --- Constants -------------------------------------------------------------
 
 BASE_CAPACITY = 2  # guests covered by the base room price before extra-place fees
+
+# Child age tiers (owner rule 2026-06-23), as half-open intervals:
+#   [0, FREE_CHILD_MAX_AGE)       -> free            (0–5)
+#   [FREE_CHILD_MAX_AGE, CHILD_PLACE_MAX_AGE) -> дитяче_місце  (6–11)
+#   [CHILD_PLACE_MAX_AGE, ∞)      -> додаткове_місце (12+)
+FREE_CHILD_MAX_AGE = 6
+CHILD_PLACE_MAX_AGE = 12
 
 # Monday=0 ... Sunday=6 (datetime.date.weekday()). Friday=4, Saturday=5.
 WEEKEND_NIGHTS = {4, 5}
@@ -163,12 +172,25 @@ def night_dates(checkin, checkout) -> List[str]:
 
 
 def child_place_key(age: int) -> Optional[str]:
-    """Which extra-place rate a child of the given age pays (None == free)."""
-    if age <= 6:
+    """Which extra-place rate a child of the given age pays (None == free).
+
+    Owner rule (2026-06-23): under 6 free; 6–11 -> дитяче_місце; 12+ -> додаткове_місце.
+    """
+    if age < FREE_CHILD_MAX_AGE:       # 0–5
         return None
-    if age <= 12:
+    if age < CHILD_PLACE_MAX_AGE:      # 6–11
         return CHILD_PLACE_KEY
-    return EXTRA_PLACE_KEY
+    return EXTRA_PLACE_KEY             # 12+
+
+
+def _is_free_child(g: "Guest") -> bool:
+    """A child under 6 stays free and never occupies a paid slot."""
+    return (not g.is_adult) and g.age is not None and g.age < FREE_CHILD_MAX_AGE
+
+
+def _is_full_rate_guest(g: "Guest") -> bool:
+    """Adults and children 12+ pay the FULL extra place (додаткове_місце)."""
+    return g.is_adult or (g.age is not None and g.age >= CHILD_PLACE_MAX_AGE)
 
 
 # --- Pricing engine --------------------------------------------------------
@@ -222,37 +244,29 @@ class PricingEngine:
     @staticmethod
     def _extra_place_keys(guests: List[Guest]) -> List[Optional[str]]:
         """Return the per-guest extra-place rate key for guests BEYOND base
-        capacity. Children <=6 are always free and never occupy a paid slot.
+        capacity. Children under 6 are always free and never occupy a paid slot.
 
         The base capacity is filled by the most expensive occupants first
-        (adults / children >12, then 6-12 children), so the cheapest guests
+        (adults / children 12+, then 6-11 children), so the cheapest guests
         end up as the charged "extras" — the customer-friendly reading that
         matches project_spec.md Case 7 (2 adults + 1 child 8 => child pays).
         """
         # Free children never count toward capacity or charges.
-        paying = [g for g in guests if not (not g.is_adult and g.age is not None and g.age <= 6)]
+        paying = [g for g in guests if not _is_free_child(g)]
 
         def cost_rank(g: Guest) -> int:
             # Higher rank = more expensive as an extra -> fills base capacity first.
-            if g.is_adult or (g.age is not None and g.age > 12):
-                return 2  # додаткове_місце
-            return 1      # дитяче_місце (children 7-12)
+            return 2 if _is_full_rate_guest(g) else 1  # додаткове vs дитяче (6-11)
 
         ordered = sorted(paying, key=cost_rank, reverse=True)
         extras = ordered[BASE_CAPACITY:]
 
-        keys: List[Optional[str]] = []
-        for g in extras:
-            if g.is_adult or (g.age is not None and g.age > 12):
-                keys.append(EXTRA_PLACE_KEY)
-            else:
-                keys.append(CHILD_PLACE_KEY)
-        return keys
+        return [EXTRA_PLACE_KEY if _is_full_rate_guest(g) else CHILD_PLACE_KEY
+                for g in extras]
 
     @staticmethod
     def _paying_guest_count(guests: List[Guest]) -> int:
-        return sum(1 for g in guests
-                   if not (not g.is_adult and g.age is not None and g.age <= 6))
+        return sum(1 for g in guests if not _is_free_child(g))
 
     # -- public API ---------------------------------------------------------
 

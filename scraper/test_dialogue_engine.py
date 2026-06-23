@@ -419,13 +419,62 @@ def test_finalize_ubd_single_room_discount_and_text():
     assert templates.MILITARY in reply    # UBD template appended
 
 
-def test_finalize_ubd_applies_only_to_flagged_room():
+def test_finalize_ubd_whole_booking_discounts_all_rooms():
+    # Owner rule 2026-06-23: УБД -20% applies to the ENTIRE booking (a veteran's family),
+    # even if only one room carries the flag. Per-room lines stay at full price; the GRAND
+    # TOTAL is discounted -20%.
     rooms = [
         {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
          "adults": 2, "children_ages": [], "ubd": True},
-        {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+        {"room_type": "Напівлюкс", "checkin": "2026-07-06", "checkout": "2026-07-08",
          "adults": 2, "children_ages": [], "ubd": False},
     ]
     reply = de.finalize_quote(rooms, {})
-    assert "3520 грн" in reply and "4400 грн" in reply
-    assert "Загальна вартість: 7920 грн" in reply
+    assert "4400 грн" in reply and "5400 грн" in reply        # per-room lines at FULL price
+    assert "Загальна вартість: 7840 грн" in reply             # (4400+5400)=9800 * 0.8
+    assert "7920" not in reply                                # NOT the old per-room math
+    assert "УБД" in reply and templates.MILITARY in reply
+
+
+# --- 6+ guest distribution (owner rule 2026-06-23) -------------------------
+
+def test_plan_six_plus_guests_in_one_room_asks_distribution():
+    # 6+ guests can't share one room (max ~5) -> ask HOW to split BEFORE quoting.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
+                              "adults": 6, "children_count": 0, "children_ages": []}]})
+    assert out == {"action": "reply", "reply": templates.ASK_ROOM_DISTRIBUTION}
+
+
+def test_plan_six_guests_counts_children_too():
+    # 2 adults + 4 children still = 6 bodies -> distribution ask.
+    out = de.plan({"rooms": [{"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+                              "adults": 2, "children_count": 4, "children_ages": [5, 7, 9, 11]}]})
+    assert out["reply"] == templates.ASK_ROOM_DISTRIBUTION
+
+
+def test_plan_five_guests_one_room_still_quotes():
+    # 5 fits Напівлюкс -> NOT a distribution ask; no room chosen -> quote_all.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
+                              "adults": 5, "children_count": 0, "children_ages": []}]})
+    assert out["action"] == "quote_all"
+
+
+def test_plan_six_plus_explicit_two_rooms_proceeds():
+    # Already split across 2 rooms -> the client said how -> proceed to quote.
+    out = de.plan({"rooms": [
+        {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+         "adults": 3, "children_ages": []},
+        {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
+         "adults": 3, "children_ages": []}]})
+    assert out["action"] == "quote"
+
+
+def test_finalize_quote_all_family_recommends_napivlux():
+    # Family of 4 (2 adults + 2 kids) -> prioritise Напівлюкс + offer the two-room split.
+    avail = {"Стандарт": {"2026-07-06": 3, "2026-07-07": 3},
+             "Стандарт +": {"2026-07-06": 3, "2026-07-07": 3},
+             "Напівлюкс": {"2026-07-06": 1, "2026-07-07": 1}}
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-07-06", "checkout": "2026-07-08", "adults": 2, "children_ages": [8, 10]}, avail)
+    assert "Напівлюкс" in reply
+    assert "два окремі номери" in reply      # offers the roomier split alternative

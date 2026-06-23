@@ -32,18 +32,21 @@ A multi-night stay can mix tariffs — compute each night separately and sum.
 room defines `одномісне_поселення`, that single-occupancy rate replaces
 `вартість_кімнати`.
 
-### 1.4 Children & extra places (TIERED — authoritative, decided 2026-06-16)
-Charged **per night**, **only for guests beyond base capacity (2)**:
+### 1.4 Children & extra places (TIERED — authoritative, owner rule 2026-06-23)
+Charged **per night**, **only for guests beyond base capacity (2)**. Half-open
+intervals (so the boundary ages are unambiguous):
 
 | Guest | Per-night surcharge |
 |---|---|
-| Child **0–6** (inclusive) | **0** — free, shares parents' bed, takes no paid slot |
-| Child **7–12** | `дитяче_місце` (already a 50% extra-bed rate, e.g. 300 грн) |
-| Child **>12** or an **extra adult** | `додаткове_місце` (full extra-bed rate) |
+| Child **0–5** (under 6) | **0** — free, shares parents' bed, takes no paid slot |
+| Child **6–11** | `дитяче_місце` (already a 50% extra-bed rate, e.g. 300 грн) |
+| Child **12+** or an **extra adult** | `додаткове_місце` (full extra-bed rate) |
 
-Fill the base capacity with the **most expensive** occupants first (adults / 12+),
-so the cheapest guests become the charged "extras" — the customer-friendly reading
-that matches Case 7. Free (≤6) children never consume a paid slot.
+Exactly **6** → `дитяче_місце`; exactly **12** → `додаткове_місце`. Fill the base
+capacity with the **most expensive** occupants first (adults / 12+), so the cheapest
+guests become the charged "extras" — the customer-friendly reading that matches Case 7.
+Free (<6) children never consume a paid slot. (Changed 2026-06-23 from the old 0–6 free /
+7–12 / >12 boundaries.)
 
 ### 1.5 The formula
 ```
@@ -61,13 +64,17 @@ room_rate(night) = одномісне_поселення  if exactly 1 paying gu
   (`додаткове_місце` 500 for the 3rd adult).
 * 2 adults + child 5, any room → child is free → just `вартість_кімнати × nights`.
 
-### 1.7 УБД (combat-veteran) discount — DETERMINISTIC
-* Strict **−20%** off a room's total: `pricing_engine.apply_military_discount(total)
-  = round(total × 0.8)`.
-* The extractor sets `ubd:true` per room; `dialogue_engine.finalize_quote` applies the
-  discount to the flagged room only ("знижка по УБД на один номер" → one room),
-  shows the discounted total + "(з урахуванням знижки УБД -20%)", and appends the
-  `MILITARY` template. Example: Стандарт July 6–8, 2 adults = 4400 → **3520** грн.
+### 1.7 УБД (combat-veteran) discount — DETERMINISTIC, WHOLE booking (owner 2026-06-23)
+* Strict **−20%** off the **entire booking total**: `pricing_engine.apply_military_discount(
+  total) = round(total × 0.8)`.
+* The extractor sets `ubd:true` for ALL rooms when a veteran is mentioned (the discount
+  covers a veteran's whole family). `dialogue_engine.finalize_quote` applies −20% to the
+  **grand total across all rooms** (per-room lines stay at full price), shows the
+  discounted total + "(з урахуванням знижки УБД -20%)", and appends `MILITARY` (asks for
+  at least a copy of the УБД certificate at check-in). Single room: Стандарт July 6–8,
+  2 adults = 4400 → **3520** грн. Two rooms 4400 + 5400 = 9800 → **7840** грн.
+* The bot offers **no other discount** — the 10% loyalty / length-of-stay discount is
+  human-only and is never quoted or computed by the bot.
 
 ## 1b. Deterministic guards & flow (NOT left to the LLM)
 

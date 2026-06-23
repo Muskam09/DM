@@ -54,11 +54,12 @@ def test_weekend_classification(date_str, expected_weekend):
 # --- child / extra-place tiers ---------------------------------------------
 
 @pytest.mark.parametrize("age,expected", [
-    (0, None), (3, None), (6, None),           # 0-6 free
-    (7, "дитяче_місце"), (10, "дитяче_місце"), (12, "дитяче_місце"),
-    (13, "додаткове_місце"), (15, "додаткове_місце"),
+    (0, None), (3, None), (5, None),                                   # 0-5 free
+    (6, "дитяче_місце"), (10, "дитяче_місце"), (11, "дитяче_місце"),    # 6-11 child place
+    (12, "додаткове_місце"), (13, "додаткове_місце"), (15, "додаткове_місце"),  # 12+ full place
 ])
 def test_child_place_key(age, expected):
+    # Owner rule (2026-06-23): under 6 free; 6-11 дитяче; 12+ додаткове.
     assert child_place_key(age) == expected
 
 
@@ -116,6 +117,30 @@ def test_base_capacity_fills_with_adults_first(engine):
                         make_guests(adults=2, children_ages=[8])) == 2500
 
 
+# --- owner child-tier boundaries (2026-06-23): under6 free / 6-11 child / 12+ full ---
+
+def test_child_age_5_is_free(engine):
+    assert engine.price("Стандарт", "2026-07-06", "2026-07-07",
+                        make_guests(adults=2, children_ages=[5])) == 2200
+
+
+def test_child_age_6_now_charged_child_place(engine):
+    # Age 6 is now дитяче_місце (was FREE under the old 0-6 rule).
+    assert engine.price("Стандарт", "2026-07-06", "2026-07-07",
+                        make_guests(adults=2, children_ages=[6])) == 2500   # 2200 + 300
+
+
+def test_child_age_11_child_place(engine):
+    assert engine.price("Стандарт", "2026-07-06", "2026-07-07",
+                        make_guests(adults=2, children_ages=[11])) == 2500
+
+
+def test_child_age_12_now_extra_place(engine):
+    # Age 12 is now додаткове_місце (was дитяче under the old <=12 rule).
+    assert engine.price("Стандарт", "2026-07-06", "2026-07-07",
+                        make_guests(adults=2, children_ages=[12])) == 2700   # 2200 + 500
+
+
 # --- weekday/weekend rate selection ----------------------------------------
 
 def test_weekend_night_uses_weekend_rate(engine):
@@ -133,6 +158,11 @@ def test_mixed_weekday_and_weekend_stay(engine):
 def test_single_occupancy_rate(engine):
     # 1 adult, Standard, 1 будні July night -> одномісне_поселення = 1800
     assert engine.price("Стандарт", "2026-07-06", "2026-07-07", make_guests(adults=1)) == 1800
+
+
+def test_single_occupancy_standard_plus(engine):
+    # Solo ALWAYS uses одномісне_поселення (June будні Стандарт+ = 2000), not the 2400 room rate.
+    assert engine.price("Стандарт +", "2026-06-28", "2026-06-29", make_guests(adults=1)) == 2000
 
 
 # --- room-type resolution & errors -----------------------------------------

@@ -91,22 +91,43 @@ incoming → spam? phone? (deterministic guards) → LLM EXTRACTION (returns JSO
    `PAYMENT_RECEIVED_HANDOFF`, add the `Замовлено` label, go silent. If a
    conversation already has `Замовлено` (`bot_logic.is_muted`) the bot ignores ALL
    messages (a human owns it).
-1e. **УБД −20% (deterministic):** the extractor sets `ubd:true` per room; `finalize_quote`
-   applies `pricing_engine.apply_military_discount` (round(total×0.8)) to that room,
-   shows the discounted total, and appends the `MILITARY` template.
+1e. **УБД −20% (deterministic, WHOLE booking):** the extractor sets `ubd:true` for ALL
+   rooms when a veteran is mentioned; `finalize_quote` applies
+   `pricing_engine.apply_military_discount` (round(total×0.8)) to the **entire booking
+   total** (a veteran's family — every room), shows the discounted grand total
+   "(з урахуванням знижки УБД -20%)", and appends the `MILITARY` template (which asks for
+   at least a copy of the УБД certificate at check-in). The bot offers NO other discount —
+   the 10% loyalty / length-of-stay discount is human-only and never quoted by the bot.
 2. **Nights = checkout − checkin.** The checkout day is never charged and never
    checked for availability.
 3. **Weekend nights = Friday & Saturday** (тариф "вихідні"); Sun–Thu = "будні".
    Decided **per night**.
 4. **Children / extra places** are tiered by age — see `skills.md` §1 and
-   `project_spec.md` §5. (≤6 free, 7–12 `дитяче_місце`, >12/extra adult
-   `додаткове_місце`, per night, only beyond base capacity 2.)
+   `project_spec.md` §5. **Owner rule 2026-06-23:** 0–5 free, 6–11 `дитяче_місце`,
+   12+/extra adult `додаткове_місце`, per night, only beyond base capacity 2 (for EVERY
+   room type, Напівлюкс included). The boundaries are half-open: exactly **6** is
+   `дитяче_місце`, exactly **12** is `додаткове_місце`.
 5. **Blacklist filter.** `bot_logic.IGNORE_CATEGORIES = ["Колиба","Басейн","Overbooking"]`
    are force-removed from scraper output — never offered as rooms.
 6. **Templates only.** Replies are copied verbatim from `templates.py`; the model
    fills `{placeholders}`, it does not invent prose.
 7. **Long-term memory.** Consolidate slots from the entire history; never re-ask
    something the client already provided, even if given one word at a time.
+8. **Owner decisions 2026-06-23 (deterministic):**
+   * **6+ guests in one room → split first.** `dialogue_engine.plan` returns
+     `ASK_ROOM_DISTRIBUTION` before any quote when a single room object holds ≥6 guests
+     (can't fit one room; max ~5). An explicit multi-room request (>1 room) proceeds.
+   * **Family of 4–5 (with children) → recommend.** `finalize_quote_all` prioritises
+     Напівлюкс and offers a two-room split as the roomier alternative (still only the 3
+     public names).
+   * **Off-season ≠ rejection.** `OFF_SEASON` now says the price is "ще узгоджується" and
+     `bot_server` tags the conversation `Instagram` for a human follow-up (no phone ask).
+   * **Barter/PR collab is wanted, not spam.** `bot_logic.is_barter` (checked BEFORE spam)
+     and the extractor `topic=barter` → bot stays SILENT but adds the `Instagram` label so
+     an operator handles the deal.
+   * **Solo → `одномісне_поселення` always.** **Pets** = 300 грн/night (cats too).
+     **Check-in 14:00 / out 12:00**, early/late free if the room is free (`CHECK_IN_OUT`).
+     **NEVER** mention a tennis court (it doesn't exist; "настільний теніс" = ping-pong, OK).
 
 ## 5. Coding guidelines
 
