@@ -66,9 +66,16 @@ incoming → spam? phone? (deterministic guards) → LLM EXTRACTION (returns JSO
 ## 4. Core algorithm rules (do not break)
 
 1. **Extraction decides routing; Python decides everything else.** The scrape runs
-   only on the deterministic **quote** path (`plan()` returns `action: "quote"`):
-   a *specific* room + dates + guests, in a priced month. FAQ / greeting / group /
-   off-season / fuzzy / thinking never scrape.
+   only on a deterministic scrape action (`plan()` returns one of
+   `quote / quote_all / explore / nearest`): exact dates+guests, or a fuzzy period +
+   guests, in a priced month. greeting / group / off-season / pure-fuzzy-no-guests /
+   thinking never scrape. **FAQ:** answered from templates and normally does NOT
+   scrape — BUT if the same message also carries an *actionable* booking intent
+   (`plan()` → a scrape action: e.g. "липень, 4 особи, чи є трансфер?"), the bot
+   answers the FAQ **and then executes the scan**, appending the real calendar result
+   (windows / room options / quote). The generic `FAQ_CONTINUE_NUDGE` is appended ONLY
+   when the booking action is a *question* (missing data). Availability for the FAQ+scan
+   path comes from a warm cache when present (no double scrape), else a fresh scrape.
 1b. **Availability gating (mandatory):** `finalize_quote` checks the calendar FIRST
    and **never quotes a sold-out room**. Sold out + other categories free →
    `ROOM_BOOKED` (Case 4); fully booked → `SOLD_OUT_NEAREST` (Case 5). A date

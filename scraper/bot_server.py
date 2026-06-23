@@ -217,6 +217,9 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - ubd — true ЛИШЕ якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових для ЦЬОГО номеру; інакше false. Якщо просять знижку УБД "на один номер" — постав ubd=true тільки для одного (першого) номеру.
 
 FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY.
+БАСЕЙН — РОЗРІЗНЯЙ ДВА ШАБЛОНИ:
+- GUEST_POOL: будь-яке питання про ЦІНУ/ВАРТІСТЬ басейну, про КУПАННЯ чи ВІДВІДУВАННЯ басейну БЕЗ проживання, "покупатись/поплавати в басейні", "скільки коштує басейн", "приїхати на басейн на день", "тільки/лише басейн", "можна просто скупатись".
+- POOL: ЗАГАЛЬНЕ питання про басейн як зручність для гостей ("чи є басейн", "він з підігрівом?", "графік/години роботи", "розмір/глибина", "чи входить басейн у вартість проживання").
 
 ІСТОРІЯ ДІАЛОГУ:
 %%HISTORY%%
@@ -558,25 +561,6 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         print(f"[i] {conversation_id}: msg #{seq} superseded mid-processing -> suppress reply.")
         return
 
-    # Bug 1: an FAQ answered while a scrape was in flight must not drop the booking
-    #    answer. The (prior/superseded) scrape populated the cache, so COMBINE: deliver
-    #    the FAQ reply, then the pending booking result FROM CACHE — no new scrape, latest
-    #    slots (never stale), one turn (never double).
-    booking_extra = None
-    if is_faq_reply:
-        cached = peek_cached_availability(conversation_id)
-        if cached is not None:
-            d2 = dialogue_engine.plan(slots)
-            if d2.get("action") in _SCRAPE_ACTIONS:
-                simplified = bot_logic.build_simplified_availability(cached)
-                booking_extra = build_booking_reply(d2, simplified)
-                if bot_logic.is_window_offer_message(booking_extra or ""):
-                    win = dialogue_engine.offered_window(d2, simplified)
-                    if win:
-                        _pending_window[conversation_id] = win
-    if booking_extra:
-        reply = reply.replace(templates.FAQ_CONTINUE_NUDGE, "")  # send the real result, not the nudge
-
     # Anti-spam: never send the SAME message twice in a row (across both emits this turn).
     last_bot = next((m.get("content", "").strip() for m in reversed(raw_history)
                      if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
@@ -595,8 +579,38 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         bot_has_spoken = True
         last_bot = text.strip()
 
+    # Bug 1 (FAQ hijacks the scan): an FAQ asked ALONGSIDE an actionable booking intent
+    #    must ANSWER the FAQ and then RUN the real scan, appending the ACTUAL calendar
+    #    result (free віконця / room options / quote) — NEVER the generic "shall I check?"
+    #    nudge. So: answer the FAQ first (greeting prepended on turn 1), take availability
+    #    from a warm cache if present (no double scrape — e.g. an FAQ that interrupted an
+    #    in-flight scrape) else scrape now ("Секундочку…"), then send the booking result as
+    #    a 2nd message. The nudge survives ONLY when the booking action is a QUESTION
+    #    (missing data) — that path keeps faq_followup's nudge and never reaches here.
+    booking_extra = None
+    if is_faq_reply:
+        d2 = dialogue_engine.plan(slots)
+        if d2.get("action") in _SCRAPE_ACTIONS:
+            reply = reply.replace(templates.FAQ_CONTINUE_NUDGE, "")  # real result, not the nudge
+            try:
+                await _emit(reply)                  # 1) answer the FAQ first
+            except Exception as e:
+                print(f"[-] Помилка надсилання (FAQ): {e}")
+            reply = None                            # already sent above
+            cached = peek_cached_availability(conversation_id)
+            availability_data = (cached if cached is not None
+                                 else await get_hotel_data_cached(conversation_id))
+            if availability_data and not _superseded(conversation_id, seq):
+                simplified = bot_logic.build_simplified_availability(availability_data)
+                booking_extra = build_booking_reply(d2, simplified)
+                if bot_logic.is_window_offer_message(booking_extra or ""):
+                    win = dialogue_engine.offered_window(d2, simplified)
+                    if win:
+                        _pending_window[conversation_id] = win
+
     try:
-        await _emit(reply)
+        if reply is not None:
+            await _emit(reply)
         if booking_extra:
             await _emit(booking_extra)
     except Exception as e:

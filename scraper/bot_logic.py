@@ -212,6 +212,7 @@ def is_location_question(text: str) -> bool:
 
 # FAQ intent must override slot-collection: a terse "собачка" / "харчування?" gets
 # answered immediately, not after rounds of "which dates?". Maps keywords -> template.
+# NB: "басейн" is handled separately (see _pool_template) — it splits into two FAQs.
 _FAQ_OVERRIDE = [
     (["соба", "песик", "пёс", "пекінес", "тварин", "кіт", "котик", "кота", "улюбленц"], "PETS"),
     (["харчув", "сніданок", "сніданк", "їжа", "їсти", "поїсти", "меню", "обід", "годуєте", "перекус"], "FOOD_PRICES"),
@@ -219,17 +220,47 @@ _FAQ_OVERRIDE = [
     (["трансфер", "парковк", "паркінг"], "TRANSFER_PARKING"),
     (["добра", "доїх", "дістат", "як до вас", "залізниц", "потяг", "електричк"], "HOW_TO_GET_THERE"),
     (["курит", "палит", "куріння", "паління"], "SMOKING"),
-    (["басейн"], "POOL"),
 ]
+
+
+# A "басейн" question splits into TWO different FAQs and the small LLM kept collapsing
+# both into POOL, so we disambiguate deterministically:
+#   GUEST_POOL — price for NON-residents / a day-visit / swimming without staying
+#                ("ціна басейну", "покупатись у басейні", "приїхати на басейн на день").
+#   POOL       — the pool as an amenity for guests ("чи є басейн", "він з підігрівом?",
+#                "графік роботи", "розмір/глибина").
+_GUEST_POOL_MARKERS = [
+    "покупат", "купат", "поплава", "скупат", "купанн",
+    "не прожива", "без прожива", "не проживаюч", "тільки басейн", "лише басейн", "лиш басейн",
+    "відвідат", "відвідуван", "на день",
+    "приїхати в басейн", "приїхати на басейн", "приїхати до басейн", "приїхати скупат",
+    "прийти в басейн", "прийти на басейн", "прийти до басейн",
+    "просто в басейн", "просто на басейн", "просто скупат",
+]
+# "ціна/вартість басейну" as a service => GUEST_POOL; BUT "чи входить басейн у вартість
+# (проживання)" is the amenity answer => POOL (so we exclude "вход…").
+_POOL_PRICE_MARKERS = ["ціна", "цін", "вартіст", "скільки кошт", "почому", "по чому", "скільки за"]
+
+
+def _pool_template(t: str) -> str:
+    """Disambiguate a 'басейн' question into GUEST_POOL (non-resident day-visit / price to
+    swim) vs POOL (general amenity). `t` is the already-lowercased message text."""
+    if any(m in t for m in _GUEST_POOL_MARKERS):
+        return "GUEST_POOL"
+    if any(m in t for m in _POOL_PRICE_MARKERS) and "вход" not in t:
+        return "GUEST_POOL"
+    return "POOL"
 
 
 def faq_override(text: str):
     """Return a fixed FAQ template name when the message is clearly one of the
-    priority FAQs (location/pets/food/transport/…), else None. Used to answer the
+    priority FAQs (location/pets/food/transport/pool/…), else None. Used to answer the
     question immediately instead of continuing slot collection."""
     if is_location_question(text):
         return "PLACE"
     t = (text or "").lower()
+    if "басейн" in t:                       # pool questions split into POOL / GUEST_POOL
+        return _pool_template(t)
     for keywords, template in _FAQ_OVERRIDE:
         if any(k in t for k in keywords):
             return template

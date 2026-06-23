@@ -241,6 +241,26 @@ def test_faq_override(text, expected):
     assert bot_logic.faq_override(text) == expected
 
 
+@pytest.mark.parametrize("text,expected", [
+    # Bug 2 (§9.11): price / swimming / day-visit WITHOUT staying -> GUEST_POOL.
+    ("яка ціна покупались у басейні", "GUEST_POOL"),       # the exact live-QA failure
+    ("скільки коштує басейн?", "GUEST_POOL"),
+    ("можна просто поплавати в басейні?", "GUEST_POOL"),
+    ("хочемо приїхати на басейн на день", "GUEST_POOL"),
+    ("вартість відвідування басейну без проживання", "GUEST_POOL"),
+    ("тільки басейн, не проживаємо", "GUEST_POOL"),
+    # General amenity questions -> POOL.
+    ("а у вас є басейн?", "POOL"),
+    ("басейн з підігрівом?", "POOL"),
+    ("до котрої працює басейн?", "POOL"),
+    ("чи входить басейн у вартість проживання?", "POOL"),  # "входить" -> amenity, not price
+])
+def test_faq_override_pool_vs_guest_pool(text, expected):
+    # The deterministic guard (not just the LLM) must split POOL/GUEST_POOL, because it
+    # OVERRIDES the extractor's faq_template for any "басейн" message.
+    assert bot_logic.faq_override(text) == expected
+
+
 def test_new_templates_content():
     assert "0673445220" in templates.LARGE_GROUPS_EVENTS
     assert "350" in templates.FOOD_PRICES and "1100" in templates.FOOD_PRICES
@@ -481,19 +501,50 @@ def test_e2e_location_question_pinned_to_place(server):
 
 
 def test_e2e_faq_midbooking_preserves_state(server):
-    # Fix 3: user is mid-booking (dates+guests known) and asks an FAQ. The bot answers
-    # WITHOUT wiping state: no scrape, no QUESTION_ALL_MISSING, offers to continue.
+    # §9.11 Bug 1: user is mid-booking (room+dates+guests known) and asks an FAQ. The bot
+    # answers WITHOUT wiping state AND — because the booking intent is ACTIONABLE (plan ->
+    # quote) — runs the scan and appends the REAL quote, never the generic nudge.
     bs = server.configure(
         slots={"topic": "faq", "faq_template": "HOW_TO_GET_THERE", "rooms": [
             {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
              "adults": 2, "children_ages": []}]},
-        history=_bot_spoke())
+        history=_bot_spoke(),
+        availability=_raw({"Стандарт": {"2026-07-06": 3, "2026-07-07": 3}}))
     _run(bs.process_incoming_message("а як до вас добратися?", 351))
     full = "\n".join(server.sent)
-    assert templates.HOW_TO_GET_THERE in full
-    assert templates.FAQ_CONTINUE_NUDGE.strip() in full       # state-aware continuation
+    assert templates.HOW_TO_GET_THERE in full                 # FAQ answered
+    assert "буде вартувати" in full                           # + the REAL quote (scan ran)
+    assert templates.FAQ_CONTINUE_NUDGE.strip() not in full   # nudge replaced by real result
     assert templates.QUESTION_ALL_MISSING not in full         # never re-asks from scratch
-    assert server.state["scraped"] is False                   # an FAQ never scrapes
+    assert server.state["scraped"] is True                    # actionable FAQ executes the scan
+
+
+def test_e2e_faq_with_fuzzy_intent_runs_proactive_scan(server):
+    # §9.11 Bug 1 (mission Dialogue 1): one message carries BOTH an FAQ and an actionable
+    # fuzzy booking intent ("липень, 4 особи, чи є трансфер?"). The bot answers the FAQ AND
+    # runs the proactive scan, proposing REAL windows — never the generic nudge, so a later
+    # "Так" has windows to accept (the scan actually happened).
+    bs = server.configure(
+        slots={"topic": "faq", "faq_template": "TRANSFER_PARKING", "rooms": [
+            {"room_type": None, "fuzzy_date": "липень", "nights": None,
+             "checkin": None, "checkout": None, "adults": 4, "children_ages": []}]},
+        history=[],   # first turn -> cold cache, must scrape
+        availability=_raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(10, 20)}}))
+    _run(bs.process_incoming_message("липень, 4 особи, чи є трансфер?", 355))
+    assert server.sent[0].startswith("Доброго дня! Вас вітає D&T Hotel")  # greeting first
+    full = "\n".join(server.sent)
+    assert templates.TRANSFER_PARKING in full                 # FAQ answered
+    assert "вільні віконця" in full                           # proactive scan ran -> real windows
+    assert templates.FAQ_CONTINUE_NUDGE.strip() not in full   # NOT the generic nudge
+    assert server.state["scraped"] is True
+    assert 355 in bs._pending_window                          # offered window stored for a later "Так"
+
+
+def test_extraction_prompt_carries_guest_pool_rule(server):
+    # Bug 2: the extractor prompt must explicitly teach GUEST_POOL vs POOL.
+    import bot_server
+    assert "GUEST_POOL:" in bot_server.EXTRACTION_PROMPT
+    assert "POOL: ЗАГАЛЬНЕ" in bot_server.EXTRACTION_PROMPT
 
 
 def test_e2e_slot_memory_restores_dropped_guests(server):
