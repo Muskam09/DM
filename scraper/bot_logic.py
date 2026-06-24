@@ -319,11 +319,27 @@ def remember_room(room) -> Dict:
     return {f: (room or {}).get(f) for f in MERGE_FIELDS}
 
 
+def _shared_booking_dates(rooms) -> Dict:
+    """The first room's date fields (checkin/checkout/nights/fuzzy_date), used to propagate
+    ONE shared stay across a multi-room split. Empty dict when no room carries dates."""
+    for r in (rooms or []):
+        if r and (r.get("checkin") or r.get("checkout") or r.get("fuzzy_date")):
+            return {k: r.get(k) for k in ("checkin", "checkout", "nights", "fuzzy_date")
+                    if r.get(k)}
+    return {}
+
+
 def merge_rooms(remembered_list, fresh_list) -> List[Dict]:
     """Multi-room slot memory: merge fresh rooms with remembered rooms BY INDEX. Each
     room's missing fields are filled from the same-index remembered room; remembered
     rooms the fresh turn didn't re-mention are PRESERVED (the bot must never forget a
-    second/third room across a chit-chat or FAQ turn)."""
+    second/third room across a chit-chat or FAQ turn).
+
+    Shared-stay date persistence (6+ split): when the client breaks ONE booking into
+    several rooms and names NO new dates, every split room inherits the single remembered
+    stay's dates — so the engine SCRAPES with those dates instead of re-asking. Dates the
+    client names THIS turn take priority; per-room dates already present are never
+    overwritten (so a genuine per-room date override still wins)."""
     rem = remembered_list or []
     fresh = fresh_list or []
     n = max(len(rem), len(fresh))
@@ -332,6 +348,13 @@ def merge_rooms(remembered_list, fresh_list) -> List[Dict]:
         f = fresh[i] if i < len(fresh) else {}
         r = rem[i] if i < len(rem) else {}
         out.append(merge_room(r, f))
+    shared = _shared_booking_dates(fresh) or _shared_booking_dates(rem)
+    if shared:
+        for room in out:
+            if not (room.get("checkin") or room.get("checkout") or room.get("fuzzy_date")):
+                for k, v in shared.items():
+                    if not room.get(k):
+                        room[k] = v
     return out
 
 

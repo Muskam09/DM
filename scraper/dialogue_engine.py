@@ -523,12 +523,20 @@ def faq_followup(slots: Dict) -> str:
 
 # --- finalisation (availability gate -> price -> exact format) -------------
 
+def _with_ubd_note(reply: str, ubd: bool) -> str:
+    """Append the УБД validation note to a NON-quote reply (sold-out alternative / cross-sell)
+    so a veteran knows the -20% still applies to the offered window (owner fix 2026-06-24)."""
+    return (reply + "\n\n" + templates.MILITARY) if ubd else reply
+
+
 def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGINE) -> str:
     """Gate on availability, compute the price deterministically, format rigidly.
 
     AVAILABILITY GATING: if ANY requested room is sold out on the dates, we return
-    the Polite Close template and never quote a price.
+    the sold-out alternative and never quote a price. УБД (-20%) applies to the WHOLE
+    booking, so when it's flagged we also append the MILITARY note to those alternatives.
     """
+    ubd_booking = any(bool(r.get("ubd")) for r in rooms)
     priced = []
     for r in rooms:
         room_type = r.get("room_type")
@@ -541,13 +549,15 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
             # Case 5: nothing free at all -> offer to find the nearest free dates.
             free = bot_logic.free_room_types(simplified_availability, nights)
             if free:  # Step 1: other categories free on the SAME dates -> cross-sell.
-                return (templates.ROOM_BOOKED
-                        .replace("{тип номеру}", room_type)
-                        .replace("{вільні_номери}", ", ".join(free)))
+                return _with_ubd_note(templates.ROOM_BOOKED
+                                      .replace("{тип номеру}", room_type)
+                                      .replace("{вільні_номери}", ", ".join(free)), ubd_booking)
             # Step 2: everything booked -> forward-scan THIS room for the nearest block.
             win = find_nearest_window(simplified_availability, room_type, checkin, len(nights))
             if win:  # exact dates were sold out -> "found nearest" wording (NOT "ще не визначились").
-                return templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1]))
+                return _with_ubd_note(
+                    templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1])),
+                    ubd_booking)
             return templates.NEAREST_NONE
 
         adults = r.get("adults") or 0
@@ -570,7 +580,6 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
 
     # УБД (2026-06-23): -20% applies to the WHOLE booking (a veteran's family), so a single
     # flagged room discounts the entire total. The discount is rendered on the grand total.
-    ubd_booking = any(bool(r.get("ubd")) for r in rooms)
     return build_quote_reply(priced, ubd_booking)
 
 
@@ -602,9 +611,11 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
     if not lines:
         # Bug 2: everything sold out -> AUTO-propose the nearest free window (don't ask
         # permission). Only fall back to NEAREST_NONE if nothing free in the whole window.
+        # УБД flagged -> append the MILITARY note so the veteran knows -20% still applies.
         win = nearest_window_any(simplified_availability, checkin, len(nights))
         if win:
-            return templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1]))
+            return _with_ubd_note(
+                templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1])), ubd)
         return templates.NEAREST_NONE
 
     header = (f"На дати {dates_phrase(checkin, checkout)} ({nights_phrase(len(nights))}) "

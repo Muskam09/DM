@@ -206,6 +206,25 @@ def test_merge_rooms_multi_room_preserves_unmentioned():
     assert merged2[0]["adults"] == 2     # inherited from memory
 
 
+def test_merge_rooms_backfills_dates_to_split_rooms():
+    # Fix (2026-06-24): a 6+ split keeps the remembered single stay's dates on EVERY new
+    # room (so the engine scrapes with those dates instead of re-asking).
+    prev = [{"checkin": "2026-07-23", "checkout": "2026-07-24", "adults": 7}]
+    merged = bot_logic.merge_rooms(prev, [{"adults": 4}, {"adults": 3}])
+    assert len(merged) == 2
+    assert all(r["checkin"] == "2026-07-23" and r["checkout"] == "2026-07-24" for r in merged)
+    assert [r["adults"] for r in merged] == [4, 3]
+
+
+def test_merge_rooms_split_respects_new_dates():
+    # If the split turn names NEW dates, those win and propagate to the dateless split room.
+    prev = [{"checkin": "2026-07-23", "checkout": "2026-07-24", "adults": 7}]
+    merged = bot_logic.merge_rooms(
+        prev, [{"adults": 4, "checkin": "2026-07-25", "checkout": "2026-07-26"}, {"adults": 3}])
+    assert merged[0]["checkin"] == "2026-07-25"
+    assert merged[1]["checkin"] == "2026-07-25"   # shared from THIS turn, not the stale 23rd
+
+
 @pytest.mark.parametrize("text,expected", [
     ("Так", True), ("так, давайте", True), ("Давайте", True), ("Добре, бронюємо", True),
     ("ок", True), ("Погоджуюсь", True),
@@ -855,6 +874,47 @@ def test_e2e_six_plus_guests_asks_distribution(server):
     _run(bs.process_incoming_message("нас 6, хочемо до вас на 6-8 липня", 450))
     assert server.state["scraped"] is False
     assert any(m == templates.ASK_ROOM_DISTRIBUTION for m in server.sent)
+
+
+def test_e2e_six_plus_split_uses_stored_dates(server):
+    # Fix (2026-06-24): after ASK_ROOM_DISTRIBUTION, the split reply must SCRAPE using the
+    # STORED dates (not re-ask for dates). Turn 1 sets memory (dates + 7 guests); turn 2
+    # splits into 2 dateless rooms -> the engine backfills the dates and scrapes.
+    avail = _raw({"Стандарт": {"2026-07-23": 5, "2026-07-24": 5}})
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24",
+             "adults": 7, "children_count": 0, "children_ages": []}]},
+        history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("На 23-24 липня, нас 7 дорослих", 470))
+    assert any(m == templates.ASK_ROOM_DISTRIBUTION for m in server.sent)
+    assert server.state["scraped"] is False        # distribution asked first, no scrape yet
+
+    server.sent.clear()
+    server.configure(                               # turn 2: split, dates DROPPED by extractor
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": None, "checkout": None, "adults": 4, "children_ages": []},
+            {"room_type": None, "checkin": None, "checkout": None, "adults": 3, "children_ages": []}]},
+        history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("Зробіть 2 номери: 4 і 3 дорослих", 470))
+    assert server.state["scraped"] is True          # used STORED dates -> scraped, didn't re-ask
+    full = "\n".join(server.sent)
+    assert templates.QUESTION_ONLY_DATES not in full and templates.ASK_DATES_ONLY not in full
+    assert templates.ASK_ROOM_DISTRIBUTION not in full
+
+
+def test_e2e_ubd_soldout_includes_military_note(server):
+    # Fix (2026-06-24): sold-out dates + UBD -> nearest-window offer WITH the military note.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": [], "ubd": True}]},
+        history=_bot_spoke(),
+        availability=_raw({"Стандарт": {"2026-07-05": 0, "2026-07-06": 0,
+                                        "2026-07-08": 2, "2026-07-09": 2, "2026-07-10": 2}}))
+    _run(bs.process_incoming_message("Стандарт 5-7 липня, 2 дорослих, я УБД", 480))
+    full = "\n".join(server.sent)
+    assert "найближче вільне віконце" in full and templates.MILITARY in full
 
 
 def test_e2e_off_season_tags_instagram_no_phone_ask(server):

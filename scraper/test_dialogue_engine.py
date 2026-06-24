@@ -469,6 +469,48 @@ def test_plan_six_plus_explicit_two_rooms_proceeds():
     assert out["action"] == "quote"
 
 
+def test_finalize_ubd_soldout_nearest_appends_military():
+    # Fix (2026-06-24): sold out + UBD -> SOLD_OUT_FOUND_NEAREST WITH the УБД note appended,
+    # so the veteran knows -20% still applies to the offered window.
+    avail = {"Стандарт": {"2026-07-05": 0, "2026-07-06": 0,
+                          "2026-07-08": 2, "2026-07-09": 2, "2026-07-10": 2}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+          "adults": 2, "children_ages": [], "ubd": True}], avail)
+    assert "найближче вільне віконце" in reply and "8 - 10 липня" in reply
+    assert templates.MILITARY in reply
+
+
+def test_finalize_ubd_room_booked_appends_military():
+    # Chosen room sold out, another category free, UBD flagged -> ROOM_BOOKED + УБД note.
+    avail = {"Стандарт": {"2026-07-05": 0, "2026-07-06": 0},
+             "Напівлюкс": {"2026-07-05": 2, "2026-07-06": 2}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+          "adults": 2, "children_ages": [], "ubd": True}], avail)
+    assert "Напівлюкс" in reply and templates.MILITARY in reply
+
+
+def test_finalize_soldout_without_ubd_has_no_military():
+    # Without УБД, the sold-out alternative must NOT carry the military note.
+    avail = {"Стандарт": {"2026-07-05": 0, "2026-07-06": 0,
+                          "2026-07-08": 2, "2026-07-09": 2, "2026-07-10": 2}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+          "adults": 2, "children_ages": []}], avail)
+    assert templates.MILITARY not in reply
+
+
+def test_finalize_quote_all_ubd_soldout_appends_military():
+    avail = {"Стандарт": {"2026-07-06": 0, "2026-07-07": 0, "2026-07-09": 2, "2026-07-10": 2},
+             "Стандарт +": {"2026-07-06": 0, "2026-07-07": 0},
+             "Напівлюкс": {"2026-07-06": 0, "2026-07-07": 0}}
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 2,
+         "children_ages": [], "ubd": True}, avail)
+    assert "найближче вільне віконце" in reply and templates.MILITARY in reply
+
+
 def test_finalize_quote_all_family_recommends_napivlux():
     # Family of 4 (2 adults + 2 kids) -> prioritise Напівлюкс + offer the two-room split.
     avail = {"Стандарт": {"2026-07-06": 3, "2026-07-07": 3},
