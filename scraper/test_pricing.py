@@ -16,6 +16,8 @@ from pricing_engine import (
     nights_between,
     is_weekend_night,
     child_place_key,
+    fits_room,
+    OverCapacityError,
 )
 
 
@@ -163,6 +165,41 @@ def test_single_occupancy_rate(engine):
 def test_single_occupancy_standard_plus(engine):
     # Solo ALWAYS uses одномісне_поселення (June будні Стандарт+ = 2000), not the 2400 room rate.
     assert engine.price("Стандарт +", "2026-06-28", "2026-06-29", make_guests(adults=1)) == 2000
+
+
+# --- hard physical occupancy gate (owner rule 2026-06-24) ------------------
+
+@pytest.mark.parametrize("room,adults,kids,fits", [
+    ("Стандарт", 3, [], True),             # 3 adults OK
+    ("Стандарт", 4, [], False),            # 4 adults -> over (max 3 adults)
+    ("Стандарт", 3, [8], True),            # 3 adults + 1 child <12 -> 4 total OK
+    ("Стандарт", 3, [12], False),          # 3 adults + child 12+ (counts as adult) -> over
+    ("Стандарт", 2, [8, 10], True),        # 2 adults + 2 kids = 4 total OK
+    ("Стандарт", 2, [8, 10, 5], False),    # 5 total -> over
+    ("Стандарт +", 4, [], False),
+    ("Стандарт +", 3, [6], True),
+    ("Напівлюкс", 5, [], True),            # Напівлюкс holds 5
+    ("Напівлюкс", 4, [10], True),          # 5 total OK
+    ("Напівлюкс", 5, [10], False),         # 6 total -> over
+])
+def test_fits_room(room, adults, kids, fits):
+    assert fits_room(room, adults, kids) is fits
+
+
+def test_quote_over_capacity_raises(engine):
+    with pytest.raises(OverCapacityError):
+        engine.quote("Стандарт", "2026-07-06", "2026-07-07", make_guests(adults=4))
+
+
+def test_price_over_capacity_returns_none(engine):
+    assert engine.price("Стандарт", "2026-07-06", "2026-07-07", make_guests(adults=4)) is None
+    assert engine.price("Стандарт +", "2026-07-06", "2026-07-07",
+                        make_guests(adults=3, children_ages=[12])) is None
+
+
+def test_napivlux_holds_five_adults(engine):
+    # 5 adults fit Напівлюкс: base 2 + 3 extra adults (додаткове 500) July будні = 2700 + 1500
+    assert engine.price("Напівлюкс", "2026-07-06", "2026-07-07", make_guests(adults=5)) == 4200
 
 
 # --- room-type resolution & errors -----------------------------------------

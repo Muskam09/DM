@@ -109,6 +109,10 @@ def quote_line(room_type, adults, children_ages, checkin, checkout, nights, pric
         f"на {nights_phrase(nights)} ({dates_phrase(checkin, checkout)}), "
         f"буде вартувати - {price} грн"
     )
+    # UX (owner 2026-06-24): make the child discount explicit when a 6-11 y.o. is present.
+    if any(a is not None and pricing_engine.child_place_key(a) == pricing_engine.CHILD_PLACE_KEY
+           for a in (children_ages or [])):
+        line += " (враховано знижку 50% на дитяче місце)"
     if ubd:
         line += " (з урахуванням знижки УБД -20%)"
     return line
@@ -382,11 +386,19 @@ def first_offered_window(spec: Dict, availability: Dict):
     return (run0, co.isoformat())
 
 
-def nearest_window_any(availability: Dict, after, nights: int, room_count: int = 1):
+def nearest_window_any(availability: Dict, after, nights: int, room_count: int = 1,
+                       fit_adults=None, fit_children=None):
     """Earliest free window across ANY offerable room type — for auto-proposing the
-    nearest dates when the client's exact dates are sold out (Bug 2: don't ask permission)."""
-    cands = [find_nearest_window(availability, rt, after, nights, room_count)
-             for rt in OFFERABLE_ROOMS]
+    nearest dates when the client's exact dates are sold out (Bug 2: don't ask permission).
+
+    When a party is given (fit_adults), only room types that can PHYSICALLY hold it are
+    scanned — so we never offer a window whose only free room is too small (capacity fix
+    2026-06-24)."""
+    rooms = OFFERABLE_ROOMS
+    if fit_adults is not None:
+        rooms = [rt for rt in rooms
+                 if pricing_engine.fits_room(rt, fit_adults, fit_children or [])]
+    cands = [find_nearest_window(availability, rt, after, nights, room_count) for rt in rooms]
     cands = [c for c in cands if c]
     return min(cands, key=lambda w: w[0]) if cands else None
 
@@ -419,7 +431,9 @@ def offered_window(decision: Dict, availability: Dict):
         spec = decision.get("spec") or {}
         ci, co = spec.get("checkin"), spec.get("checkout")
         if ci and co:
-            return nearest_window_any(availability, ci, len(pricing_engine.night_dates(ci, co)))
+            return nearest_window_any(availability, ci, len(pricing_engine.night_dates(ci, co)),
+                                      fit_adults=spec.get("adults"),
+                                      fit_children=spec.get("children_ages"))
         return None
     return None
 
@@ -529,6 +543,16 @@ def _with_ubd_note(reply: str, ubd: bool) -> str:
     return (reply + "\n\n" + templates.MILITARY) if ubd else reply
 
 
+def _room_too_small_reply(rooms: List[Dict]) -> str:
+    """Multi-room booking where one or more chosen rooms can't physically hold their party.
+    Name each bad room and ask to redistribute — never silently drop the valid rooms."""
+    parts = []
+    for r in rooms:
+        rt = r.get("room_type") or "Стандарт"
+        parts.append(f"«{rt}» — {guests_phrase(r.get('adults') or 0, r.get('children_ages') or [])}")
+    return templates.ROOM_TOO_SMALL.replace("{деталі}", "; ".join(parts))
+
+
 def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGINE) -> str:
     """Gate on availability, compute the price deterministically, format rigidly.
 
@@ -538,6 +562,7 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
     """
     ubd_booking = any(bool(r.get("ubd")) for r in rooms)
     priced = []
+    too_small = []
     for r in rooms:
         room_type = r.get("room_type")
         checkin, checkout = r.get("checkin"), r.get("checkout")
@@ -569,6 +594,11 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
             quote = engine.quote(room_type, checkin, checkout, guests)
         except pricing_engine.OffSeasonError:
             return templates.OFF_SEASON
+        except pricing_engine.OverCapacityError:
+            # Chosen room is physically too small for the party. Collect it and handle AFTER
+            # the loop so a multi-room booking never silently drops its other (valid) rooms.
+            too_small.append(r)
+            continue
         except KeyError:
             return templates.PRESENTATION_ROOMS  # unknown room type -> present options
 
@@ -577,6 +607,14 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
             "checkin": checkin, "checkout": checkout, "nights": quote.nights,
             "price": quote.total,
         })
+
+    # A chosen room can't physically hold its party. Single-room booking -> show the room
+    # types that DO fit; multi-room -> name the bad split and ask to adjust (never silently
+    # drop the valid rooms — review fix 2026-06-24).
+    if too_small:
+        if len(rooms) == 1:
+            return finalize_quote_all(too_small[0], simplified_availability)
+        return _room_too_small_reply(too_small)
 
     # УБД (2026-06-23): -20% applies to the WHOLE booking (a veteran's family), so a single
     # flagged room discounts the entire total. The discount is rendered on the grand total.
@@ -603,8 +641,8 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
         try:
             guests = pricing_engine.make_guests(adults=adults, children_ages=children_ages)
             quote = engine.quote(room_type, checkin, checkout, guests)
-        except (pricing_engine.OffSeasonError, KeyError):
-            continue
+        except (pricing_engine.OffSeasonError, KeyError, pricing_engine.OverCapacityError):
+            continue  # off-season / unknown / physically can't hold the party -> skip
         price = pricing_engine.apply_military_discount(quote.total) if ubd else quote.total
         lines.append(f"{_ROOM_EMOJI.get(room_type, '•')} {room_type} — {price} грн")
 
@@ -612,7 +650,8 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
         # Bug 2: everything sold out -> AUTO-propose the nearest free window (don't ask
         # permission). Only fall back to NEAREST_NONE if nothing free in the whole window.
         # УБД flagged -> append the MILITARY note so the veteran knows -20% still applies.
-        win = nearest_window_any(simplified_availability, checkin, len(nights))
+        win = nearest_window_any(simplified_availability, checkin, len(nights),
+                                 fit_adults=adults, fit_children=children_ages)
         if win:
             return _with_ubd_note(
                 templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1])), ubd)

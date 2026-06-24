@@ -47,6 +47,14 @@ BASE_CAPACITY = 2  # guests covered by the base room price before extra-place fe
 FREE_CHILD_MAX_AGE = 6
 CHILD_PLACE_MAX_AGE = 12
 
+# Hard physical occupancy per public room class (owner rule 2026-06-24). Standard-class
+# rooms (Стандарт / Стандарт +, incl. their sub-types) hold at most 3 adults AND 4 people
+# total; a 3rd-adult party may add at most ONE child UNDER 12 (a child 12+ counts as an
+# adult). Напівлюкс holds 5 people. Over-capacity room types are filtered out of quotes.
+STANDARD_MAX_ADULTS = 3
+STANDARD_MAX_TOTAL = 4
+NAPIVLUX_MAX_TOTAL = 5
+
 # Monday=0 ... Sunday=6 (datetime.date.weekday()). Friday=4, Saturday=5.
 WEEKEND_NIGHTS = {4, 5}
 
@@ -73,6 +81,11 @@ _DEFAULT_PRICING_PATH = os.path.join(os.path.dirname(__file__), "pricing.json")
 
 class OffSeasonError(KeyError):
     """Raised when a stay falls in a month that has no price table (Sept–May)."""
+
+
+class OverCapacityError(ValueError):
+    """Raised when a room type physically cannot hold the requested party (owner rule
+    2026-06-24). Callers filter that room type out of the quotes."""
 
 
 # --- Data models -----------------------------------------------------------
@@ -193,6 +206,30 @@ def _is_full_rate_guest(g: "Guest") -> bool:
     return g.is_adult or (g.age is not None and g.age >= CHILD_PLACE_MAX_AGE)
 
 
+def _is_napivlux(room_type: str) -> bool:
+    return "".join((room_type or "").lower().split()).startswith(("напівлюкс", "напивлюкс"))
+
+
+def fits_room(room_type: str, adults: int, children_ages: Optional[List[int]] = None) -> bool:
+    """Physical occupancy gate (owner rule 2026-06-24).
+
+    Стандарт / Стандарт + (and their sub-types): MAX 3 adults; MAX 4 people total; a child
+    aged 12+ counts as an adult (so 3 adults + a 12+ child is over capacity). Напівлюкс: MAX 5.
+    """
+    ages = children_ages or []
+    total = adults + len(ages)
+    if _is_napivlux(room_type):
+        return total <= NAPIVLUX_MAX_TOTAL
+    over12 = sum(1 for a in ages if a is not None and a >= CHILD_PLACE_MAX_AGE)
+    if adults > STANDARD_MAX_ADULTS:
+        return False
+    if adults == STANDARD_MAX_ADULTS and over12 > 0:
+        return False
+    if total > STANDARD_MAX_TOTAL:
+        return False
+    return True
+
+
 # --- Pricing engine --------------------------------------------------------
 
 class PricingEngine:
@@ -277,6 +314,15 @@ class PricingEngine:
         if not guests:
             raise ValueError("At least one guest is required")
 
+        # Hard physical occupancy gate (owner rule 2026-06-24): a room type that cannot hold
+        # the party is rejected so callers drop it from the offered options.
+        adults = sum(1 for g in guests if g.is_adult)
+        child_ages = [g.age for g in guests if not g.is_adult and g.age is not None]
+        if not fits_room(room, adults, child_ages):
+            raise OverCapacityError(
+                f"{room} cannot hold {adults} adults + {len(child_ages)} children "
+                f"(standard class max {STANDARD_MAX_ADULTS} adults / {STANDARD_MAX_TOTAL} total)")
+
         extra_keys = self._extra_place_keys(guests)
         single_occupancy = self._paying_guest_count(guests) == 1
 
@@ -324,9 +370,13 @@ class PricingEngine:
             breakdown=breakdown,
         )
 
-    def price(self, room_type, checkin, checkout, guests: List[Guest]) -> int:
-        """Convenience wrapper returning only the total price in UAH."""
-        return self.quote(room_type, checkin, checkout, guests).total
+    def price(self, room_type, checkin, checkout, guests: List[Guest]):
+        """Convenience wrapper returning only the total price in UAH, or None when the
+        party physically does not fit the room type (owner capacity gate 2026-06-24)."""
+        try:
+            return self.quote(room_type, checkin, checkout, guests).total
+        except OverCapacityError:
+            return None
 
     def quote_multiple(self, bookings) -> MultiQuote:
         """Quote several rooms in one booking and sum them (multi-room, <=8 rooms).
