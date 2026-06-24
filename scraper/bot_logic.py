@@ -270,10 +270,33 @@ def _pool_template(t: str) -> str:
     return "POOL"
 
 
+# Payment-RULES questions (prepayment / deposit / "pay on arrival") -> BOOK_ROOM.
+# Pinned deterministically because the extractor, in a booking context, keeps routing these
+# to a booking topic (or CHECK_IN_OUT, on the word "приїзд") instead of the deposit rules.
+# NB: a COMPLETED payment ("оплатив"/"квитанція") is caught earlier by is_payment_intent;
+# this is about ASKING the rules. "приїзд" alone = check-in; "приїзд" + оплата = prepayment.
+_PAYMENT_RULES_MARKERS = [
+    "по приїзду оплат", "приїзду оплат", "оплатити по приїзд", "оплата по приїзд",
+    "оплатити на місці", "оплата на місці", "оплатити при заселен", "оплата при заселен",
+    "без передоплат", "без предоплат", "яка передоплата", "яка предоплата",
+    "потрібна передоплата", "потрібна предоплата", "чи є передоплата", "чи потрібна передоплата",
+    "правила оплат", "як оплачувати", "коли оплачувати", "коли платити", "коли вносити",
+    "потрібен аванс", "який аванс", "розмір авансу", "розмір передоплати",
+]
+
+
+def is_payment_rules_question(text: str) -> bool:
+    """True for a question about HOW/WHEN to pay (prepayment / deposit / pay-on-arrival)."""
+    t = (text or "").lower()
+    return any(m in t for m in _PAYMENT_RULES_MARKERS)
+
+
 def faq_override(text: str):
     """Return a fixed FAQ template name when the message is clearly one of the
-    priority FAQs (location/pets/food/transport/pool/…), else None. Used to answer the
-    question immediately instead of continuing slot collection."""
+    priority FAQs (payment-rules/location/pets/food/transport/pool/…), else None. Used to
+    answer the question immediately instead of continuing slot collection."""
+    if is_payment_rules_question(text):
+        return "BOOK_ROOM"
     if is_location_question(text):
         return "PLACE"
     t = (text or "").lower()

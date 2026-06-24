@@ -273,6 +273,22 @@ def test_faq_override(text, expected):
 
 
 @pytest.mark.parametrize("text,expected", [
+    # Payment-rules questions -> BOOK_ROOM (deterministic; the LLM kept mis-routing these).
+    ("Чи можна по приїзду оплатити повністю", "BOOK_ROOM"),   # the exact persona-2 failure
+    ("чи можна без передоплати?", "BOOK_ROOM"),
+    ("яка передоплата потрібна?", "BOOK_ROOM"),
+    ("коли платити за бронювання?", "BOOK_ROOM"),
+    ("можна оплатити на місці?", "BOOK_ROOM"),
+    # NOT payment -> must stay out of BOOK_ROOM (check-in time / plain booking).
+    ("о котрій заїзд і виїзд?", None),
+    ("приїзд у п'ятницю, виїзд у неділю", None),
+    ("Стандарт на 5-7 липня для двох", None),
+])
+def test_faq_override_payment_rules(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+@pytest.mark.parametrize("text,expected", [
     # Bug 2 (§9.11): price / swimming / day-visit WITHOUT staying -> GUEST_POOL.
     ("яка ціна покупались у басейні", "GUEST_POOL"),       # the exact live-QA failure
     ("скільки коштує басейн?", "GUEST_POOL"),
