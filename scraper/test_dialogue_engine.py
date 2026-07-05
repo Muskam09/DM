@@ -178,6 +178,14 @@ def test_fuzzy_period_range_maps_named_parts():
     assert de.fuzzy_period_range("на вихідних") is None      # no month -> unconstrained
 
 
+def test_fuzzy_period_range_parses_normalized_yyyy_mm():
+    # Bug 2026-07-05: the extractor normalised "початок серпня" -> "2026-08"; the range mapper
+    # must still resolve the month (else an August period offers July windows).
+    assert de.fuzzy_period_range("2026-08") == ("2026-08-01", "2026-08-31")
+    assert de.fuzzy_period_range("2026-07") == ("2026-07-01", "2026-07-31")
+    assert de.fuzzy_period_range("2026-01") is None          # off-season month -> unconstrained
+
+
 def test_propose_windows_constrained_to_named_period():
     # Free blocks early AND late July, but client said "початок липня" -> only early.
     avail = {"Стандарт": {

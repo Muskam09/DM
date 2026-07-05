@@ -190,6 +190,14 @@ def _fuzzy_month(text: str) -> Optional[int]:
     for stem, month in _PRICED_MONTH_STEMS:
         if stem in text:
             return month
+    # The extractor sometimes normalises a fuzzy period to "YYYY-MM" (e.g. "2026-08" for
+    # "початок серпня"). Parse the month so we still scan the RIGHT month (bug 2026-07-05:
+    # an August period was offering July windows because this returned None).
+    m = re.search(r"20\d\d[-/.](\d{1,2})", text)
+    if m:
+        mon = int(m.group(1))
+        if mon in pricing_engine.PRICED_MONTHS:
+            return mon
     return None
 
 
