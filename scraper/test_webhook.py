@@ -86,8 +86,9 @@ def test_is_room_available_states():
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-05"]) == "available"
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-06"]) == "sold_out"
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-05", "2026-07-06"]) == "sold_out"
-    assert bot_logic.is_room_available(avail, "Président", ["2026-07-05"]) == "unknown"      # unknown room
-    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-08-10"]) == "unknown"       # out of window
+    assert bot_logic.is_room_available(avail, "Président", ["2026-07-05"]) == "unknown"      # room category absent
+    # Owner fix 2026-06-24: a date the scraper didn't return defaults to SOLD OUT, not available.
+    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-08-10"]) == "sold_out"      # missing date
 
 
 def test_room_key_matching_handles_spacing():
@@ -289,6 +290,40 @@ def test_faq_override_payment_rules(text, expected):
 
 
 @pytest.mark.parametrize("text,expected", [
+    ("У вас у кожному номері є фен?", "HAIRDRYER"),
+    ("чи є фен?", "HAIRDRYER"),
+    ("Чи є фото/відео номерів?", "MEDIA"),
+    ("можна побачити світлини території?", "MEDIA"),
+    ("Де саме знаходиться готель?", "PLACE"),
+    ("Де знаходиться готель?", "PLACE"),
+    ("де ваш готель розташований?", "PLACE"),
+])
+def test_faq_override_hairdryer_media_location(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("приїдемо з собачкою", True), ("у нас пекінес", True), ("буде кіт", False),
+    ("маленький песик", True), ("наш улюбленець", True),
+    ("Стандарт на 5-7 липня", False), ("двоє дорослих", False),
+])
+def test_mentions_pet(text, expected):
+    assert bot_logic.mentions_pet(text) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Дякую", True), ("Дякую вам!", True), ("Спасибі велике", True),
+    ("До побачення", True), ("дякую, до зустрічі", True),
+    ("дякую, бронюю", False),         # confirm -> proceed to booking, not a close
+    ("дякую, а яка ціна?", False),    # has a real question (4 words but contains 'ціна'? still <=4)
+    ("Дякую за інформацію про номери будь ласка", False),  # too long
+    ("5-7 липня", False),
+])
+def test_is_pure_thanks(text, expected):
+    assert bot_logic.is_pure_thanks(text) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
     # Bug 2 (§9.11): price / swimming / day-visit WITHOUT staying -> GUEST_POOL.
     ("яка ціна покупались у басейні", "GUEST_POOL"),       # the exact live-QA failure
     ("скільки коштує басейн?", "GUEST_POOL"),
@@ -331,6 +366,18 @@ def test_owner_2026_06_23_templates():
     assert "дитяче місце" in templates.CHILDREN and "Від 12" in templates.CHILDREN
     assert "ліжечок" in templates.CHILDREN_AMENITIES
     assert "фіскальний чек" in templates.DOCUMENTS
+
+
+def test_owner_2026_06_24_templates():
+    assert "фен" in templates.HAIRDRYER
+    assert "сторіс" in templates.MEDIA or "хайлайтс" in templates.MEDIA
+    assert "Дякуємо" in templates.ACKNOWLEDGE_THANKS
+    assert "максимум 3" in templates.PRESENTATION_ROOMS        # explicit capacity (Fix 1)
+    assert "Температура" in templates.POOL                     # typo fixed (Fix 6)
+    assert "зацікавлять інші дати" not in templates.NEAREST_NONE  # no permission ask (Fix 5)
+    # GENERAL_INFORMATION must NOT leak internal room names (Fix 2 — the "hallucination").
+    for leak in ("Хом", "Боярин", "Гропа", "Баба Людова", "11 номер"):
+        assert leak not in templates.GENERAL_INFORMATION
 
 
 # -- payment hand-off & bot muting ------------------------------------------
@@ -393,6 +440,7 @@ def server(monkeypatch):
     bot_server._greeted.clear()      # fresh greeting state per test
     bot_server._pending_window.clear()  # fresh pending-window state per test
     bot_server._no_dates_mode.clear()   # fresh no-dates mode per test
+    bot_server._cooldowns.clear()       # fresh 503-cooldown state per test
 
     def configure(slots=None, slots_text=None, history=None, availability=None,
                   labels=None, dynamic_history=False):
@@ -931,6 +979,60 @@ def test_e2e_ubd_soldout_includes_military_note(server):
     _run(bs.process_incoming_message("Стандарт 5-7 липня, 2 дорослих, я УБД", 480))
     full = "\n".join(server.sent)
     assert "найближче вільне віконце" in full and templates.MILITARY in full
+
+
+def test_e2e_503_cooldown_silences_followups(server):
+    # Fix 7: after an LLM outage the bot goes silent for 5 min so a human can take over,
+    # instead of re-failing on every new message.
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, history=[])
+    async def boom(prompt, *a, **k):
+        raise RuntimeError("503 UNAVAILABLE high demand")
+    bs.generate_with_retry = boom
+    _run(bs.process_incoming_message("Дізнатися вартість", 175))
+    assert server.sent == [templates.ERROR_LLM_DOWN]
+    assert 175 in bs._cooldowns
+    server.sent.clear()
+    # a follow-up within the cooldown -> ignored entirely (even though the LLM is "back")
+    server.configure(slots={"topic": "price_quote", "rooms": [
+        {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-07",
+         "adults": 2, "children_ages": []}]}, history=_bot_spoke())
+    _run(bs.process_incoming_message("Стандарт на 6-7 липня", 175))
+    assert server.sent == []                       # silent during cooldown
+    assert server.state["scraped"] is False
+    assert server.prompts == []                    # no LLM call attempted
+
+
+def test_e2e_pure_thanks_gets_a_close(server):
+    # Fix 8: "Дякую" must NEVER be met with silence -> a warm close (deterministic, no LLM).
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, history=_bot_spoke())
+    _run(bs.process_incoming_message("Дякую!", 490))
+    assert server.sent == [templates.ACKNOWLEDGE_THANKS]
+    assert server.prompts == []                    # no LLM call
+
+
+def test_e2e_pet_note_appended_to_quote(server):
+    # Fix 4: a client who mentioned a pet gets the +300 грн/доба note on the price quote.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": []}]},
+        history=[{"id": 1, "message_type": "incoming", "content": "приїдемо з собачкою"},
+                 {"id": 2, "message_type": "outgoing", "content": "вітаю"}],
+        availability=_raw({"Стандарт": {"2026-07-06": 3}}))
+    _run(bs.process_incoming_message("Стандарт на 6-7 липня", 492))
+    full = "\n".join(server.sent)
+    assert "буде вартувати" in full and "доплати за тваринку 300 грн" in full
+
+
+def test_e2e_dedup_suppresses_message_two_back(server):
+    # Fix 4: a reply matching a bot message TWO turns back is suppressed (drip FAQ spam).
+    bs = server.configure(
+        slots={"topic": "faq", "faq_template": "SMOKING", "rooms": []},
+        history=[{"id": 1, "message_type": "outgoing",
+                  "content": templates.SMOKING + templates.FAQ_DATE_NUDGE},
+                 {"id": 2, "message_type": "outgoing", "content": "щось інше від бота"}])
+    _run(bs.process_incoming_message("а курити можна?", 496))
+    assert not any(templates.SMOKING in m for m in server.sent)   # suppressed (2 back)
 
 
 def test_e2e_off_season_tags_instagram_no_phone_ask(server):

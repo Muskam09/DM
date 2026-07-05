@@ -121,14 +121,14 @@ def is_room_available(simplified: Dict, room_type: str, night_dates: List[str]) 
     """
     key = match_availability_key(simplified, room_type)
     if key is None:
+        # The room category is entirely absent from the scrape (e.g. a total scraper
+        # failure) — we genuinely cannot confirm; stay lenient rather than block.
         return "unknown"
     avail = simplified.get(key) or {}
     if not night_dates:
         return "unknown"
-    # A date outside the scraped window ("Шахівниця" only shows a few weeks) is
-    # NOT the same as sold out — we simply cannot confirm it.
-    if any(d not in avail for d in night_dates):
-        return "unknown"
+    # Owner rule (2026-06-24): a date MISSING from a scraped room's calendar defaults to
+    # SOLD OUT (count 0), never "available" — never quote a date OtelMS didn't confirm free.
     if all(avail.get(d, 0) > 0 for d in night_dates):
         return "available"
     return "sold_out"
@@ -223,9 +223,10 @@ def is_location_question(text: str) -> bool:
     t = (text or "").lower()
     if any(k in t for k in _DIRECTIONS_MARKERS):
         return False
-    if "де" in t and ("знаход" in t or "розташ" in t):
+    if "де" in t and ("знаход" in t or "розташ" in t or "готель" in t):
         return True
-    return any(k in t for k in ["адрес", "локац", "на карті", "де ви є", "де ви знаход"])
+    return any(k in t for k in ["адрес", "локац", "на карті", "де ви є", "де ви знаход",
+                                "розташув", "де готель", "де ваш готель", "в якому місці"])
 
 
 # FAQ intent must override slot-collection: a terse "собачка" / "харчування?" gets
@@ -238,6 +239,8 @@ _FAQ_OVERRIDE = [
     (["трансфер", "парковк", "паркінг"], "TRANSFER_PARKING"),
     (["добра", "доїх", "дістат", "як до вас", "залізниц", "потяг", "електричк"], "HOW_TO_GET_THERE"),
     (["курит", "палит", "куріння", "паління"], "SMOKING"),
+    (["фен", "фена", "феном"], "HAIRDRYER"),
+    (["фото", "відео", "світлин", "знімк"], "MEDIA"),
 ]
 
 
@@ -289,6 +292,40 @@ def is_payment_rules_question(text: str) -> bool:
     """True for a question about HOW/WHEN to pay (prepayment / deposit / pay-on-arrival)."""
     t = (text or "").lower()
     return any(m in t for m in _PAYMENT_RULES_MARKERS)
+
+
+# --- pet mention (for the "+300 грн/доба" note on a quote) -------------------
+_PET_MARKERS = ["соба", "песик", "пёс", "пес ", "пекінес", "тварин", "котик", "кота ",
+                "улюблен", "вихован", "цуцик", "хвостик"]
+
+
+def mentions_pet(text: str) -> bool:
+    """True if the dialogue mentions bringing a pet (so a quote can flag the +300 грн/night)."""
+    t = (text or "").lower()
+    return any(m in t for m in _PET_MARKERS)
+
+
+# --- pure thanks / goodbye (the bot must always have the last word) ----------
+_THANKS_MARKERS = ["дякую", "дякуємо", "спасибі", "вдячн", "до побачення", "всього добр",
+                   "на все добре", "бувайте", "гарного дня", "гарного вечора", "до зустріч"]
+# A substantive word means it's NOT just a thanks — there's a real request to answer.
+_THANKS_STOP = ["цін", "вартіст", "скільки", "коли", "номер", "дата", "можна", "фото",
+                "відео", "басейн", "харчув", "вільн", "які дати", "трансфер", "знижк"]
+
+
+def is_pure_thanks(text: str) -> bool:
+    """True when a SHORT message is essentially just thanks / a goodbye (no new request),
+    so the bot can close warmly instead of staying silent. A confirm word ("дякую,
+    бронюю") or a substantive word ("дякую, а яка ціна?") means it is NOT a pure close."""
+    t = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in (text or "").lower())
+    words = t.split()
+    if not words or len(words) > 4 or any(c.isdigit() for c in t):
+        return False
+    if any(w in _CONFIRM_WORDS for w in words):
+        return False
+    if any(s in t for s in _THANKS_STOP):
+        return False
+    return any(m in t for m in _THANKS_MARKERS)
 
 
 def faq_override(text: str):

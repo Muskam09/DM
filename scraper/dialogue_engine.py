@@ -466,7 +466,10 @@ def plan(slots: Dict) -> Dict:
     # them BEFORE quoting (owner rule 2026-06-23). Only when the client packed everyone
     # into ONE room object; an explicit multi-room request (>1 room) is already split.
     if len(rooms) == 1 and _room_guests(rooms[0]) >= 6:
-        return {"action": "reply", "reply": templates.ASK_ROOM_DISTRIBUTION}
+        # Fix (2026-06-24): show the room capacities FIRST (so the client knows the limits),
+        # then ask how to split. [SPLIT] -> two messages.
+        return {"action": "reply",
+                "reply": templates.PRESENTATION_ROOMS + "[SPLIT]" + templates.ASK_ROOM_DISTRIBUTION}
 
     cc = max((_child_count(r) for r in rooms), default=0)
     ages = max((len(r.get("children_ages") or []) for r in rooms), default=0)
@@ -550,7 +553,9 @@ def _room_too_small_reply(rooms: List[Dict]) -> str:
     for r in rooms:
         rt = r.get("room_type") or "Стандарт"
         parts.append(f"«{rt}» — {guests_phrase(r.get('adults') or 0, r.get('children_ages') or [])}")
-    return templates.ROOM_TOO_SMALL.replace("{деталі}", "; ".join(parts))
+    # Fix (2026-06-24): show the room capacities FIRST, then the "doesn't fit" explanation.
+    return (templates.PRESENTATION_ROOMS + "[SPLIT]"
+            + templates.ROOM_TOO_SMALL.replace("{деталі}", "; ".join(parts)))
 
 
 def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGINE) -> str:
@@ -579,6 +584,11 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
                                       .replace("{вільні_номери}", ", ".join(free)), ubd_booking)
             # Step 2: everything booked -> forward-scan THIS room for the nearest block.
             win = find_nearest_window(simplified_availability, room_type, checkin, len(nights))
+            if not win:
+                # Fix 5: NEVER ask permission — ALWAYS offer the nearest window. If the chosen
+                # room has none, scan ANY room type that fits the party before giving up.
+                win = nearest_window_any(simplified_availability, checkin, len(nights),
+                                         fit_adults=r.get("adults"), fit_children=r.get("children_ages"))
             if win:  # exact dates were sold out -> "found nearest" wording (NOT "ще не визначились").
                 return _with_ubd_note(
                     templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1])),

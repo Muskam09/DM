@@ -405,13 +405,33 @@ def test_finalize_unknown_room_in_availability_still_quotes():
     assert "2200 грн" in reply
 
 
-def test_finalize_out_of_window_dates_quote_not_blocked():
-    # Дати поза вікном "Шахівниці" (тільки липень у даних) -> unknown -> все одно ціна.
+def test_finalize_missing_dates_default_sold_out():
+    # Owner fix 2026-06-24: dates the scraper didn't return default to SOLD OUT, never quoted.
+    # Here only 5 July is known; an August request has no forward window in the data.
     avail = {"Стандарт": {"2026-07-05": 3}}
     reply = de.finalize_quote(
         [{"room_type": "Стандарт", "checkin": "2026-08-10", "checkout": "2026-08-11",
           "adults": 2, "children_ages": []}], avail)
-    assert "грн" in reply and reply != templates.POLITE_CLOSE
+    assert "буде вартувати" not in reply         # NOT quoted
+    assert reply == templates.NEAREST_NONE
+
+
+def test_finalize_soldout_specific_room_falls_back_to_any_fitting():
+    # Fix 5: chosen Стандарт has no forward window, but Напівлюкс does -> offer it (always
+    # offer SOMETHING; never the permission-asking NEAREST_NONE when a fitting window exists).
+    avail = {"Стандарт": {"2026-07-05": 0, "2026-07-06": 0},
+             "Напівлюкс": {"2026-07-05": 0, "2026-07-06": 0, "2026-07-08": 2, "2026-07-09": 2}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2026-07-05", "checkout": "2026-07-07",
+          "adults": 2, "children_ages": []}], avail)
+    assert "найближче вільне віконце" in reply and "8 - 10 липня" in reply
+    assert reply != templates.NEAREST_NONE
+
+
+def test_nearest_none_does_not_ask_permission():
+    # Fix 5: the fallback message must NOT ask "можливо вас зацікавлять інші дати?".
+    assert "зацікавлять інші дати" not in templates.NEAREST_NONE
+    assert "підшукати" not in templates.NEAREST_NONE
 
 
 # --- УБД (combat-veteran) 20% discount, deterministic ----------------------
@@ -451,17 +471,20 @@ def test_finalize_ubd_whole_booking_discounts_all_rooms():
 # --- 6+ guest distribution (owner rule 2026-06-23) -------------------------
 
 def test_plan_six_plus_guests_in_one_room_asks_distribution():
-    # 6+ guests can't share one room (max ~5) -> ask HOW to split BEFORE quoting.
+    # 6+ guests can't share one room (max ~5) -> show capacities THEN ask HOW to split.
     out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
                               "adults": 6, "children_count": 0, "children_ages": []}]})
-    assert out == {"action": "reply", "reply": templates.ASK_ROOM_DISTRIBUTION}
+    assert out["action"] == "reply"
+    assert templates.PRESENTATION_ROOMS in out["reply"]       # capacities shown first
+    assert templates.ASK_ROOM_DISTRIBUTION in out["reply"]    # then the split question
+    assert "[SPLIT]" in out["reply"]
 
 
 def test_plan_six_guests_counts_children_too():
     # 2 adults + 4 children still = 6 bodies -> distribution ask.
     out = de.plan({"rooms": [{"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
                               "adults": 2, "children_count": 4, "children_ages": [5, 7, 9, 11]}]})
-    assert out["reply"] == templates.ASK_ROOM_DISTRIBUTION
+    assert templates.ASK_ROOM_DISTRIBUTION in out["reply"]
 
 
 def test_plan_five_guests_one_room_still_quotes():
@@ -514,7 +537,8 @@ def test_finalize_multiroom_one_over_capacity_keeps_others():
          "adults": 2, "children_ages": []},
     ]
     reply = de.finalize_quote(rooms, avail)
-    assert reply == templates.ROOM_TOO_SMALL.replace("{деталі}", "«Стандарт» — 4 дорослих")
+    assert templates.ROOM_TOO_SMALL.replace("{деталі}", "«Стандарт» — 4 дорослих") in reply
+    assert templates.PRESENTATION_ROOMS in reply     # capacities shown first
     assert "Який тип номеру обираєте" not in reply   # NOT the single-room picker that dropped room 1
 
 

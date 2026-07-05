@@ -27,6 +27,7 @@ app = FastAPI()
 
 AVAILABILITY_CACHE = {}
 CACHE_TTL = 900
+COOLDOWN_TTL = 300   # after an LLM (Gemini) outage, go silent 5 min so a human can take over
 
 def send_chatwoot_message(conversation_id: int, message_text: str):
     url = f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/messages"
@@ -162,8 +163,10 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting | barter | unknown>",
   "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "nights": <ціле|null>, "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
-  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
+  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
+
+⛔ Ти НЕ пишеш текст для клієнта і НЕ вигадуєш описи. НІКОЛИ не генеруй опис номерів, внутрішні назви/номери кімнат (напр. "Хом'як", "Боярин", "Гропа") чи будь-яку прозу — весь клієнтський текст формує Python із готових шаблонів. Якщо клієнт просить розповісти про номери — постав topic=presentation (або faq_template=GENERAL_INFORMATION); сам опис підставить Python. Ти повертаєш ЛИШЕ JSON.
 
 Дати/гостей/номери збирай з УСІЄЇ історії. Якщо обрано topic=faq — faq_template обирай за ОСТАННІМ (поточним) питанням клієнта.
 ВАЖЛИВО (анти-амнезія): на БУДЬ-ЯКОМУ ході (не лише FAQ) ОБОВ'ЯЗКОВО заповнюй rooms[] усіма вже відомими даними бронювання (дати, гості, ночі, номер, нечіткий період) з УСІЄЇ історії. Відповідь на FAQ НЕ повинна стирати раніше надані клієнтом дані. Якщо клієнт раніше назвав дати — ЗБЕРІГАЙ їх у checkin/checkout, навіть якщо ці дати виявились зайняті або бот запропонував інші; скидай/змінюй дату ЛИШЕ коли клієнт сам назве нову.
@@ -217,7 +220,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - Якщо взагалі не вказано ні дорослих, ні дітей — adults=0, children_count=0, children_ages=[].
 - ubd — true якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових. Знижка діє на ВСЕ бронювання родини (-20% від загальної суми), тому постав ubd=true для УСІХ номерів у rooms[]; інакше false для всіх.
 
-FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS.
+FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS; фен / чи є фен у номері -> HAIRDRYER; фото / відео / світлини номерів чи території -> MEDIA.
 ВАЖЛИВО: тенісного КОРТУ у готелі НЕМАЄ — НЕ пропонуй теніс як активність. Знижки 10% / "програми лояльності" бот НЕ рахує і НЕ обіцяє (це лише людина): на пряме питання про знижку 10% став faq_template=null.
 БАСЕЙН — РОЗРІЗНЯЙ ДВА ШАБЛОНИ:
 - GUEST_POOL: будь-яке питання про ЦІНУ/ВАРТІСТЬ басейну, про КУПАННЯ чи ВІДВІДУВАННЯ басейну БЕЗ проживання, "покупатись/поплавати в басейні", "скільки коштує басейн", "приїхати на басейн на день", "тільки/лише басейн", "можна просто скупатись".
@@ -295,6 +298,7 @@ _slot_memory: dict = {}   # conv_id -> list of last-known booking rooms (robust 
 _greeted: set = set()     # conv_ids already greeted (idempotent vs Chatwoot read-after-write lag)
 _pending_window: dict = {}  # conv_id -> (checkin, checkout) of the first proposed free window
 _no_dates_mode: set = set() # conv_ids where the client said they don't know dates yet
+_cooldowns: dict = {}       # conv_id -> ts of the last ERROR_LLM_DOWN (5-min silent cooldown)
 
 
 def _lock_for(conversation_id):
@@ -337,6 +341,13 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     labels = await asyncio.to_thread(get_conversation_labels, conversation_id)
     if bot_logic.is_muted(labels):
         print(f"[i] Конверсація {conversation_id} під керуванням людини ({labels}); бот мовчить.")
+        return
+
+    # 503 COOLDOWN: after an LLM outage the bot stays silent for 5 minutes so a human
+    # manager can take over seamlessly, instead of re-failing on every new message.
+    cd = _cooldowns.get(conversation_id)
+    if cd and (time.time() - cd) < COOLDOWN_TTL:
+        print(f"[i] {conversation_id}: кулдаун після збою LLM ({int(time.time() - cd)}s) -> мовчимо.")
         return
 
     # Блогер / бартер / PR-колаборація: готель ХОЧЕ такі угоди, але домовляється людина.
@@ -383,6 +394,15 @@ async def _handle_incoming(user_message: str, conversation_id: int,
 
     print(f"\n[+] Обробка повідомлення: {user_message}")
 
+    # The bot ALWAYS has the last word: a bare "дякую" / "до побачення" -> a warm close,
+    # never silence (owner fix 2026-06-24). Deterministic, no LLM call.
+    if bot_logic.is_pure_thanks(user_message):
+        last = next((m.get("content", "").strip() for m in reversed(raw_history)
+                     if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
+        if last != templates.ACKNOWLEDGE_THANKS.strip() and not _superseded(conversation_id, seq):
+            await _deliver(conversation_id, templates.ACKNOWLEDGE_THANKS)
+        return
+
     # 1) LLM EXTRACTION ONLY — structured slots, no math, no prose.
     prompt = (EXTRACTION_PROMPT
               .replace("%%TODAY%%", date.today().isoformat())
@@ -402,6 +422,7 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         if last_bot != templates.ERROR_LLM_DOWN.strip():   # don't repeat the holding message
             await _deliver(conversation_id, templates.ERROR_LLM_DOWN)
             await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
+        _cooldowns[conversation_id] = time.time()   # start the 5-min silent cooldown
         return
 
     # SLOT MEMORY (multi-room): the extractor sometimes drops a slot the client already
@@ -584,23 +605,29 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         print(f"[i] {conversation_id}: міжсезоння -> тег '{bot_logic.INSTAGRAM_LABEL}' для менеджера")
         await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
 
-    # Anti-spam: never send the SAME message twice in a row (across both emits this turn).
-    last_bot = next((m.get("content", "").strip() for m in reversed(raw_history)
-                     if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
+    # Anti-spam: suppress any message that repeats one of the LAST 2 bot messages — a drip
+    # burst can re-trigger the same FAQ several times (owner fix 2026-06-24). Pet note: when
+    # the client mentioned a pet, flag the +300 грн/доба surcharge on the price quote.
+    recent_bots = [m.get("content", "").strip() for m in reversed(raw_history)
+                   if m.get("message_type") in ("outgoing", 1) and m.get("content")][:2]
+    has_pet = bot_logic.mentions_pet(f"{dialogue_history} {user_message}")
+    _PET_NOTE = "\n\n(вартість вказана без урахування доплати за тваринку 300 грн/доба)"
 
     async def _emit(text):
-        nonlocal last_bot, bot_has_spoken
+        nonlocal recent_bots, bot_has_spoken
         if not text or not text.strip():
             return
-        if last_bot and text.strip() == last_bot:
-            print(f"[i] {conversation_id}: reply identical to previous -> suppress (anti-spam).")
+        if has_pet and bot_logic.is_quote_message(text) and "тваринку" not in text:
+            text = text + _PET_NOTE
+        if text.strip() in recent_bots:
+            print(f"[i] {conversation_id}: reply repeats a recent bot message -> suppress (anti-spam).")
             return
         out = bot_logic.prepend_greeting_if_needed(text, bot_has_spoken)
         if out != text:                       # greeting was prepended this emit
             _greeted.add(conversation_id)
         await _deliver(conversation_id, out)
         bot_has_spoken = True
-        last_bot = text.strip()
+        recent_bots = ([text.strip()] + recent_bots)[:2]
 
     # Bug 1 (FAQ hijacks the scan): an FAQ asked ALONGSIDE an actionable booking intent
     #    must ANSWER the FAQ and then RUN the real scan, appending the ACTUAL calendar
