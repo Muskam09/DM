@@ -343,6 +343,61 @@ def test_faq_override_pool_vs_guest_pool(text, expected):
     assert bot_logic.faq_override(text) == expected
 
 
+@pytest.mark.parametrize("text,expected", [
+    # New DISCOUNTS FAQ: a GENERAL discount question was falling through to a room description.
+    ("Є якісь знижки у вас?", "DISCOUNTS"),
+    ("а які у вас знижки?", "DISCOUNTS"),
+    ("чи є знижки?", "DISCOUNTS"),
+    ("є акції?", "DISCOUNTS"),
+    ("маєте промокод?", "DISCOUNTS"),
+    # military-specific discount question keeps the precise MILITARY answer.
+    ("чи надаєте знижку військовим?", "MILITARY"),
+    ("є знижка для УБД?", "MILITARY"),
+    # a booking that merely mentions a discount must NOT be hijacked into an FAQ.
+    ("порахуйте зі знижкою УБД на 5-7 липня", None),
+    ("Стандарт на 5-7 липня для двох", None),
+    ("2 дорослих", None),
+])
+def test_faq_override_discounts(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Є якісь знижки у вас?", True), ("які у вас акції?", True), ("маєте промокод?", True),
+    ("порахуйте зі знижкою УБД", False),   # passing mention in a booking, not a question
+    ("Стандарт на 5-7 липня", False),
+])
+def test_is_discount_question(text, expected):
+    assert bot_logic.is_discount_question(text) is expected
+
+
+def test_pending_faq_sequence_collects_burst_faqs():
+    # Fix 3: every FAQ in the unanswered burst (since the bot's last reply) + the current
+    # message, in order, de-duplicated.
+    hist = [
+        {"id": 1, "message_type": "outgoing", "content": "вітаю"},
+        {"id": 2, "message_type": "incoming", "content": "Де ви знаходитесь?"},
+        {"id": 3, "message_type": "incoming", "content": "а басейн з підігрівом?"},
+    ]
+    assert bot_logic.pending_faq_sequence(hist, "а харчування є?") == ["PLACE", "POOL", "FOOD_PRICES"]
+    # Stops at the bot's last reply -> anything before it is already answered.
+    hist2 = [
+        {"id": 1, "message_type": "incoming", "content": "де ви?"},
+        {"id": 2, "message_type": "outgoing", "content": "ось адреса"},
+        {"id": 3, "message_type": "incoming", "content": "а фен є?"},
+    ]
+    assert bot_logic.pending_faq_sequence(hist2, "а фен є?") == ["HAIRDRYER"]
+    # De-dupes and ignores non-FAQ chatter.
+    assert bot_logic.pending_faq_sequence([], "а басейн є? і ще раз про басейн?") == ["POOL"]
+    assert bot_logic.pending_faq_sequence([], "Стандарт на 5-7 липня") == []
+
+
+def test_discounts_template_content():
+    assert "знижки для дітей" in templates.DISCOUNTS
+    assert "військовослужбовців" in templates.DISCOUNTS
+    assert "Instagram" in templates.DISCOUNTS
+
+
 def test_new_templates_content():
     assert "0673445220" in templates.LARGE_GROUPS_EVENTS
     assert "350" in templates.FOOD_PRICES and "1100" in templates.FOOD_PRICES
@@ -649,6 +704,53 @@ def test_e2e_faq_with_fuzzy_intent_runs_proactive_scan(server):
     assert templates.FAQ_CONTINUE_NUDGE.strip() not in full   # NOT the generic nudge
     assert server.state["scraped"] is True
     assert 355 in bs._pending_window                          # offered window stored for a later "Так"
+
+
+def test_e2e_discounts_faq_answered_not_room_description(server):
+    # PHASE-2 fix: "Є якісь знижки?" was answered with a room description. Now the
+    # deterministic guard pins it to DISCOUNTS even if the extractor mislabels it.
+    bs = server.configure(
+        slots={"topic": "faq", "faq_template": "GENERAL_INFORMATION", "rooms": []},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("Є якісь знижки у вас?", 520))
+    joined = "\n".join(server.sent)
+    assert "знижки для дітей" in joined and "військовослужбовців" in joined   # DISCOUNTS
+    assert "У нас 3 типи номерів" not in joined                                # NOT the room description
+
+
+def test_e2e_burst_multiple_faqs_then_quote_ordered(server):
+    # PHASE-2 Fix 3: a drip burst asked TWO FAQs (location, pool) then a full booking. The
+    # bot must answer BOTH FAQs (in order) AND the quote — Greeting -> FAQs -> Booking -> CTA.
+    hist = [{"id": 1, "message_type": "incoming", "content": "Де ви знаходитесь?"},
+            {"id": 2, "message_type": "incoming", "content": "а басейн з підігрівом?"}]
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-07",
+             "adults": 2, "children_ages": []}]},
+        history=hist, availability=_raw({"Стандарт": {"2026-07-06": 3}}))
+    _run(bs.process_incoming_message("Стандарт на 6-7 липня для двох", 530))
+    assert server.sent[0].startswith("Доброго дня! Вас вітає")     # greeting first
+    i_place = next(i for i, m in enumerate(server.sent) if "серці Карпат" in m)
+    i_pool = next(i for i, m in enumerate(server.sent) if "працює щодня" in m)
+    i_quote = next(i for i, m in enumerate(server.sent) if "буде вартувати" in m)
+    assert i_place < i_quote and i_pool < i_quote                  # both FAQs answered BEFORE the quote
+    assert "буде вартувати" in "\n".join(server.sent)              # the quote (CTA) is produced
+
+
+def test_e2e_compound_fuzzy_period_includes_second_month(server):
+    # PHASE-2 Fix 2 (date horizon): "друга половина липня або після 6 серпня" with late July
+    # booked must still scan AUGUST and offer that window (never drop the 2nd month).
+    avail = _raw({"Стандарт": {
+        **{f"2026-07-{d:02d}": 0 for d in range(16, 32)},     # late July booked
+        **{f"2026-08-{d:02d}": 2 for d in range(6, 14)}}})    # early August free
+    bs = server.configure(
+        slots={"topic": "fuzzy_dates", "rooms": [
+            {"room_type": None, "fuzzy_date": "друга половина липня або після 6 серпня",
+             "nights": None, "checkin": None, "checkout": None, "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("друга половина липня або після 6 серпня, на двох", 540))
+    full = "\n".join(server.sent)
+    assert "вільні віконця" in full and "серпня" in full          # August window offered
 
 
 def test_extraction_prompt_carries_guest_pool_rule(server):

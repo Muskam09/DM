@@ -186,6 +186,49 @@ def test_fuzzy_period_range_parses_normalized_yyyy_mm():
     assert de.fuzzy_period_range("2026-01") is None          # off-season month -> unconstrained
 
 
+def test_fuzzy_period_ranges_compound_keeps_all_months():
+    # Date-horizon fix: a compound period naming SEVERAL months must scan EVERY named month —
+    # dropping the 2nd month made an August request silently offer only July windows.
+    assert de.fuzzy_period_ranges("друга половина липня або після 6 серпня") == [
+        ("2026-07-16", "2026-07-31"), ("2026-08-06", "2026-08-31")]
+    assert de.fuzzy_period_ranges("липень чи серпень") == [
+        ("2026-07-01", "2026-07-31"), ("2026-08-01", "2026-08-31")]
+    assert de.fuzzy_period_ranges("у липні і серпні") == [
+        ("2026-07-01", "2026-07-31"), ("2026-08-01", "2026-08-31")]
+    assert de.fuzzy_period_ranges("початок серпня") == [("2026-08-01", "2026-08-10")]  # single
+    assert de.fuzzy_period_ranges("на вихідних") == []       # no month -> unconstrained
+    # back-compat single-range view returns the FIRST named window.
+    assert de.fuzzy_period_range("друга половина липня або після 6 серпня") == ("2026-07-16", "2026-07-31")
+
+
+def test_propose_windows_compound_period_offers_second_month():
+    # The exact reported miss: "друга половина липня або після 6 серпня" with late July booked
+    # must still offer the AUGUST window (never drop the 2nd month).
+    avail = {"Стандарт": {
+        **{f"2026-07-{d:02d}": 0 for d in range(16, 32)},     # late July fully booked
+        **{f"2026-08-{d:02d}": 2 for d in range(6, 14)},      # early-mid August free
+    }}
+    reply = de.propose_windows(
+        {"room_type": "Стандарт", "fuzzy_date": "друга половина липня або після 6 серпня"}, avail)
+    assert "вільні віконця" in reply                          # a real window was found
+    assert "6 - 13 серпня" in reply                           # the AUGUST window is offered
+    # the only DATE window offered is August (late July was booked); the echoed period text
+    # naturally still contains "липня", so we check the offered window portion explicitly.
+    offered = reply.split("вільні віконця:", 1)[1]
+    assert "липня" not in offered
+
+
+def test_propose_windows_compound_period_prefers_earliest_across_months():
+    # Both months free -> windows are offered in chronological order (July first).
+    avail = {"Стандарт": {
+        **{f"2026-07-{d:02d}": 2 for d in range(16, 22)},     # late July free
+        **{f"2026-08-{d:02d}": 2 for d in range(6, 12)},      # August free
+    }}
+    reply = de.propose_windows(
+        {"room_type": "Стандарт", "fuzzy_date": "друга половина липня або після 6 серпня"}, avail)
+    assert "липня" in reply                                   # earliest (July) window shown
+
+
 def test_propose_windows_constrained_to_named_period():
     # Free blocks early AND late July, but client said "початок липня" -> only early.
     avail = {"Стандарт": {

@@ -201,14 +201,16 @@ def _fuzzy_month(text: str) -> Optional[int]:
     return None
 
 
-def fuzzy_period_range(fuzzy: str, year: int = _FUZZY_YEAR):
-    """Map a fuzzy Ukrainian period to an inclusive ('YYYY-MM-DD', 'YYYY-MM-DD')
-    window so the proactive scan (Fix 1) stays inside the month/part the client
-    actually named ("початок серпня" -> 1–10 Aug, "друга половина липня" -> 16–31 Jul).
+# A compound fuzzy period can name several months/parts joined by a connector
+# ("друга половина липня АБО після 6 серпня", "липень чи серпень", "у липні і серпні").
+# Split on these so EVERY named month is scanned — dropping the 2nd month made an August
+# request silently offer only July windows (date-horizon bug).
+_PERIOD_SPLIT_RE = re.compile(r"\s+(?:або|чи|та|і)\s+|\s*[,;/]\s*", re.IGNORECASE)
 
-    Returns None when no priced month can be identified (scan left unconstrained).
-    """
-    t = (fuzzy or "").lower()
+
+def _single_period_range(t: str, year: int):
+    """Map ONE fuzzy Ukrainian sub-period (already lowercased) to an inclusive
+    ('YYYY-MM-DD', 'YYYY-MM-DD') window, or None when no priced month is identifiable."""
     month = _fuzzy_month(t)
     if not month:
         return None
@@ -231,6 +233,36 @@ def fuzzy_period_range(fuzzy: str, year: int = _FUZZY_YEAR):
         start_day, end_day = 1, last
     return (date(year, month, start_day).isoformat(),
             date(year, month, end_day).isoformat())
+
+
+def fuzzy_period_ranges(fuzzy: str, year: int = _FUZZY_YEAR):
+    """ALL inclusive ('YYYY-MM-DD', 'YYYY-MM-DD') windows named in a fuzzy period, so a
+    compound period naming several months/parts is fully scanned ("друга половина липня
+    або після 6 серпня" -> [(2026-07-16, 2026-07-31), (2026-08-06, 2026-08-31)]). Returns
+    [] when no priced month can be identified (scan left unconstrained)."""
+    t = (fuzzy or "").lower()
+    segments = [s.strip() for s in _PERIOD_SPLIT_RE.split(t) if s and s.strip()] or [t]
+    ranges = []
+    for seg in segments:
+        r = _single_period_range(seg, year)
+        if r and r not in ranges:
+            ranges.append(r)
+    return ranges
+
+
+def fuzzy_period_range(fuzzy: str, year: int = _FUZZY_YEAR):
+    """The FIRST inclusive window named in a fuzzy period (back-compat single-range view).
+    Prefer `fuzzy_period_ranges` for compound periods. Returns None when no priced month."""
+    ranges = fuzzy_period_ranges(fuzzy, year)
+    return ranges[0] if ranges else None
+
+
+def _in_period_dates(all_dates, ranges):
+    """The subset of sorted calendar dates that fall inside ANY named period range.
+    No ranges (unconstrained scan) -> all dates."""
+    if not ranges:
+        return list(all_dates)
+    return [d for d in all_dates if any(lo <= d <= hi for lo, hi in ranges)]
 
 
 def _has_dates(room: Dict) -> bool:
@@ -334,15 +366,16 @@ def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
         # No named period (client said "дати ще не знаю") -> open-calendar phrasing.
         return templates.PROPOSE_WINDOWS_OPEN.replace("{found_dates}", found)
 
-    period = fuzzy_period_range(fuzzy)
-    in_period = [d for d in all_dates if period is None or period[0] <= d <= period[1]]
+    ranges = fuzzy_period_ranges(fuzzy)
+    in_period = _in_period_dates(all_dates, ranges)
     windows = _free_windows(avail, in_period, min_nights, room_count)
     if windows:
         return _offer(windows)
 
-    # Nothing free inside the VISIBLE part of the named period.
+    # Nothing free inside the VISIBLE part of the named period(s).
     vis_max = all_dates[-1] if all_dates else None
-    if period is not None and vis_max is not None and period[1] > vis_max:
+    max_end = max((hi for _, hi in ranges), default=None)
+    if max_end is not None and vis_max is not None and max_end > vis_max:
         # The named period EXTENDS beyond the open calendar window (OtelMS shows only
         # ~6-7 weeks ahead) and the visible slice has nothing free — we cannot honestly
         # scan the rest. Ask for exact dates instead of proposing dates from the wrong
@@ -369,12 +402,13 @@ def first_offered_window(spec: Dict, availability: Dict):
     key = bot_logic.match_availability_key(availability, room)
     avail = (availability.get(key) or {}) if key else {}
     all_dates = sorted(avail.keys())
-    period = fuzzy_period_range(fuzzy)
-    in_period = [d for d in all_dates if period is None or period[0] <= d <= period[1]]
+    ranges = fuzzy_period_ranges(fuzzy)
+    in_period = _in_period_dates(all_dates, ranges)
     windows = _free_windows(avail, in_period, min_nights, room_count)
     if not windows:
         vis_max = all_dates[-1] if all_dates else None
-        if period is not None and vis_max is not None and period[1] > vis_max:
+        max_end = max((hi for _, hi in ranges), default=None)
+        if max_end is not None and vis_max is not None and max_end > vis_max:
             return None    # propose_windows asks for exact dates here -> nothing to accept
         windows = _free_windows(avail, all_dates, min_nights, room_count)
     if not windows:

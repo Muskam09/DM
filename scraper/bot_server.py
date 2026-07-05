@@ -163,7 +163,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting | barter | unknown>",
   "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "nights": <ціле|null>, "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
-  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
+  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|DISCOUNTS|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
 
 ⛔ Ти НЕ пишеш текст для клієнта і НЕ вигадуєш описи. НІКОЛИ не генеруй опис номерів, внутрішні назви/номери кімнат (напр. "Хом'як", "Боярин", "Гропа") чи будь-яку прозу — весь клієнтський текст формує Python із готових шаблонів. Якщо клієнт просить розповісти про номери — постав topic=presentation (або faq_template=GENERAL_INFORMATION); сам опис підставить Python. Ти повертаєш ЛИШЕ JSON.
@@ -212,6 +212,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
   • ТОЧНИЙ діапазон (конкретні числа заїзду+виїзду АБО дата+кількість ночей, напр. "з 22.06 по 02.07", "17-19 липня", "20.07 на 3 ночі") => заповни checkin/checkout, fuzzy_date=null, і topic="price_quote" (НІКОЛИ не "general_price"). Слова "орієнтовно"/"приблизно"/"десь" ПЕРЕД конкретними числами НЕ роблять дати нечіткими ("орієнтовно 2-7 липня" = ТОЧНІ дати 2026-07-02..2026-07-07).
   • НЕЧІТКИЙ період ("початок серпня", "друга половина липня", "у серпні", "влітку", "кінець місяця", "після 6 серпня") => fuzzy_date="<текст періоду клієнта>", checkin=null, checkout=null.
   • НЕ підставляй "перше число місяця" як checkin для нечітких періодів — став fuzzy_date.
+  • ДЕКІЛЬКА ПЕРІОДІВ/МІСЯЦІВ в одному запиті ("друга половина липня або після 6 серпня", "липень чи серпень", "у липні і серпні") => збережи ВЕСЬ текст періоду у fuzzy_date разом з усіма місяцями (НЕ відкидай другий місяць!). Python сам просканує КОЖЕН названий місяць.
 - nights — кількість ночей, ЛИШЕ якщо названо ОДНЕ чітке число ("на 3 ночі"=3, "тиждень"=7, "на 5 діб"=5, "2 ночі"=2). ДІАПАЗОН ("3-5 діб", "на 3-4 ночі") або невідомо => nights=null. Для точних дат nights можна лишити null (порахується з checkin/checkout).
 - adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" / "за трьох" / "на трьох" / "для трьох" / "трьох" => adults=3; "четверо" / "за чотирьох" => 4; одна особа => 1. Якщо клієнт лише УТОЧНЮЄ "дорослі всі" / "всі дорослі" / "дорослі" — кількість дорослих БЕРИ з попередніх повідомлень (напр., раніше "за трьох" => adults=3) і НЕ скидай у 0.
 - children_count — ЗАГАЛЬНА кількість дітей (навіть якщо вік невідомий). children_ages — лише ВІДОМІ віки (цілі), вік не вигадуй.
@@ -220,8 +221,8 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - Якщо взагалі не вказано ні дорослих, ні дітей — adults=0, children_count=0, children_ages=[].
 - ubd — true якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових. Знижка діє на ВСЕ бронювання родини (-20% від загальної суми), тому постав ubd=true для УСІХ номерів у rooms[]; інакше false для всіх.
 
-FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS; фен / чи є фен у номері -> HAIRDRYER; фото / відео / світлини номерів чи території -> MEDIA.
-ВАЖЛИВО: тенісного КОРТУ у готелі НЕМАЄ — НЕ пропонуй теніс як активність. Знижки 10% / "програми лояльності" бот НЕ рахує і НЕ обіцяє (це лише людина): на пряме питання про знижку 10% став faq_template=null.
+FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ЗАГАЛЬНЕ питання про знижки/акції ("чи є знижки", "які у вас знижки", "є якісь акції", "промокод") -> DISCOUNTS; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS; фен / чи є фен у номері -> HAIRDRYER; фото / відео / світлини номерів чи території -> MEDIA.
+ВАЖЛИВО: тенісного КОРТУ у готелі НЕМАЄ — НЕ пропонуй теніс як активність. Загальне питання про знижки/акції -> DISCOUNTS (шаблон перелічує лише реальні знижки — діти та військові — і відсилає за іншими акціями в Instagram). Знижку 10% / "програму лояльності" бот НЕ рахує і НЕ обіцяє окремо (це лише людина) — на питання про знижки завжди став DISCOUNTS, а не GENERAL_INFORMATION і не null.
 БАСЕЙН — РОЗРІЗНЯЙ ДВА ШАБЛОНИ:
 - GUEST_POOL: будь-яке питання про ЦІНУ/ВАРТІСТЬ басейну, про КУПАННЯ чи ВІДВІДУВАННЯ басейну БЕЗ проживання, "покупатись/поплавати в басейні", "скільки коштує басейн", "приїхати на басейн на день", "тільки/лише басейн", "можна просто скупатись".
 - POOL: ЗАГАЛЬНЕ питання про басейн як зручність для гостей ("чи є басейн", "він з підігрівом?", "графік/години роботи", "розмір/глибина", "чи входить басейн у вартість проживання").
@@ -628,6 +629,25 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         await _deliver(conversation_id, out)
         bot_has_spoken = True
         recent_bots = ([text.strip()] + recent_bots)[:2]
+
+    # Fix 3 (batch ordering): a drip burst is collapsed to this single turn, so the extractor
+    # classified only the LAST question. Answer EVERY OTHER FAQ the burst raised, in the order
+    # asked, BEFORE the booking status / call-to-action — Greeting -> FAQs -> Booking -> CTA.
+    # The primary FAQ (already in `reply` on the faq path) is excluded so it isn't sent twice;
+    # the anti-spam dedup in _emit drops any that repeat a recent bot message.
+    answered_faqs = set()
+    if is_faq_reply and isinstance(slots.get("faq_template"), str):
+        answered_faqs.add(slots["faq_template"])
+    for _fname in bot_logic.pending_faq_sequence(raw_history, user_message):
+        if _fname in answered_faqs:
+            continue
+        answered_faqs.add(_fname)
+        _tmpl = getattr(templates, _fname, None)
+        if isinstance(_tmpl, str) and _tmpl.strip():
+            try:
+                await _emit(_tmpl)
+            except Exception as e:
+                print(f"[-] Помилка надсилання (burst FAQ {_fname}): {e}")
 
     # Bug 1 (FAQ hijacks the scan): an FAQ asked ALONGSIDE an actionable booking intent
     #    must ANSWER the FAQ and then RUN the real scan, appending the ACTUAL calendar

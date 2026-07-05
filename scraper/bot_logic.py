@@ -294,6 +294,32 @@ def is_payment_rules_question(text: str) -> bool:
     return any(m in t for m in _PAYMENT_RULES_MARKERS)
 
 
+# --- discount / promotions question -> DISCOUNTS (deterministic) -------------
+# A GENERAL "do you have discounts?" question was falling through to a room description
+# (GENERAL_INFORMATION). Pin it: the DISCOUNTS template lists only the bot's real discounts
+# (children + military) and points to Instagram for other promos. Phrase-based (not a bare
+# "знижк") so a booking that merely mentions "зі знижкою УБД" is NOT hijacked into an FAQ.
+_DISCOUNT_MARKERS = [
+    # promotions — safe as bare stems (a booking never contains these).
+    "акці", "промокод", "промо-код", "промо код", "скидк", "распродаж",
+    # discounts — PHRASE-based so a booking that only mentions "зі знижкою УБД" is NOT hijacked.
+    "чи є знижк", "є знижк", "є якісь знижк", "якісь знижк", "які знижк", "яка знижк",
+    "у вас знижк", "вас знижк", "знижки є", "знижок", "маєте знижк", "надаєте знижк",
+    "робите знижк", "даєте знижк", "діють знижк", "будуть знижк", "щодо знижок", "про знижки",
+]
+# When the discount question is specifically about the military discount, keep the more
+# precise MILITARY answer (it names the УБД certificate requirement) instead of DISCOUNTS.
+_MILITARY_MARKERS = ["військ", "убд", "ветеран", "зсу", "всу", "боєц", "бійц", "атовц"]
+
+
+def is_discount_question(text: str) -> bool:
+    """True for a GENERAL question about discounts / promotions ('чи є знижки?',
+    'які у вас акції?'). Phrase-based to avoid hijacking a booking that only mentions
+    a discount in passing ('порахуйте зі знижкою УБД')."""
+    t = (text or "").lower()
+    return any(m in t for m in _DISCOUNT_MARKERS)
+
+
 # --- pet mention (for the "+300 грн/доба" note on a quote) -------------------
 _PET_MARKERS = ["соба", "песик", "пёс", "пес ", "пекінес", "тварин", "котик", "кота ",
                 "улюблен", "вихован", "цуцик", "хвостик"]
@@ -337,12 +363,40 @@ def faq_override(text: str):
     if is_location_question(text):
         return "PLACE"
     t = (text or "").lower()
+    if is_discount_question(text):
+        # A military-specific discount question keeps the precise MILITARY answer; a general
+        # "чи є знижки?" gets the DISCOUNTS overview (children + military + Instagram promos).
+        return "MILITARY" if any(m in t for m in _MILITARY_MARKERS) else "DISCOUNTS"
     if "басейн" in t:                       # pool questions split into POOL / GUEST_POOL
         return _pool_template(t)
     for keywords, template in _FAQ_OVERRIDE:
         if any(k in t for k in keywords):
             return template
     return None
+
+
+def pending_faq_sequence(raw_history, user_message: str) -> List[str]:
+    """Ordered, de-duplicated FAQ template names for the client's UNANSWERED burst — every
+    incoming message since the bot's last reply, plus the current message (Fix 3, batch
+    ordering). A drip burst is collapsed to ONE processing turn, so the extractor answers
+    only the LAST question; this lets the bot answer EVERY FAQ the burst asked, in order,
+    before the booking status / call-to-action (Greeting -> FAQs -> Booking -> CTA)."""
+    msgs: List[str] = []
+    for m in reversed(raw_history or []):
+        mtype = m.get("message_type")
+        if mtype in ("outgoing", 1):
+            break                              # stop at the bot's previous reply
+        if mtype in ("incoming", 0) and m.get("content"):
+            msgs.append(m["content"])
+    msgs.reverse()                             # back to chronological order
+    if user_message and (not msgs or msgs[-1].strip() != user_message.strip()):
+        msgs.append(user_message)
+    seq: List[str] = []
+    for text in msgs:
+        f = faq_override(text)
+        if f and f not in seq:
+            seq.append(f)
+    return seq
 
 
 # --- per-conversation slot memory (robust to extractor variance) ------------
