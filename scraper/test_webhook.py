@@ -392,6 +392,27 @@ def test_pending_faq_sequence_collects_burst_faqs():
     assert bot_logic.pending_faq_sequence([], "Стандарт на 5-7 липня") == []
 
 
+def test_pending_faq_sequence_skips_notice_messages():
+    # Live-QA race: a mid-burst FAQ ("харчування є?") that landed just BEFORE the bot's
+    # greeting / "Секундочку" notice (a slow scrape) must NOT be treated as answered — a
+    # notice is not an answer. The scan skips notices and still collects the food FAQ.
+    seku = "Секундочку, перевіряю доступність номеру та актуальні ціни на ці дати… 🗓️"
+    hist = [
+        {"id": 1, "message_type": "incoming", "content": "Четверо дорослих"},
+        {"id": 2, "message_type": "incoming", "content": "харчування є?"},
+        {"id": 3, "message_type": "outgoing", "content": bot_logic.GREETING},
+        {"id": 4, "message_type": "outgoing", "content": seku},
+    ]
+    assert bot_logic.pending_faq_sequence(hist, "Стандарт +") == ["FOOD_PRICES"]
+    # But a REAL bot answer still bounds the scan (already-answered FAQs aren't re-collected).
+    hist2 = [
+        {"id": 1, "message_type": "incoming", "content": "де ви?"},
+        {"id": 2, "message_type": "outgoing", "content": templates.PLACE},   # a real answer
+        {"id": 3, "message_type": "incoming", "content": "а фен є?"},
+    ]
+    assert bot_logic.pending_faq_sequence(hist2, "а фен є?") == ["HAIRDRYER"]
+
+
 def test_discounts_template_content():
     assert "знижки для дітей" in templates.DISCOUNTS
     assert "військовослужбовців" in templates.DISCOUNTS
@@ -1110,6 +1131,27 @@ def test_e2e_pure_thanks_gets_a_close(server):
     _run(bs.process_incoming_message("Дякую!", 490))
     assert server.sent == [templates.ACKNOWLEDGE_THANKS]
     assert server.prompts == []                    # no LLM call
+
+
+def test_e2e_pure_thanks_still_answers_pending_burst_faq(server):
+    # Live-QA finding: an FAQ ("харчування?") the bot was still processing when a bare "Дякую"
+    # arrived (superseding it) must STILL be answered before the warm close — never dropped.
+    bs = server.configure(
+        slots={"topic": "greeting", "rooms": []},
+        history=[{"id": 1, "message_type": "outgoing", "content": templates.THINKING_ABOUT_IT},
+                 {"id": 2, "message_type": "incoming", "content": "Зорієнтуйте по харчуванню"}])
+    _run(bs.process_incoming_message("Дякую", 495))
+    joined = "\n".join(server.sent)
+    assert "350" in joined or "Сніданок" in joined            # FOOD_PRICES was answered
+    assert templates.ACKNOWLEDGE_THANKS in server.sent        # and the warm close still sent
+    assert server.prompts == []                               # still no LLM call on the fast path
+
+
+def test_e2e_pure_thanks_no_pending_faq_just_closes(server):
+    # Regression: a plain "Дякую" with nothing pending still just closes warmly (unchanged).
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, history=_bot_spoke())
+    _run(bs.process_incoming_message("Дякую!", 494))
+    assert server.sent == [templates.ACKNOWLEDGE_THANKS]
 
 
 def test_e2e_pet_note_appended_to_quote(server):

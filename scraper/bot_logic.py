@@ -375,19 +375,43 @@ def faq_override(text: str):
     return None
 
 
+# Bot messages that are NOTICES, not answers: the greeting, the "checking availability"
+# filler, and the LLM-outage holder. When deciding what the client asked but hasn't been
+# ANSWERED yet, these must be skipped — otherwise a mid-burst FAQ that landed right before a
+# "Секундочку…" notice (during a slow scrape) is wrongly treated as answered and orphaned
+# (a live-QA race the offline mocks could not reproduce).
+_NOTICE_MARKERS = [
+    GREETING_MARKER,
+    "Секундочку, перевіряю доступність",
+    "система зараз трохи перевантажена",
+]
+
+
+def _is_notice_message(text: str) -> bool:
+    t = text or ""
+    return any(m in t for m in _NOTICE_MARKERS)
+
+
 def pending_faq_sequence(raw_history, user_message: str) -> List[str]:
     """Ordered, de-duplicated FAQ template names for the client's UNANSWERED burst — every
-    incoming message since the bot's last reply, plus the current message (Fix 3, batch
+    incoming message since the bot's last REAL reply, plus the current message (Fix 3, batch
     ordering). A drip burst is collapsed to ONE processing turn, so the extractor answers
     only the LAST question; this lets the bot answer EVERY FAQ the burst asked, in order,
-    before the booking status / call-to-action (Greeting -> FAQs -> Booking -> CTA)."""
+    before the booking status / call-to-action (Greeting -> FAQs -> Booking -> CTA).
+
+    Notice messages (greeting / "Секундочку" / outage holder) are NOT answers, so the scan
+    skips them and keeps looking back — a food FAQ asked just before a slow scrape's
+    "Секундочку" notice must still be answered (live-QA finding)."""
     msgs: List[str] = []
     for m in reversed(raw_history or []):
         mtype = m.get("message_type")
+        content = m.get("content") or ""
         if mtype in ("outgoing", 1):
-            break                              # stop at the bot's previous reply
-        if mtype in ("incoming", 0) and m.get("content"):
-            msgs.append(m["content"])
+            if _is_notice_message(content):
+                continue                       # a notice isn't an answer -> keep scanning back
+            break                              # a REAL bot reply -> stop
+        if mtype in ("incoming", 0) and content:
+            msgs.append(content)
     msgs.reverse()                             # back to chronological order
     if user_message and (not msgs or msgs[-1].strip() != user_message.strip()):
         msgs.append(user_message)

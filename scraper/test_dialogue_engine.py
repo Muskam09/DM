@@ -28,6 +28,42 @@ def test_parse_garbage_falls_back_to_greeting():
     assert s["topic"] == "greeting" and s["rooms"] == []
 
 
+def test_parse_slots_denulls_stringy_null_values():
+    # LIVE-LLM quirk (caught by live_auto_qa.py, invisible to offline mocks): the extractor
+    # sometimes emits the STRING "null"/"None"/"" instead of JSON null. These MUST become
+    # Python None, or "двомісний номер" scans a bogus room type "null" -> empty availability
+    # -> a false NEAREST_NONE ("all booked"), dropping real free windows.
+    s = de.parse_slots('{"topic":"fuzzy_dates","rooms":[{"room_type":"null",'
+                       '"checkin":"None","checkout":"","fuzzy_date":"друга половина липня",'
+                       '"nights":"null","adults":2,"children_ages":[]}]}')
+    r = s["rooms"][0]
+    assert r["room_type"] is None
+    assert r["checkin"] is None and r["checkout"] is None and r["nights"] is None
+    assert r["fuzzy_date"] == "друга половина липня"     # a REAL value is left untouched
+    assert r["adults"] == 2
+
+
+def test_plan_stringy_null_room_type_not_treated_as_chosen():
+    # After denulling, a stringy-null room_type with exact dates must route to quote_all
+    # (price every type), NOT quote a nonexistent "null" room.
+    s = de.parse_slots('{"topic":"price_quote","rooms":[{"room_type":"null",'
+                       '"checkin":"2026-07-06","checkout":"2026-07-08","adults":2,"children_ages":[]}]}')
+    assert de.plan(s)["action"] == "quote_all"
+
+
+def test_propose_windows_stringy_null_room_defaults_and_scans():
+    # The persona-9 failure end-to-end: a compound fuzzy period with a stringy-null room_type
+    # must still scan the default room type and offer BOTH months (not NEAREST_NONE).
+    avail = {"Стандарт": {**{f"2026-07-{d:02d}": 2 for d in range(19, 27)},
+                          **{f"2026-08-{d:02d}": 2 for d in range(6, 21)}}}
+    s = de.parse_slots('{"topic":"fuzzy_dates","rooms":[{"room_type":"null",'
+                       '"fuzzy_date":"друга половина липня або після 6 серпня",'
+                       '"adults":2,"children_ages":[]}]}')
+    reply = de.propose_windows(s["rooms"][0], avail)
+    assert "вільні віконця" in reply and "серпня" in reply and "липня" in reply
+    assert reply != templates.NEAREST_NONE
+
+
 # --- formatting (rigid quote format, directive 3) --------------------------
 
 def test_quote_line_exact_format():

@@ -400,6 +400,14 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     if bot_logic.is_pure_thanks(user_message):
         last = next((m.get("content", "").strip() for m in reversed(raw_history)
                      if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
+        # Never DROP a question: if an FAQ from the same burst is still unanswered (a drip the
+        # bot was mid-processing when this "Дякую" arrived and superseded it), answer it FIRST,
+        # then the warm close (live-QA finding — a bare thanks was orphaning a food FAQ).
+        for fname in bot_logic.pending_faq_sequence(raw_history, user_message):
+            tmpl = getattr(templates, fname, None)
+            if (isinstance(tmpl, str) and tmpl.strip() and tmpl.strip() != last
+                    and not _superseded(conversation_id, seq)):
+                await _deliver(conversation_id, tmpl)
         if last != templates.ACKNOWLEDGE_THANKS.strip() and not _superseded(conversation_id, seq):
             await _deliver(conversation_id, templates.ACKNOWLEDGE_THANKS)
         return

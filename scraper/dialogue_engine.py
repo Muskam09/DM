@@ -36,9 +36,31 @@ _MONTH_TEMPLATE = {6: templates.PRICE_JUNE, 7: templates.PRICE_JULY, 8: template
 
 # --- slot parsing ----------------------------------------------------------
 
+# The extractor LLM sometimes emits the STRING "null" / "none" / "" for a field instead
+# of JSON null (a real live-LLM quirk offline mocks never reproduce: it made a "двомісний
+# номер" request scan a bogus room type "null" -> empty availability -> a false NEAREST_NONE).
+# Normalise these stringy-nulls to Python None at the LLM->core boundary so nothing
+# downstream (room-key match, date parsing, quoting) is fed a fake value.
+_NULLISH = {"null", "none", "nil", "n/a", "na", "-", ""}
+
+
+def _denull(v):
+    """String forms of 'null' from the LLM -> Python None; everything else unchanged."""
+    if isinstance(v, str) and v.strip().lower() in _NULLISH:
+        return None
+    return v
+
+
+def _clean_room(r: Dict) -> Dict:
+    if not isinstance(r, dict):
+        return {}
+    return {k: _denull(v) for k, v in r.items()}
+
+
 def parse_slots(text: str) -> Dict:
     """Robustly parse the extractor LLM's JSON. On any failure, fall back to a
-    safe 'greeting' (which makes the bot ask for the missing info)."""
+    safe 'greeting' (which makes the bot ask for the missing info). Stringy-null
+    values ('null'/'none'/'') are normalised to real None (live-LLM hardening)."""
     if not text:
         return {"topic": "greeting", "rooms": []}
     cleaned = text.strip()
@@ -53,9 +75,14 @@ def parse_slots(text: str) -> Dict:
     if not isinstance(data, dict):
         return {"topic": "greeting", "rooms": []}
     data.setdefault("topic", "greeting")
+    if not isinstance(data.get("topic"), str) or data["topic"].strip().lower() in _NULLISH:
+        data["topic"] = "greeting"
     data.setdefault("rooms", [])
     if not isinstance(data["rooms"], list):
         data["rooms"] = []
+    data["rooms"] = [_clean_room(r) for r in data["rooms"]]
+    if "faq_template" in data:
+        data["faq_template"] = _denull(data["faq_template"])
     return data
 
 
