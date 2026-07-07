@@ -163,7 +163,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting | barter | unknown>",
   "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "nights": <ціле|null>, "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
-  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|DISCOUNTS|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
+  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|DISCOUNTS|PRICE_POLICY|PET_SURCHARGE|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
 }
 
 ⛔ Ти НЕ пишеш текст для клієнта і НЕ вигадуєш описи. НІКОЛИ не генеруй опис номерів, внутрішні назви/номери кімнат (напр. "Хом'як", "Боярин", "Гропа") чи будь-яку прозу — весь клієнтський текст формує Python із готових шаблонів. Якщо клієнт просить розповісти про номери — постав topic=presentation (або faq_template=GENERAL_INFORMATION); сам опис підставить Python. Ти повертаєш ЛИШЕ JSON.
@@ -221,7 +221,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - Якщо взагалі не вказано ні дорослих, ні дітей — adults=0, children_count=0, children_ages=[].
 - ubd — true якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових. Знижка діє на ВСЕ бронювання родини (-20% від загальної суми), тому постав ubd=true для УСІХ номерів у rooms[]; інакше false для всіх.
 
-FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ЗАГАЛЬНЕ питання про знижки/акції ("чи є знижки", "які у вас знижки", "є якісь акції", "промокод") -> DISCOUNTS; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS; фен / чи є фен у номері -> HAIRDRYER; фото / відео / світлини номерів чи території -> MEDIA.
+FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ЗАГАЛЬНЕ питання про знижки/акції ("чи є знижки", "які у вас знижки", "є якісь акції", "промокод") -> DISCOUNTS; питання про ЦІНОВУ ПОЛІТИКУ по місяцях ("чи така сама цінова політика в серпні, як у липні", "ціни однакові по місяцях", "в серпні дорожче?") -> PRICE_POLICY; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS; фен / чи є фен у номері -> HAIRDRYER; фото / відео / світлини номерів чи території -> MEDIA.
 ВАЖЛИВО: тенісного КОРТУ у готелі НЕМАЄ — НЕ пропонуй теніс як активність. Загальне питання про знижки/акції -> DISCOUNTS (шаблон перелічує лише реальні знижки — діти та військові — і відсилає за іншими акціями в Instagram). Знижку 10% / "програму лояльності" бот НЕ рахує і НЕ обіцяє окремо (це лише людина) — на питання про знижки завжди став DISCOUNTS, а не GENERAL_INFORMATION і не null.
 БАСЕЙН — РОЗРІЗНЯЙ ДВА ШАБЛОНИ:
 - GUEST_POOL: будь-яке питання про ЦІНУ/ВАРТІСТЬ басейну, про КУПАННЯ чи ВІДВІДУВАННЯ басейну БЕЗ проживання, "покупатись/поплавати в басейні", "скільки коштує басейн", "приїхати на басейн на день", "тільки/лише басейн", "можна просто скупатись".
@@ -430,7 +430,9 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                          if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
         if last_bot != templates.ERROR_LLM_DOWN.strip():   # don't repeat the holding message
             await _deliver(conversation_id, templates.ERROR_LLM_DOWN)
-            await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
+        # Rule 2 (owner 2026-07-06): on ANY LLM outage ALWAYS tag the conversation Instagram so a
+        # human operator steps in — even when the duplicate holding message is suppressed.
+        await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
         _cooldowns[conversation_id] = time.time()   # start the 5-min silent cooldown
         return
 
@@ -600,6 +602,16 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             print(f"[i] {conversation_id}: QUESTION_ALL_MISSING would repeat -> pivot to ASK_GUESTS")
         elif prev == templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS.strip():
             reply = templates.ACKNOWLEDGE_NO_DATES_ASK_GUESTS  # already pivoted -> anti-spam silences
+
+    # Rule 3 (owner 2026-07-06): the bot NEVER quotes a price for children of unknown age
+    # (plan already guards that). But if we ALREADY asked for the ages last turn and the client
+    # replied WITHOUT giving them, a plain repeat would be anti-spam-suppressed -> silence. So
+    # insist ONCE, firmly but warmly, with a DIFFERENT message that won't be dropped.
+    if (reply is not None and bot_logic.asks_for_child_ages(reply)
+            and bot_logic.asks_for_child_ages(last_bot_msg)
+            and bot_logic.has_child_of_unknown_age(slots)):   # a REAL child of unknown age only
+        reply = templates.INSIST_CHILD_AGES
+        print(f"[i] {conversation_id}: age question ignored -> insisting firmly on child ages")
 
     # 3) SEND. A newer drip that arrived while we were processing supersedes this reply,
     #    so a burst collapses to ONE consolidated reply AND a mid-scrape correction wins

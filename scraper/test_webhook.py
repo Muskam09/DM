@@ -413,6 +413,75 @@ def test_pending_faq_sequence_skips_notice_messages():
     assert bot_logic.pending_faq_sequence(hist2, "а фен є?") == ["HAIRDRYER"]
 
 
+@pytest.mark.parametrize("text,expected", [
+    (templates.QUESTION_MISSING_AGE, True),
+    (templates.QUESTION_MISSING_DATES_1_CHILD, True),
+    (templates.QUESTION_MISSING_DATES_CHILDREN, True),
+    ("Орієнтуємось на кінець серпня! підкажіть лише вік діток 😊", True),
+    (bot_logic.GREETING, False),
+    ("Вартість номеру ... буде вартувати - 4400 грн", False),
+])
+def test_asks_for_child_ages(text, expected):
+    assert bot_logic.asks_for_child_ages(text) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    # Rule 4: a monthly pricing-policy question must be answered (was swallowed in Persona 9).
+    ("В серпні актуальна, як і на липень, цінова політика?", "PRICE_POLICY"),
+    ("ціни однакові по місяцях?", "PRICE_POLICY"),
+    ("в серпні ціни такі самі як у липні?", "PRICE_POLICY"),
+    # not a policy question -> stays out of PRICE_POLICY
+    ("яка вартість на 5-7 липня?", None),
+    ("Стандарт на 5-7 липня", None),
+])
+def test_faq_override_price_policy(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    # Rule 4: a specific pet-FEE question gets the concise PET_SURCHARGE (not the verbose PETS,
+    # which the anti-dedup would swallow if already shown).
+    ("Треба за собаку доплачувати?", "PET_SURCHARGE"),
+    ("чи є доплата за тваринку?", "PET_SURCHARGE"),
+    ("скільки доплата за песика?", "PET_SURCHARGE"),
+    # a general pet mention stays PETS
+    ("а можна з собачкою?", "PETS"),
+])
+def test_faq_override_pet_surcharge(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+def test_pet_surcharge_not_triggered_by_booking_price():
+    # A booking that merely mentions a pet + a ROOM price must NOT be read as a pet-FEE question
+    # (no surcharge word) -> the surcharge detector stays False.
+    assert bot_logic.is_pet_surcharge_question("з собакою, яка вартість Стандарт 5-7 липня?") is False
+    assert bot_logic.is_pet_surcharge_question("Треба за собаку доплачувати?") is True
+
+
+def test_pet_surcharge_template_content():
+    assert "300 грн" in templates.PET_SURCHARGE and "тваринк" in templates.PET_SURCHARGE
+
+
+def test_price_policy_template_content():
+    assert "залежать від місяця" in templates.PRICE_POLICY
+    assert "серпн" in templates.PRICE_POLICY.lower()
+
+
+def test_e2e_price_policy_question_answered(server):
+    # Rule 4: the exact Persona-9 message must be ANSWERED, not swallowed by fuzzy-date logic.
+    bs = server.configure(
+        slots={"topic": "fuzzy_dates", "rooms": [
+            {"room_type": None, "fuzzy_date": "друга половина липня", "adults": 2, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("В серпні актуальна, як і на липень, цінова політика?", 620))
+    assert any("залежать від місяця" in m for m in server.sent)   # PRICE_POLICY answered
+
+
+def test_insist_child_ages_template_content():
+    assert "вік діт" in templates.INSIST_CHILD_AGES.lower()
+    assert "розрахувати" in templates.INSIST_CHILD_AGES
+
+
 def test_discounts_template_content():
     assert "знижки для дітей" in templates.DISCOUNTS
     assert "військовослужбовців" in templates.DISCOUNTS
@@ -1131,6 +1200,78 @@ def test_e2e_pure_thanks_gets_a_close(server):
     _run(bs.process_incoming_message("Дякую!", 490))
     assert server.sent == [templates.ACKNOWLEDGE_THANKS]
     assert server.prompts == []                    # no LLM call
+
+
+def test_e2e_insist_on_child_ages_when_ignored(server):
+    # Rule 3 (owner 2026-07-06): the bot already asked the child ages and the client replied
+    # WITHOUT them -> insist firmly (a DIFFERENT message, so anti-spam doesn't silence it), and
+    # NEVER quote a price until the ages are known.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
+             "adults": 2, "children_count": 1, "children_ages": []}]},
+        history=[{"id": 1, "message_type": "outgoing", "content": templates.QUESTION_MISSING_AGE}])
+    _run(bs.process_incoming_message("та просто цікавить ціна", 610))
+    assert any(m == templates.INSIST_CHILD_AGES for m in server.sent)
+    assert not any("буде вартувати" in m for m in server.sent)   # never quotes without ages
+
+
+def test_e2e_no_insist_for_adult_only_booking(server):
+    # Rule 3 guard (Persona 7 live bug): the generic prompts also say "вік діток", but an
+    # ADULT-ONLY booking (no children) must NEVER trigger the child-age insist.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-13", "checkout": "2026-07-17",
+             "adults": 0, "children_count": 0, "children_ages": []}]},
+        history=[{"id": 1, "message_type": "outgoing", "content": templates.QUESTION_ALL_MISSING}])
+    _run(bs.process_incoming_message("13-17 липня", 612))
+    assert not any(m == templates.INSIST_CHILD_AGES for m in server.sent)
+    assert any(m == templates.QUESTION_MISSING_GUESTS for m in server.sent)   # asks guests, not insist
+
+
+@pytest.mark.parametrize("slots,expected", [
+    ({"rooms": [{"children_count": 1, "children_ages": []}]}, True),
+    ({"rooms": [{"children_count": 2, "children_ages": [8]}]}, True),
+    ({"rooms": [{"children_count": 2, "children_ages": [8, 10]}]}, False),   # ages known
+    ({"rooms": [{"adults": 2, "children_count": 0, "children_ages": []}]}, False),  # no children
+    ({"rooms": []}, False),
+])
+def test_has_child_of_unknown_age(slots, expected):
+    assert bot_logic.has_child_of_unknown_age(slots) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("що входить у вартість?", "INCLUDED_IN_THE_PRICE"),
+    ("що включено у проживання?", "INCLUDED_IN_THE_PRICE"),
+    ("чи входить басейн у вартість?", "POOL"),           # pool amenity check wins
+    ("що входить у сніданок?", "FOOD_PRICES"),            # food keyword wins (checked earlier)
+])
+def test_faq_override_included_in_price(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+def test_e2e_first_age_ask_is_not_insist(server):
+    # Regression: the FIRST age ask is the normal question, not the firm insist.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
+             "adults": 2, "children_count": 1, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("2 дорослих і дитина", 611))
+    assert any(m == templates.QUESTION_MISSING_AGE for m in server.sent)
+    assert not any(m == templates.INSIST_CHILD_AGES for m in server.sent)
+
+
+def test_e2e_llm_down_always_tags_instagram_even_on_repeat(server):
+    # Rule 2 (owner 2026-07-06): a repeat 503 (holding message suppressed) STILL tags Instagram.
+    bs = server.configure(slots={"topic": "greeting", "rooms": []},
+                          history=[{"id": 1, "message_type": "outgoing", "content": templates.ERROR_LLM_DOWN}])
+    async def boom(prompt, *a, **k):
+        raise RuntimeError("503 UNAVAILABLE")
+    bs.generate_with_retry = boom
+    _run(bs.process_incoming_message("ще раз", 172))
+    assert server.sent == []                                    # holding message not repeated
+    assert bot_logic.INSTAGRAM_LABEL in server.added_labels     # but Instagram tag applied
 
 
 def test_e2e_pure_thanks_still_answers_pending_burst_faq(server):

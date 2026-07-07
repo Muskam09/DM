@@ -581,6 +581,25 @@ def test_plan_five_guests_one_room_still_quotes():
     assert out["action"] == "quote_all"
 
 
+def test_plan_multiroom_no_type_assigns_fitting_and_quotes_all():
+    # Persona 15 live bug: "2 номери: 4 і 3" (no types) must quote BOTH rooms with fitting
+    # types, never just the first. 4 adults -> Напівлюкс; 3 adults -> Стандарт.
+    out = de.plan({"rooms": [
+        {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24", "adults": 4, "children_ages": []},
+        {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24", "adults": 3, "children_ages": []}]})
+    assert out["action"] == "quote"
+    assert len(out["rooms"]) == 2                                   # BOTH rooms kept
+    assert [r["room_type"] for r in out["rooms"]] == ["Напівлюкс", "Стандарт"]
+
+
+def test_assign_fitting_type():
+    assert de._assign_fitting_type({"adults": 2, "children_ages": []})["room_type"] == "Стандарт"
+    assert de._assign_fitting_type({"adults": 3, "children_ages": []})["room_type"] == "Стандарт"
+    assert de._assign_fitting_type({"adults": 4, "children_ages": []})["room_type"] == "Напівлюкс"
+    assert de._assign_fitting_type({"adults": 2, "children_ages": [8, 10]})["room_type"] == "Стандарт"
+    assert de._assign_fitting_type({"adults": 2, "children_ages": [8, 10, 5]})["room_type"] == "Напівлюкс"
+
+
 def test_plan_six_plus_explicit_two_rooms_proceeds():
     # Already split across 2 rooms -> the client said how -> proceed to quote.
     out = de.plan({"rooms": [
@@ -591,25 +610,30 @@ def test_plan_six_plus_explicit_two_rooms_proceeds():
     assert out["action"] == "quote"
 
 
-def test_finalize_quote_all_filters_over_capacity_standard():
-    # Owner capacity gate: 4 adults can't fit Стандарт/Стандарт+ (max 3 adults) -> only Напівлюкс.
+def test_finalize_quote_all_group_offers_standard_split_first():
+    # Owner rule 2026-07-06: 4 adults -> PRIORITISE several Стандарт/Стандарт+ rooms (more
+    # inventory); Напівлюкс only as a secondary fallback. (Reverses the old Напівлюкс-only.)
     avail = {"Стандарт": {"2026-07-06": 3, "2026-07-07": 3},
              "Стандарт +": {"2026-07-06": 3, "2026-07-07": 3},
              "Напівлюкс": {"2026-07-06": 2, "2026-07-07": 2}}
     reply = de.finalize_quote_all(
         {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 4, "children_ages": []}, avail)
-    assert "Напівлюкс" in reply
-    assert "Стандарт" not in reply        # both standard-class lines filtered out (impossible)
+    assert "2 номери Стандарт" in reply             # split offered (2+2)
+    assert "рекомендуємо кілька" in reply           # standard rooms prioritised
+    assert "Напівлюкс" in reply                      # secondary fallback still shown
+    assert reply.index("Стандарт") < reply.index("Напівлюкс")   # standard BEFORE Напівлюкс
 
 
-def test_finalize_quote_chosen_too_small_redirects_to_fitting():
-    # User chose Стандарт for 4 adults -> redirect to the room types that DO fit (Напівлюкс).
+def test_finalize_quote_chosen_too_small_redirects_to_standard_split():
+    # User chose Стандарт for 4 adults -> redirect offers the Стандарт SPLIT (owner priority),
+    # with Напівлюкс as the secondary option.
     avail = {"Стандарт": {"2026-07-06": 3, "2026-07-07": 3},
              "Напівлюкс": {"2026-07-06": 2, "2026-07-07": 2}}
     reply = de.finalize_quote(
         [{"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-07",
           "adults": 4, "children_ages": []}], avail)
-    assert "Напівлюкс" in reply and "Який тип номеру обираєте" in reply
+    assert "2 номери Стандарт" in reply and "Напівлюкс" in reply
+    assert "Який варіант обираєте" in reply
 
 
 def test_finalize_multiroom_one_over_capacity_keeps_others():
@@ -639,15 +663,40 @@ def test_nearest_window_any_respects_capacity():
     assert de.nearest_window_any(avail, "2026-07-05", 1)[0] == "2026-07-06"
 
 
-def test_finalize_quote_all_over_capacity_offers_fitting_nearest():
-    # 4 adults on 06-07: Стандарт free (too small) + Напівлюкс sold out -> offer the nearest
-    # NAPIVLUX window, never the free-but-too-small Стандарт dates.
+def test_finalize_quote_all_group_uses_standard_split_when_napivlux_soldout():
+    # 4 adults on 06-07: Напівлюкс sold out, but Стандарт has 2+ free -> the split now fits on
+    # the REQUESTED dates (owner priority), so we offer it rather than a nearest window.
     avail = {"Стандарт": {"2026-07-06": 3, "2026-07-07": 3},
              "Напівлюкс": {"2026-07-06": 0, "2026-07-07": 0,
                            "2026-07-10": 2, "2026-07-11": 2}}
     reply = de.finalize_quote_all(
         {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 4, "children_ages": []}, avail)
+    assert "2 номери Стандарт" in reply
+    assert "10 - 11" not in reply          # no nearest window needed — the split fits the dates
+
+
+def test_finalize_quote_all_group_no_split_available_offers_fitting_nearest():
+    # 4 adults, Стандарт has only ONE free room (can't split into 2) and Напівлюкс sold out on
+    # the dates -> fall back to the nearest FITTING window (Напівлюкс 10-11).
+    avail = {"Стандарт": {"2026-07-06": 1, "2026-07-07": 1},
+             "Напівлюкс": {"2026-07-06": 0, "2026-07-07": 0,
+                           "2026-07-10": 2, "2026-07-11": 2}}
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 4, "children_ages": []}, avail)
     assert "10 - 11 липня" in reply
+
+
+def test_finalize_soldout_crosssell_is_capacity_aware():
+    # Persona 15 live: a 4-adult room's chosen type (Напівлюкс) is sold out; the free Стандарт/
+    # Стандарт+ DON'T fit 4 -> never offer them. Fall through to the nearest FITTING window.
+    avail = {"Напівлюкс": {"2026-07-23": 0, "2026-07-24": 0, "2026-07-30": 2, "2026-07-31": 2},
+             "Стандарт": {"2026-07-23": 3, "2026-07-24": 3},
+             "Стандарт +": {"2026-07-23": 3, "2026-07-24": 3}}
+    reply = de.finalize_quote(
+        [{"room_type": "Напівлюкс", "checkin": "2026-07-23", "checkout": "2026-07-24",
+          "adults": 4, "children_ages": []}], avail)
+    assert "Стандарт" not in reply          # non-fitting types NOT offered for a 4-adult room
+    assert "30 - 31 липня" in reply         # nearest FITTING (Напівлюкс) window instead
 
 
 def test_finalize_ubd_soldout_nearest_appends_military():
@@ -692,12 +741,14 @@ def test_finalize_quote_all_ubd_soldout_appends_military():
     assert "найближче вільне віконце" in reply and templates.MILITARY in reply
 
 
-def test_finalize_quote_all_family_recommends_napivlux():
-    # Family of 4 (2 adults + 2 kids) -> prioritise Напівлюкс + offer the two-room split.
+def test_finalize_quote_all_family_recommends_standard_first():
+    # Owner rule 2026-07-06 (REVERSED): a family of 4 (2 adults + 2 kids) -> prioritise
+    # Стандарт/Стандарт+ (double bed + sofa); Напівлюкс is the LAST resort, not the pick.
     avail = {"Стандарт": {"2026-07-06": 3, "2026-07-07": 3},
              "Стандарт +": {"2026-07-06": 3, "2026-07-07": 3},
              "Напівлюкс": {"2026-07-06": 1, "2026-07-07": 1}}
     reply = de.finalize_quote_all(
         {"checkin": "2026-07-06", "checkout": "2026-07-08", "adults": 2, "children_ages": [8, 10]}, avail)
-    assert "Напівлюкс" in reply
-    assert "два окремі номери" in reply      # offers the roomier split alternative
+    assert "добре підійде Стандарт" in reply          # standard prioritised for the family
+    assert "два окремі номери" not in reply            # no longer the old Напівлюкс/split pitch
+    assert reply.index("Стандарт") < reply.index("Напівлюкс")   # standard listed BEFORE Напівлюкс

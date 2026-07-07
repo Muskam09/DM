@@ -241,6 +241,8 @@ _FAQ_OVERRIDE = [
     (["курит", "палит", "куріння", "паління"], "SMOKING"),
     (["фен", "фена", "феном"], "HAIRDRYER"),
     (["фото", "відео", "світлин", "знімк"], "MEDIA"),
+    (["що входить", "входить у вартість", "входить у ціну", "що включ", "включено у вартіст",
+      "що входе"], "INCLUDED_IN_THE_PRICE"),
 ]
 
 
@@ -312,6 +314,43 @@ _DISCOUNT_MARKERS = [
 _MILITARY_MARKERS = ["військ", "убд", "ветеран", "зсу", "всу", "боєц", "бійц", "атовц"]
 
 
+# A question about the monthly pricing POLICY / month-to-month comparison must be ANSWERED,
+# not swallowed by fuzzy-date extraction (owner Rule 4, 2026-07-06: the "В серпні актуальна,
+# як і на липень, цінова політика?" drop).
+def is_price_policy_question(text: str) -> bool:
+    """True for a question about whether prices differ by month / stay the same
+    ("цінова політика", "ціни такі самі як у липні", "в серпні так само?")."""
+    t = (text or "").lower()
+    if "цінова політ" in t or "ціновій політ" in t or "цінову політ" in t:
+        return True
+    if ("цін" in t or "вартіст" in t or "так само" in t) and any(
+            m in t for m in ["так сам", "такі сам", "ті сам", "однаков", "не змін", "змінюються",
+                             "відрізня", "як у лип", "як в лип", "як липень", "як і лип",
+                             "як у серп", "як в серп", "як червень", "як у червн"]):
+        return True
+    return False
+
+
+def asks_for_child_ages(text: str) -> bool:
+    """True if a bot message is asking for the children's ages (any of the age-question
+    templates). Used to insist firmly when the client ignores the ask (owner rule 2026-07-06)."""
+    t = (text or "").lower()
+    return "вік діт" in t or "вік дит" in t
+
+
+def has_child_of_unknown_age(slots) -> bool:
+    """True if any room has a child whose age is still UNKNOWN (children_count exceeds the
+    number of known ages). The ONLY situation where we insist on ages — the generic first-
+    contact prompts also say 'вік діток', but an adult-only booking must NOT trigger the
+    insist (owner Rule 3 guard, 2026-07-06 — caught live in Persona 7)."""
+    for r in (slots.get("rooms") or []):
+        cc = r.get("children_count")
+        cnt = cc if cc is not None else len(r.get("children_ages") or [])
+        if cnt > len(r.get("children_ages") or []):
+            return True
+    return False
+
+
 def is_discount_question(text: str) -> bool:
     """True for a GENERAL question about discounts / promotions ('чи є знижки?',
     'які у вас акції?'). Phrase-based to avoid hijacking a booking that only mentions
@@ -329,6 +368,19 @@ def mentions_pet(text: str) -> bool:
     """True if the dialogue mentions bringing a pet (so a quote can flag the +300 грн/night)."""
     t = (text or "").lower()
     return any(m in t for m in _PET_MARKERS)
+
+
+# Surcharge-specific words ONLY (доплата/доплачувати/приплата) so a normal booking that merely
+# mentions a pet ("з собакою, яка ВАРТІСТЬ Стандарт?") is NOT hijacked into a pet-fee answer.
+_PET_FEE_MARKERS = ["доплач", "доплат", "приплат", "доплатити"]
+
+
+def is_pet_surcharge_question(text: str) -> bool:
+    """True for a specific question about the pet FEE ("треба за собаку доплачувати?",
+    "чи є доплата за тваринку?") — answered concisely so it isn't swallowed by the verbose PETS
+    template's anti-dedup (owner Rule 4, 2026-07-06)."""
+    t = (text or "").lower()
+    return mentions_pet(t) and any(m in t for m in _PET_FEE_MARKERS)
 
 
 # --- pure thanks / goodbye (the bot must always have the last word) ----------
@@ -360,9 +412,13 @@ def faq_override(text: str):
     answer the question immediately instead of continuing slot collection."""
     if is_payment_rules_question(text):
         return "BOOK_ROOM"
+    if is_price_policy_question(text):
+        return "PRICE_POLICY"
     if is_location_question(text):
         return "PLACE"
     t = (text or "").lower()
+    if is_pet_surcharge_question(text):        # concise pet-fee answer (before the verbose PETS)
+        return "PET_SURCHARGE"
     if is_discount_question(text):
         # A military-specific discount question keeps the precise MILITARY answer; a general
         # "чи є знижки?" gets the DISCOUNTS overview (children + military + Instagram promos).

@@ -310,6 +310,19 @@ def _room_guests(room: Dict) -> int:
     return (room.get("adults") or 0) + _child_count(room)
 
 
+def _assign_fitting_type(room: Dict) -> Dict:
+    """Give a type-less room the smallest FITTING public type (Стандарт-first, owner Rule 1),
+    so a multi-room split ("2 номери: 4 і 3") quotes each room with a real, fitting type."""
+    adults = room.get("adults") or 0
+    ages = room.get("children_ages") or []
+    if adults == 0 and not ages:
+        adults = 2
+    for rt in OFFERABLE_ROOMS:                       # Стандарт, Стандарт +, Напівлюкс
+        if pricing_engine.fits_room(rt, adults, ages):
+            return {**room, "room_type": rt}
+    return {**room, "room_type": OFFERABLE_ROOMS[-1]}  # largest (Напівлюкс) fallback
+
+
 def _fuzzy_offseason(fuzzy: str) -> bool:
     t = (fuzzy or "").lower()
     return any(w in t for w in _OFFSEASON_WORDS)
@@ -552,6 +565,11 @@ def plan(slots: Dict) -> Dict:
         chosen = [r for r in dated if r.get("room_type")]
         if chosen:
             return {"action": "quote", "rooms": chosen}
+        if len(dated) > 1:
+            # Multi-room split WITHOUT chosen types (e.g. "2 номери: 4 і 3") — auto-assign the
+            # smallest FITTING type per room (Стандарт-first) and quote EVERY room, never just
+            # the first (owner Rule 1 fix, caught live in Persona 15).
+            return {"action": "quote", "rooms": [_assign_fitting_type(r) for r in dated]}
         return {"action": "quote_all", "spec": dated[0]}
 
     # Exact dates but guests unknown -> granular "missing guests".
@@ -647,7 +665,12 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
             # Case 4: other room types are still free on these dates -> offer them.
             # Case 5: nothing free at all -> offer to find the nearest free dates.
             free = bot_logic.free_room_types(simplified_availability, nights)
-            if free:  # Step 1: other categories free on the SAME dates -> cross-sell.
+            # Capacity-aware cross-sell (owner Rule 1 fix, caught live in Persona 15): only offer
+            # free types that PHYSICALLY hold this room's party — never suggest a Стандарт for a
+            # 4-adult room. If none of the free types fit, fall through to the nearest window.
+            free = [rt for rt in free
+                    if pricing_engine.fits_room(rt, r.get("adults") or 0, r.get("children_ages") or [])]
+            if free:  # Step 1: other FITTING categories free on the SAME dates -> cross-sell.
                 return _with_ubd_note(templates.ROOM_BOOKED
                                       .replace("{тип номеру}", room_type)
                                       .replace("{вільні_номери}", ", ".join(free)), ubd_booking)
@@ -700,10 +723,62 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
     return build_quote_reply(priced, ubd_booking)
 
 
-def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE) -> str:
-    """Exact dates but no chosen room -> price EVERY available room type (Fix 4).
+# Owner room-distribution priority (2026-07-06): Стандарт / Стандарт+ FIRST (the hotel has
+# far more of them); Напівлюкс is the secondary / family option. A group of 4+ adults is
+# offered several standard rooms; a small family gets a single Стандарт/Стандарт+.
+STANDARD_TYPES = ["Стандарт", "Стандарт +"]
 
-    Skips sold-out / unpriced types; if nothing is free -> SOLD_OUT_NEAREST.
+
+def _min_free_on_nights(availability: Dict, room_type: str, nights: List[str]) -> int:
+    """Fewest free rooms of `room_type` across every requested night (0 if absent)."""
+    key = bot_logic.match_availability_key(availability, room_type)
+    if not key or not nights:
+        return 0
+    avail = availability.get(key) or {}
+    return min((avail.get(d, 0) for d in nights), default=0)
+
+
+def _adult_split(adults: int, max_per: int = pricing_engine.STANDARD_MAX_ADULTS) -> List[int]:
+    """Split N adults across the fewest standard rooms, evenly (4 -> [2,2]; 5 -> [3,2])."""
+    rooms = max(1, -(-adults // max_per))          # ceil division
+    base, rem = divmod(adults, rooms)
+    return [base + (1 if i < rem else 0) for i in range(rooms)]
+
+
+def _standard_split_options(adults, children_ages, checkin, checkout, nights,
+                            availability, engine, ubd):
+    """Owner rule 2026-07-06: a group of 4+ adults is offered MULTIPLE Стандарт / Стандарт+
+    rooms FIRST (more inventory) rather than a single Напівлюкс. Returns
+    [(room_type, split_list, total_price), ...] for the standard types that both physically
+    fit each split room AND have enough free rooms on every night."""
+    if adults < 4 or children_ages:      # only pure-adult groups split into standard rooms
+        return []
+    split = _adult_split(adults)
+    n = len(split)
+    if n < 2:
+        return []
+    out = []
+    for rt in STANDARD_TYPES:
+        if any(not pricing_engine.fits_room(rt, a, []) for a in split):
+            continue
+        if _min_free_on_nights(availability, rt, nights) < n:
+            continue
+        try:
+            total = sum(engine.quote(rt, checkin, checkout,
+                                     pricing_engine.make_guests(adults=a)).total for a in split)
+        except (pricing_engine.OffSeasonError, KeyError, pricing_engine.OverCapacityError):
+            continue
+        if ubd:
+            total = pricing_engine.apply_military_discount(total)
+        out.append((rt, split, total))
+    return out
+
+
+def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE) -> str:
+    """Exact dates but no chosen room -> offer rooms by the owner's priority (2026-07-06):
+    Стандарт / Стандарт+ first (a group of 4+ adults gets several of them); Напівлюкс is the
+    secondary / family option. Skips sold-out / unpriced / over-capacity types; nothing free
+    -> nearest window or NEAREST_NONE.
     """
     checkin, checkout = spec.get("checkin"), spec.get("checkout")
     nights = pricing_engine.night_dates(checkin, checkout)
@@ -713,7 +788,8 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
         adults = 2
     ubd = bool(spec.get("ubd"))
 
-    lines = []
+    # Single-room options that FIT the party, in Стандарт-first order (Напівлюкс stays LAST).
+    single = []  # (room_type, price)
     for room_type in OFFERABLE_ROOMS:
         if bot_logic.is_room_available(simplified_availability, room_type, nights) == "sold_out":
             continue
@@ -723,12 +799,15 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
         except (pricing_engine.OffSeasonError, KeyError, pricing_engine.OverCapacityError):
             continue  # off-season / unknown / physically can't hold the party -> skip
         price = pricing_engine.apply_military_discount(quote.total) if ubd else quote.total
-        lines.append(f"{_ROOM_EMOJI.get(room_type, '•')} {room_type} — {price} грн")
+        single.append((room_type, price))
 
-    if not lines:
-        # Bug 2: everything sold out -> AUTO-propose the nearest free window (don't ask
-        # permission). Only fall back to NEAREST_NONE if nothing free in the whole window.
-        # УБД flagged -> append the MILITARY note so the veteran knows -20% still applies.
+    # Owner priority: a group of 4+ adults -> several Стандарт / Стандарт+ rooms FIRST.
+    splits = _standard_split_options(adults, children_ages, checkin, checkout, nights,
+                                     simplified_availability, engine, ubd)
+
+    if not single and not splits:
+        # Everything sold out -> AUTO-propose the nearest free window (don't ask permission);
+        # only NEAREST_NONE if nothing free in the whole window. УБД -> append MILITARY note.
         win = nearest_window_any(simplified_availability, checkin, len(nights),
                                  fit_adults=adults, fit_children=children_ages)
         if win:
@@ -736,23 +815,42 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
                 templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1])), ubd)
         return templates.NEAREST_NONE
 
-    header = (f"На дати {dates_phrase(checkin, checkout)} ({nights_phrase(len(nights))}) "
-              f"для {guests_phrase(adults, children_ages)} доступні такі номери:")
+    dates_ph = dates_phrase(checkin, checkout)
+    nights_ph = nights_phrase(len(nights))
+    guests_ph = guests_phrase(adults, children_ages)
 
-    # Family recommendation (owner rule 2026-06-23): for a family of 4-5 (with children),
-    # prioritise Напівлюкс, then offer two separate rooms as a roomier alternative.
+    if splits:
+        # Group of adults -> several standard rooms PRIMARY; a single Напівлюкс only as a
+        # secondary "roomier" option (owner rule 2026-07-06).
+        lines = [f"{_ROOM_EMOJI.get(rt, '•')} {room_count_phrase(len(split))} {rt} "
+                 f"(розподіл {' + '.join(str(a) for a in split)} дорослих) — {total} грн"
+                 for rt, split, total in splits]
+        napiv = next((p for (t, p) in single if pricing_engine._is_napivlux(t)), None)
+        fallback = (f"\nАбо один просторий Напівлюкс — {napiv} грн (радше для родини з дітьми)."
+                    if napiv is not None else "")
+        header = (f"На дати {dates_ph} ({nights_ph}) для {guests_ph} рекомендуємо кілька "
+                  f"окремих номерів (Стандартів у нас більше, ніж Напівлюксів):")
+        reply = header + "\n" + "\n".join(lines) + fallback + "\nЯкий варіант обираєте? 💙"
+        if ubd:
+            reply += "\n\n💚 Вказані ціни вже враховують знижку УБД -20%.\n\n" + templates.MILITARY
+        return reply
+
+    # Small party / family -> single-room listing, Стандарт/Стандарт+ first, Напівлюкс last.
+    lines = [f"{_ROOM_EMOJI.get(rt, '•')} {rt} — {price} грн" for (rt, price) in single]
+    header = f"На дати {dates_ph} ({nights_ph}) для {guests_ph} доступні такі номери:"
+
+    # Family recommendation (owner rule 2026-07-06, REVERSED from the old Напівлюкс-first):
+    # for a family with children, prioritise Стандарт / Стандарт+ (double bed + sofa);
+    # Напівлюкс is the roomier LAST resort.
     family_note = ""
-    if (adults + len(children_ages)) >= 4 and children_ages:
-        if any("Напівлюкс" in ln for ln in lines):
-            family_note = ("\n💡 Для родини найзручніший Напівлюкс. За бажанням можемо також "
-                           "запропонувати два окремі номери — буде ще просторіше.")
-        else:
-            family_note = ("\n💡 Для вашої родини комфортно підійдуть два окремі номери — "
-                           "підкажіть, і я підберу варіанти.")
+    if children_ages and any(t in ("Стандарт", "Стандарт +") for (t, _) in single):
+        family_note = ("\n💡 Для вашої компанії добре підійде Стандарт або Стандарт+ "
+                       "(з диваном/додатковим ліжком для діток). Напівлюкс — просторіший "
+                       "варіант, якщо забажаєте.")
 
     reply = header + "\n" + "\n".join(lines) + family_note + "\nЯкий тип номеру обираєте? 💙"
     if ubd:
-        reply += "\n\n" + templates.MILITARY
+        reply += "\n\n💚 Вказані ціни вже враховують знижку УБД -20%.\n\n" + templates.MILITARY
     return reply
 
 
