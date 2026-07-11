@@ -326,6 +326,87 @@ def test_collapse_duplicate_group_rooms_date_choice():
     assert bot_logic.slots_total_guests({"rooms": out}) == 10   # not the doubled 20
 
 
+def test_label_kill_switch_mutes_on_pozncheno_or_zamovleno():
+    # Owner Sprint 5: BOTH "Позначено" and "Замовлено" are a HARD STOP (bot halts, no LLM, no reply).
+    assert bot_logic.is_muted(["Позначено"]) is True
+    assert bot_logic.is_muted(["Замовлено"]) is True
+    assert bot_logic.is_muted(["Instagram", "Позначено"]) is True
+    assert bot_logic.is_muted(["Instagram"]) is False
+    assert bot_logic.is_muted([]) is False
+
+
+# --- Bug 2 (Sprint 5): vague/nights-range guards ----------------------------------------------
+@pytest.mark.parametrize("text,vague", [
+    ("Ще є вільні місця у липні", True),
+    ("чи є вільні номери?", True),
+    ("маєте щось вільне на серпень?", True),
+    ("На 5 ночей з 19", False),
+    ("24-26.07.26", False),
+])
+def test_is_vague_availability_probe(text, vague):
+    assert bot_logic.is_vague_availability_probe(text) is vague
+
+
+@pytest.mark.parametrize("text,rng", [
+    ("Днів 4-5", True), ("на 3-5 діб", True), ("4-5 ночей", True),
+    ("на 5 ночей", False), ("24-26.07", False), ("19-24 липня", False),
+])
+def test_mentions_nights_range(text, rng):
+    assert bot_logic.mentions_nights_range(text) is rng
+
+
+@pytest.mark.parametrize("text,committed", [
+    ("На 5 ночей з 19", True),         # explicit single nights
+    ("з 19 по 24 липня", True),        # з N по N
+    ("24-26.07", True),                # date range (not adjacent to a nights word)
+    ("17-19 липня", True),
+    ("Днів 4-5", False),               # nights range -> NOT committed
+    ("Бажано з 15.07", False),         # check-in only
+    ("Ще є вільні місця у липні", False),
+])
+def test_has_committed_stay(text, committed):
+    assert bot_logic.has_committed_stay(text) is committed
+
+
+# --- Bug 1 (Sprint 5): real bed-config availability -------------------------------------------
+def _raw_bed(sample):
+    return {cat: {"total_available": ta, "rooms": {}} for cat, ta in sample.items()}
+
+
+def test_bed_config_availability_from_raw():
+    nights = ["2026-07-24", "2026-07-25"]
+    # twin (2Л+Д) free both nights -> separate True; a double (Напівлюкс) free -> double True.
+    raw = _raw_bed({
+        "Стандарт 4х 2Л + Д": {"2026-07-24": 1, "2026-07-25": 2},
+        "Стандарт": {"2026-07-24": 0, "2026-07-25": 0},
+        "Стандарт +": {"2026-07-24": 0, "2026-07-25": 0},
+        "Напівлюкс": {"2026-07-24": 1, "2026-07-25": 1},
+        "Стандарт сімейний В+Д": {"2026-07-24": 0, "2026-07-25": 0},
+        "Стандарт + Сімейний В+Д": {"2026-07-24": 0, "2026-07-25": 0},
+    })
+    assert bot_logic.bed_config_availability(raw, nights) == {"separate": True, "double": True}
+    # a booked night in the ONLY twin room -> separate False; double still free.
+    raw2 = _raw_bed({
+        "Стандарт 4х 2Л + Д": {"2026-07-24": 1, "2026-07-25": 0},   # night 25 booked
+        "Стандарт": {"2026-07-24": 0, "2026-07-25": 0},
+        "Стандарт +": {"2026-07-24": 0, "2026-07-25": 0},
+        "Стандарт сімейний В+Д": {"2026-07-24": 2, "2026-07-25": 2},
+    })
+    assert bot_logic.bed_config_availability(raw2, nights) == {"separate": False, "double": True}
+
+
+def test_bed_availability_reply_variants():
+    import dialogue_engine as de
+    both = _raw_bed({"Стандарт 4х 2Л + Д": {"2026-07-24": 1, "2026-07-25": 1},
+                     "Напівлюкс": {"2026-07-24": 1, "2026-07-25": 1}})
+    r = de.bed_availability_reply("2026-07-24", "2026-07-26", both)
+    assert "24 - 26 липня" in r and "роздільними" in r and "двоспальним" in r
+    assert templates.BED_AVAIL_BOTH.split("{dates}")[0] in r     # the "both available" template
+    none = _raw_bed({"Стандарт 4х 2Л + Д": {"2026-07-24": 0, "2026-07-25": 0}})
+    r2 = de.bed_availability_reply("2026-07-24", "2026-07-26", none)
+    assert "вже немає" in r2
+
+
 def test_normalize_rooms_for_total_distributes_adults():
     # Persona 25: "2 номери для 4-х дорослих" — the extractor put 4 adults in EACH room (8 total).
     # Redistribute 4 adults across 2 rooms -> [2, 2], so no bogus 8-adult over-capacity split.
@@ -348,6 +429,30 @@ def test_normalize_rooms_for_total_noop_when_correct_or_absent():
     # A family request (children present) is never redistributed.
     fam = [{"adults": 2, "children_ages": [8]}, {"adults": 2, "children_ages": [8]}]
     assert bot_logic.normalize_rooms_for_total(fam, "2 номери для 4 дорослих") == fam
+
+
+def test_normalize_rooms_for_total_generalized_separate_messages():
+    # Bug 3 (Sprint 5): "2 номери Стандарт" + "Четверо дорослих" stated in SEPARATE client messages,
+    # extractor drifted to 4 adults per room (8 total) -> redistribute to [2, 2] (number word "четверо").
+    drift = [{"room_type": "Стандарт", "adults": 4, "children_ages": []},
+             {"room_type": "Стандарт", "adults": 4, "children_ages": []}]
+    out = bot_logic.normalize_rooms_for_total(drift, "Давайте 2 номери Стандарт\nЧетверо дорослих")
+    assert [r["adults"] for r in out] == [2, 2]
+    assert all(r["room_type"] == "Стандарт" for r in out)   # chosen type preserved
+    # Also fixes a 1-room extraction of 4 adults when the client asked for 2 rooms.
+    one = [{"adults": 4, "children_ages": []}]
+    assert [r["adults"] for r in bot_logic.normalize_rooms_for_total(one, "два номери на чотирьох")] == [2, 2]
+
+
+def test_normalize_rooms_for_total_respects_explicit_per_room_split():
+    # An EXPLICIT per-room breakdown ("в одному 4, в іншому 3") must be respected, not evened out.
+    split = [{"adults": 4, "children_ages": []}, {"adults": 3, "children_ages": []}]
+    assert bot_logic.normalize_rooms_for_total(
+        split, "Давайте 2 номери: в одному 4, в іншому 3") == split
+    # A DATE "з 13 по 17 липня" must NOT be mistaken for a per-room split ("по 17"): still normalizes.
+    drift = [{"adults": 4, "children_ages": []}, {"adults": 4, "children_ages": []}]
+    out = bot_logic.normalize_rooms_for_total(drift, "2 номери для 4 дорослих з 13 по 17 липня")
+    assert [r["adults"] for r in out] == [2, 2]
 
 
 def test_collapse_leaves_real_multiroom_untouched():

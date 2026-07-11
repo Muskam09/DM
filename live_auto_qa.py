@@ -313,7 +313,9 @@ PERSONAS = {
          ("military/УБД discount handled", has("20%", "убд", "військов")),
          ("no removed «Стандартів більше» aside (#266)", lacks("стандартів у нас більше")),
          ("EXACT food cost computed: (1100*4*2)+(350*4*1)=10200", has("10200")),
-         ("menu (dishes) question answered", has("узгоджуються по заїзду"))]),
+         ("menu (dishes) question answered", has("узгоджуються по заїзду")),
+         # Bug 3 (Sprint 5): the food/menu turn must NOT leak a ROOM_TOO_SMALL capacity error.
+         ("no ROOM_TOO_SMALL flip-flop leak (Bug 3)", lacks("обраний розподіл не вміщується"))]),
 
     # 3: ("3️⃣ Двоє дітей, нечіткі дати (кінець серпня)",  # PASSED
     #     ["Доброго дня.", "Двоє дорослих і двоє дітей.", "Яка вартість, і вільні дати?",
@@ -416,15 +418,16 @@ PERSONAS = {
     #      ["Доброго дня! Цікавить ціна, але дати ще не можу сказати", "Для двох дорослих"],
     #      DRIP_DEFAULT, [("proactive scan", has("вільні віконця", "перевірив календар"))]),
 
-    15: ("🧪 6+ split: 7 дорослих → 4 і 3 → valid re-split → ACCEPT → quote (fix #282-284)",
-         ["Доброго дня! На 23-24 липня, нас 7 дорослих",
-          "Давайте 2 номери: в одному 4, в іншому 3",
-          "Добре, порахуйте, будь ласка, вартість"],
-         DRIP_DEFAULT,
-         [("explains max 3 adults per room (#282-284)", has("максимум 3 дорослих")),
-          ("suggests enough rooms (3) with a valid distribution", has("3 номери")),
-          ("shows the 2 + 2 + 3 distribution", has("2 + 2 + 3")),
-          ("after ACCEPT -> quotes the split rooms (owner #15)", has("буде вартувати", "загальна вартість"))]),
+    # 15: PASSED (owner Sprint 5) — commented out, kept for re-runs. (6+ split accept -> quote)
+    # 15: ("🧪 6+ split: 7 дорослих → 4 і 3 → valid re-split → ACCEPT → quote (fix #282-284)",
+    #      ["Доброго дня! На 23-24 липня, нас 7 дорослих",
+    #       "Давайте 2 номери: в одному 4, в іншому 3",
+    #       "Добре, порахуйте, будь ласка, вартість"],
+    #      DRIP_DEFAULT,
+    #      [("explains max 3 adults per room (#282-284)", has("максимум 3 дорослих")),
+    #       ("suggests enough rooms (3) with a valid distribution", has("3 номери")),
+    #       ("shows the 2 + 2 + 3 distribution", has("2 + 2 + 3")),
+    #       ("after ACCEPT -> quotes the split rooms (owner #15)", has("буде вартувати", "загальна вартість"))]),
 
     # 16: ("🧪 УБД on a sold-out window → note kept",  # PASSED
     #      ["Доброго дня! Стандарт на 6-8 липня, двоє дорослих, я УБД"],
@@ -530,9 +533,13 @@ PERSONAS = {
          [("quotes a Стандарт-class room for the 2-room, 4-adult booking", has("стандарт")),
           ("gives a real price / aggregate (2 rooms)",
            has("грн", "загальна вартість", "2 номери", "за 2 номери")),
-          ("answers the twin/double bed question (BED_CONFIG)", has("ліжк")),
-          ("does NOT invent a hard per-date bed guarantee / no hallucination",
-           lacks("гарантуємо саме", "точно буде"))]),
+          # Bug 1 (Sprint 5): the bed answer is based on REAL availability ON THE DATES, not the
+          # generic "підберемо при бронюванні" template.
+          ("answers beds from REAL availability on the dates", has("на дати")),
+          ("names both bed configs (separate + double)",
+           lambda t: "роздільн" in t and "двоспальн" in t),
+          ("NOT the generic lazy bed template (Bug 1)",
+           lacks("підтвердимо доступність на ваші дати при бронюванні"))]),
 
     26: ("2️⃣6️⃣ Scattered NLP stress client (3 дор, pool/address/food, 15-24.07)",
          ["Добрий день яка вартість номеру на трьох дорослих",
@@ -563,24 +570,28 @@ PERSONAS = {
          [("pool 'included in price' answered", has("басейн", "входить у вартість")),
           ("address answered", has("стаїще", "верховин", "карпат", "maps")),
           ("food answered", has("сніданок", "350", "харчуванн")),
-          ("included-in-price / Стандарт+ amenities answered", has("холодильник", "балкон", "входить")),
-          ("gives a coherent price", has("грн")),
-          ("survives the chaos — warm close, never silent on 'Дякую'",
-           has("гарного дня", "будемо раді", "раді допомогти", "дякуємо"))]),
+          # Bug 2 (Sprint 5): NEVER claim "booked" before exact dates — push the client to clarify.
+          ("pushes for exact dates before quoting (Bug 2)",
+           has("які дати вас цікавлять", "точні дати", "на який термін")),
+          # owner 2026-07-11: A/C answered as NO air conditioners (never hallucinated).
+          ("A/C answered — no air conditioners", lambda t: "кондиціонер" in t and "немає" in t),
+          ("gives a coherent price once dates are committed", has("грн")),
+          ("warm close on 'Дякую'", has("гарного дня", "будемо раді", "раді допомогти", "дякуємо"))]),
 
-    27: ("2️⃣7️⃣ Cottage → no cottage, pivot to room split (5 дор + 2 діти, 1-11 серпня)",
-         ["Добрий день цікавить котедж на 7 чоловік , 5 дорослих і 2 дітей",
-          "які є варіанти з 1 го по 11 серпня, дякую"],
-         DRIP_DEFAULT,
-         [("acknowledges there is NO cottage (we are a hotel)", has("котедж", "готель")),
-          ("offers the real room types instead", has("стандарт", "напівлюкс")),
-          ("handles the 7-person group (asks distribution / proposes split)",
-           has("розсел", "розподіл", "як вас краще", "оптимальні номери")),
-          ("no bogus single-room quote for 7 people",
-           lambda t: "буде вартувати" not in t or "загальна вартість" in t)]),
+    # 27: PASSED (owner Sprint 5) — commented out, kept for re-runs. (cottage -> rooms)
+    # 27: ("2️⃣7️⃣ Cottage → no cottage, pivot to room split (5 дор + 2 діти, 1-11 серпня)",
+    #      ["Добрий день цікавить котедж на 7 чоловік , 5 дорослих і 2 дітей",
+    #       "які є варіанти з 1 го по 11 серпня, дякую"],
+    #      DRIP_DEFAULT,
+    #      [("acknowledges there is NO cottage (we are a hotel)", has("котедж", "готель")),
+    #       ("offers the real room types instead", has("стандарт", "напівлюкс")),
+    #       ("handles the 7-person group (asks distribution / proposes split)",
+    #        has("розсел", "розподіл", "як вас краще", "оптимальні номери")),
+    #       ("no bogus single-room quote for 7 people",
+    #        lambda t: "буде вартувати" not in t or "загальна вартість" in t)]),
 }
 
-DEFAULT_SET = [2, 15, 21, 23, 25, 26, 27]
+DEFAULT_SET = [2, 21, 23, 25, 26]
 
 
 # --------------------------------------------------------------------------- #

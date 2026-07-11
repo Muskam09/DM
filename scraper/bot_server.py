@@ -216,7 +216,8 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
   • НЕЧІТКИЙ період ("початок серпня", "друга половина липня", "у серпні", "влітку", "кінець місяця", "після 6 серпня") => fuzzy_date="<текст періоду клієнта>", checkin=null, checkout=null.
   • НЕ підставляй "перше число місяця" як checkin для нечітких періодів — став fuzzy_date.
   • ДЕКІЛЬКА ПЕРІОДІВ/МІСЯЦІВ в одному запиті ("друга половина липня або після 6 серпня", "липень чи серпень", "у липні і серпні") => збережи ВЕСЬ текст періоду у fuzzy_date разом з усіма місяцями (НЕ відкидай другий місяць!). Python сам просканує КОЖЕН названий місяць.
-- nights — кількість ночей, ЛИШЕ якщо названо ОДНЕ чітке число ("на 3 ночі"=3, "тиждень"=7, "на 5 діб"=5, "2 ночі"=2). ДІАПАЗОН ("3-5 діб", "на 3-4 ночі") або невідомо => nights=null. Для точних дат nights можна лишити null (порахується з checkin/checkout).
+- nights — кількість ночей, ЛИШЕ якщо названо ОДНЕ чітке число ("на 3 ночі"=3, "тиждень"=7, "на 5 діб"=5, "2 ночі"=2). ДІАПАЗОН ("3-5 діб", "на 3-4 ночі", "днів 4-5") або невідомо => nights=null. Для точних дат nights можна лишити null (порахується з checkin/checkout).
+  ⚠ ДЛЯ ДІАПАЗОНУ НОЧЕЙ ("днів 4-5", "3-5 діб") НЕ обчислюй і НЕ вигадуй checkout — залиш checkout=null (клієнт ще не визначився з тривалістю). Так само для запитань "чи є вільні місця", "ще є місця у липні" БЕЗ точних чисел заїзду/виїзду — checkin=checkout=null (лише fuzzy_date, якщо названо місяць). Обчислюй checkout ТІЛЬКИ з чіткого одного числа ночей або явного діапазону дат.
 - adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" / "за трьох" / "на трьох" / "для трьох" / "трьох" => adults=3; "четверо" / "за чотирьох" => 4; одна особа => 1. Якщо клієнт лише УТОЧНЮЄ "дорослі всі" / "всі дорослі" / "дорослі" — кількість дорослих БЕРИ з попередніх повідомлень (напр., раніше "за трьох" => adults=3) і НЕ скидай у 0.
 - РОДИННІ СЛОВА → ГОСТІ: «батьки» / «мої батьки» = 2 дорослих; додай СЕБЕ, якщо клієнт каже «я»/«ми» («мої батьки, я та …» = 2+1 = adults=3); «чоловік»/«дружина»/«мама»/«тато»/«брат»/«сестра» — кожен = 1 дорослий. ДІТИ: «син»/«сина»/«синів»/«донька»/«доньки»/«дитина»/«діти»/«малюк»/«онук» = ДІТИ (children_count), а НЕ дорослі; якщо вік не названо — children_ages=[] (бот запитає вік). Приклад: «Мої батьки, я та мої 2 сина» => adults=3, children_count=2, children_ages=[].
 - children_count — ЗАГАЛЬНА кількість дітей (навіть якщо вік невідомий). children_ages — лише ВІДОМІ віки (цілі), вік не вигадуй.
@@ -416,11 +417,15 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         bot_has_spoken = True
 
     dialogue_history = ""
+    client_history = ""            # CLIENT-side messages only (for deterministic count/date parsing)
     for msg in raw_history:
         content = msg.get("content")
         if content:
-            author = "Клієнт" if msg.get("message_type") in ["incoming", 0] else "Бот"
+            is_client = msg.get("message_type") in ["incoming", 0]
+            author = "Клієнт" if is_client else "Бот"
             dialogue_history += f"{author}: {content}\n"
+            if is_client:
+                client_history += f"{content}\n"
 
     print(f"\n[+] Обробка повідомлення: {user_message}")
 
@@ -474,7 +479,7 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     # the LLM's date-CHOICE duplication (e.g. "15 чи 16 липня" -> two rooms EACH holding the whole
     # 10-person party). Both run BEFORE the merge/large-group count so a party isn't inflated.
     slots["rooms"] = bot_logic.normalize_rooms_for_total(
-        slots.get("rooms") or [], f"{dialogue_history}\n{user_message}")
+        slots.get("rooms") or [], f"{client_history}\n{user_message}")
     slots["rooms"] = bot_logic.collapse_duplicate_group_rooms(slots.get("rooms") or [])
 
     prev_mem = _slot_memory.get(conversation_id)
@@ -494,6 +499,14 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                 if parsed.get("checkout"):
                     _r["checkout"] = parsed["checkout"]
             print(f"[i] {conversation_id}: LLM dropped the date -> deterministic parse {parsed}")
+
+    # Bug 2 (owner Sprint 5): a nights-RANGE this turn ("Днів 4-5") is NOT a committed stay length —
+    # strip any (LLM-picked) single nights AND a checkout NOT backed by an explicit checkout date, so
+    # the bot asks for exact dates instead of quoting a guessed stay.
+    if bot_logic.mentions_nights_range(user_message) and not bot_logic.has_committed_stay(user_message):
+        for _r in merged_rooms:
+            _r["nights"] = None
+            _r["checkout"] = None
 
     # Derive a concrete check-out from check-in + the remembered nights (a "дві доби" group that then
     # says "15 липня" -> checkout 17), so the dated split re-proposal differs from the first one.
@@ -634,9 +647,41 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             if meals_reply:
                 _meals_key_to_store = _mkey
 
+    # Bug 1 (owner Sprint 5): a bed-config question WITH known dates is answered from REAL availability
+    # (raw per-sub-type scrape), not the generic template — is a separate-bed room AND a double-bed
+    # room actually free on those dates?
     reply = route_simple_topic(slots)
+    if slots.get("faq_template") == "BED_CONFIG":
+        _bd = bot_logic._shared_booking_dates(slots.get("rooms") or [])
+        _bci, _bco = _bd.get("checkin"), _bd.get("checkout")
+        if _bci and _bco:
+            _cached = peek_cached_availability(conversation_id)
+            _raw = _cached if _cached is not None else await get_hotel_data_cached(conversation_id)
+            # Only answer from availability when the scrape is VALID (has real categories, no error);
+            # otherwise keep the generic BED_CONFIG template.
+            _raw_ok = isinstance(_raw, dict) and "error" not in _raw and any(
+                isinstance(v, dict) and v.get("total_available") for v in _raw.values())
+            if _raw_ok and not _superseded(conversation_id, seq):
+                reply = dialogue_engine.bed_availability_reply(_bci, _bco, _raw)
+                # keep is_faq_reply=True so BED_CONFIG stays in answered_faqs (the burst loop must NOT
+                # re-emit the generic bed template); the FAQ re-render combo only re-quotes (deduped).
+                print(f"[i] {conversation_id}: bed-config with dates -> real availability answer")
+
     if reply is None:
         decision = dialogue_engine.plan(slots)
+        # Bug 2 (owner Sprint 5): NEVER scrape / claim "booked" without a COMMITTED, explicit stay. A
+        # vague probe ("ще є вільні місця") or a lingering nights-RANGE ("Днів 4-5") is not bookable ->
+        # ask for exact dates rather than quoting / claiming sold-out on guessed dates.
+        if decision.get("action") in ("quote", "quote_all"):
+            _full = f"{client_history} {user_message}"
+            _prim = next((r for r in (slots.get("rooms") or []) if r.get("checkin")),
+                         (slots.get("rooms") or [{}])[0])
+            _committed = ((isinstance(_prim.get("nights"), int) and _prim["nights"] > 0)
+                          or bot_logic.has_committed_stay(_full))
+            if (bot_logic.mentions_nights_range(_full)
+                    or bot_logic.is_vague_availability_probe(_full)) and not _committed:
+                decision = {"action": "reply", "reply": templates.QUESTION_ONLY_DATES}
+                print(f"[i] {conversation_id}: vague/nights-range without a committed stay -> ask exact dates (Bug 2)")
         # Remember a PROPOSED split so the client's "так, порахуйте" can materialise & quote it.
         if decision.get("split_counts"):
             _rooms = slots.get("rooms") or []
@@ -812,7 +857,7 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         if d2.get("action") in _SCRAPE_ACTIONS:
             reply = reply.replace(templates.FAQ_CONTINUE_NUDGE, "")  # real result, not the nudge
             try:
-                await _emit(reply)                  # 1) answer the FAQ first
+                await _emit(reply)                  # 1) answer the FAQ first (greeting prepended)
             except Exception as e:
                 print(f"[-] Помилка надсилання (FAQ): {e}")
             reply = None                            # already sent above
@@ -821,11 +866,18 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                                  else await get_hotel_data_cached(conversation_id))
             if availability_data and not _superseded(conversation_id, seq):
                 simplified = bot_logic.build_simplified_availability(availability_data)
-                booking_extra = build_booking_reply(d2, simplified)
-                if bot_logic.is_window_offer_message(booking_extra or ""):
-                    win = dialogue_engine.offered_window(d2, simplified)
-                    if win:
-                        _pending_window[conversation_id] = win
+                _candidate = build_booking_reply(d2, simplified)
+                # Bug 3 (owner Sprint 5): after an FAQ, resurface ONLY a POSITIVE booking result (a
+                # quote or a free-window offer) — NEVER a capacity error / ROOM_TOO_SMALL / split
+                # suggestion. So a menu/food question can't re-trigger a bogus room-too-small (which
+                # also duplicated the room-info block). If it isn't positive, the plain FAQ stands.
+                if _candidate and (bot_logic.is_quote_message(_candidate)
+                                   or bot_logic.is_window_offer_message(_candidate)):
+                    booking_extra = _candidate
+                    if bot_logic.is_window_offer_message(booking_extra):
+                        win = dialogue_engine.offered_window(d2, simplified)
+                        if win:
+                            _pending_window[conversation_id] = win
 
     try:
         if meals_reply:                     # deterministic food cost, before the booking status

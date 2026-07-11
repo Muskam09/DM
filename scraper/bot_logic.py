@@ -486,35 +486,150 @@ def parse_date_request(text, year: int = _DATE_YEAR):
     return None
 
 
-# "N номери для M дорослих" — N rooms for M adults TOTAL. The extractor sometimes reads M as a
-# PER-ROOM count and puts M adults in EACH of the N rooms (N*M total), which then triggers a bogus
-# over-capacity split ("2 номери для 4-х" -> 8 adults -> "split into 3 rooms"). Distribute deterministically.
-_ROOMS_FOR_COUNT_RE = re.compile(
-    r"(\d+)\s*(?:номер\w*|кімнат\w*)\s+(?:для|на)\s+(\d+)[\s\-–]*(?:х|ти|ьох|ох|и)?\s*"
-    r"(?:дорослих|дорослі|осіб|особ|гостей|людей|чол)", re.IGNORECASE)
+# --- multi-room total-vs-per-room stabiliser (Bug 3, owner Sprint 5) --------------------------
+# The extractor flip-flops between "2 Стандарт for 4 adults TOTAL" (2+2) and "4 adults per room"
+# (4+4=8), which trips a bogus over-capacity ROOM_TOO_SMALL. Deterministically parse the stated
+# ROOMS count and the stated TOTAL adults (digits OR Ukrainian number words) and redistribute.
+_NUM_WORD = {
+    "один": 1, "одного": 1, "одна": 1, "одному": 1,
+    "два": 2, "дві": 2, "двох": 2, "двоє": 2, "двома": 2, "вдвох": 2,
+    "три": 3, "трьох": 3, "троє": 3, "трьома": 3, "втрьох": 3,
+    "чотири": 4, "чотирьох": 4, "четверо": 4, "чотирма": 4, "вчотирьох": 4,
+    "п'ять": 5, "пять": 5, "п’ять": 5, "п'ятьох": 5, "пятьох": 5, "п'ятеро": 5, "пятеро": 5,
+    "шість": 6, "шести": 6, "шістьох": 6, "шестеро": 6,
+    "сім": 7, "семи": 7, "сімох": 7, "семеро": 7,
+}
+_NUM_ALT = "|".join(sorted((re.escape(w) for w in _NUM_WORD), key=len, reverse=True))
+_ROOMS_COUNT_RE = re.compile(r"(\d+|" + _NUM_ALT + r")\s*(?:номер\w*|кімнат\w*)", re.IGNORECASE)
+_ADULTS_TOTAL_RE = re.compile(
+    r"(\d+|" + _NUM_ALT + r")[\s\-–—]*(?:х|ти|ьох|ох|и)?\s*(?:дорослих|дорослі|осіб|особи|людей|гост)",
+    re.IGNORECASE)
+_ADULTS_FOR_RE = re.compile(r"\bна\s+(\d+|двох|трьох|чотирьох|п'ятьох|пятьох|шістьох|сімох)", re.IGNORECASE)
+# An EXPLICIT per-room breakdown ("в одному 4, в іншому 3", "2 номери: 3 і 2", "по 4 в кожному") must
+# be respected verbatim — never redistributed. ("по" is gated to "по N осіб/в кожному" so a DATE like
+# "з 13 по 17 липня" is not mistaken for a per-room split.)
+_PER_ROOM_SPLIT_RE = re.compile(
+    r"в одному\s*\d|в іншому\s*\d|в другому\s*\d|в першому\s*\d"
+    r"|по\s*\d+\s*(?:в кожн|особ|дорослих|осіб|гост)"
+    r"|номер\w*\s*[:—\-]\s*\d+\s*(?:і|та|,)\s*\d+",
+    re.IGNORECASE)
+
+
+def _int_token(tok):
+    tok = (tok or "").strip().lower()
+    return int(tok) if tok.isdigit() else _NUM_WORD.get(tok)
+
+
+def _explicit_rooms_count(text):
+    m = _ROOMS_COUNT_RE.search(text or "")
+    return _int_token(m.group(1)) if m else None
+
+
+def _explicit_adults_total(text):
+    m = _ADULTS_TOTAL_RE.search(text or "")
+    if m:
+        return _int_token(m.group(1))
+    m2 = _ADULTS_FOR_RE.search(text or "")
+    return _int_token(m2.group(1)) if m2 else None
 
 
 def normalize_rooms_for_total(rooms, text):
-    """When the client says "N номери для M дорослих" (M adults TOTAL across N rooms) but the
-    extractor put M adults in EACH of the N rooms, redistribute the M adults evenly across N rooms.
-    Fires ONLY for a pure-adult request (no children) with an explicit "N rooms for M people" phrase,
-    so a real per-room breakdown is never touched."""
-    m = _ROOMS_FOR_COUNT_RE.search(text or "")
-    if not m:
-        return rooms
-    n_rooms, total = int(m.group(1)), int(m.group(2))
+    """Stabilise "N rooms for M adults TOTAL". Reads an explicit ROOMS count ("2 номери", "два
+    номери") and an explicit TOTAL adults ("4 дорослих", "четверо", "на чотирьох") from `text` and
+    rebuilds exactly N pure-adult rooms summing to M. Fires ONLY when: no children, no explicit
+    per-room breakdown, N>=2, M>=N, and the current rooms don't already equal (N rooms summing to M).
+    So a real per-room split ("в одному 4, в іншому 3") and family bookings are never touched.
+    Pass CLIENT-side text only (never bot messages — PRESENTATION_ROOMS mentions "3 дорослих")."""
     rooms = [r for r in (rooms or []) if isinstance(r, dict)]
-    if not (1 < n_rooms <= 8) or total < n_rooms:
-        return rooms                        # need 2+ rooms and at least one adult per room
+    if _PER_ROOM_SPLIT_RE.search(text or ""):
+        return rooms
+    n_rooms = _explicit_rooms_count(text)
+    total = _explicit_adults_total(text)
+    if not n_rooms or not total or n_rooms < 2 or n_rooms > 8 or total < n_rooms:
+        return rooms
     if any(r.get("children_ages") or r.get("children_count") for r in rooms):
-        return rooms                        # families carry per-room composition -> leave it
+        return rooms
     if len(rooms) == n_rooms and sum((r.get("adults") or 0) for r in rooms) == total:
-        return rooms                        # already EXACTLY N rooms summing to M -> correct
+        return rooms
     base = rooms[0] if rooms else {}
     shared = {k: base.get(k) for k in ("checkin", "checkout", "nights", "fuzzy_date", "ubd")}
+    rt = base.get("room_type")
     per = [total // n_rooms + (1 if i < total % n_rooms else 0) for i in range(n_rooms)]
-    return [{**shared, "room_type": None, "adults": a, "children_count": 0, "children_ages": []}
+    return [{**shared, "room_type": rt, "adults": a, "children_count": 0, "children_ages": []}
             for a in per]
+
+
+# --- Bug 2 (owner Sprint 5): never scrape / claim "booked" without a COMPLETE, explicit stay ----
+# A vague availability probe ("чи є вільні місця", "ще є місця") or a nights-RANGE ("днів 4-5") is
+# NOT a bookable stay — the bot must ask for exact dates / offer windows, never claim "booked".
+_VAGUE_PROBE_MARKERS = [
+    "чи є вільн", "ще є вільн", "є вільні місц", "є вільне місц", "є вільні номер", "є вільний номер",
+    "є місця", "є місце", "чи є місц", "маєте вільн", "маєте щось", "щось вільн", "є щось вільн",
+    "залишились вільн", "залишилися вільн", "чи є щось", "чи вільн",
+]
+_NIGHTS_RANGE_RE = re.compile(
+    r"\b\d{1,2}\s*[-–—]\s*\d{1,2}\s*(?:дн|діб|доб|ноч|ніч)|(?:дн\w*|діб|доб|ноч\w*|ніч)\w*\s*\d{1,2}\s*[-–—]\s*\d{1,2}",
+    re.IGNORECASE)
+
+
+def is_vague_availability_probe(text: str) -> bool:
+    """True for a vague "is there availability?" probe with no committed exact dates."""
+    t = (text or "").lower()
+    return any(m in t for m in _VAGUE_PROBE_MARKERS)
+
+
+def mentions_nights_range(text: str) -> bool:
+    """True when the client's stay length is a RANGE ("днів 4-5", "3-5 діб") — not a definite stay."""
+    return bool(_NIGHTS_RANGE_RE.search(text or ""))
+
+
+def has_committed_stay(text: str) -> bool:
+    """True when the client committed a DEFINITE stay somewhere in `text`: 'з N по N', an explicit
+    DATE range ("24-26.07", "17-19 липня" — a "N-M" NOT adjacent to a nights word), OR an explicit
+    single nights ("на 5 ночей"). A lingering nights-RANGE ("Днів 4-5") does NOT count (owner Sprint 5,
+    Bug 2). This is text-only; the caller also treats a single integer `nights` slot as committed."""
+    t = (text or "").lower()
+    if re.search(r"\bз\s+\d{1,2}\s+по\s+\d{1,2}", t):
+        return True
+    if re.search(r"\bна\s+\d{1,2}\s*(?:ноч\w*|діб|доб)", t):        # explicit "на N ночей/діб"
+        return True
+    for m in re.finditer(r"\d{1,2}\s*[-–—]\s*\d{1,2}", t):          # a "N-M" that is a DATE range
+        before = t[max(0, m.start() - 9):m.start()]
+        after = t[m.end():m.end() + 9]
+        near_nights = bool(re.search(r"(?:дн|діб|доб|ноч|ніч)\w*\s*$", before)
+                           or re.match(r"\s*(?:дн|діб|доб|ноч|ніч)", after))
+        if not near_nights:
+            return True
+    return False
+
+
+# --- Bug 1 (owner Sprint 5): real bed-configuration availability from the RAW per-sub-type scrape ---
+# Owner-CONFIRMED OtelMS sub-types (see BED_CONFIG_MAP). "Separate" = rooms with individual single
+# beds (twin 2Л+Д, or the plain 3-single Стандарти); "double" = rooms with a big double bed.
+BED_SEPARATE_CATEGORIES = ["Стандарт 4х 2Л + Д", "Стандарт", "Стандарт +"]
+BED_DOUBLE_CATEGORIES = ["Стандарт сімейний В+Д", "Стандарт + Сімейний В+Д", "Напівлюкс"]
+
+
+def _raw_category_free_all_nights(raw_availability, category, nights) -> bool:
+    """True if `category` (a RAW OtelMS sub-type) has >=1 free room on EVERY night."""
+    if not nights:
+        return False
+    entry = (raw_availability or {}).get(category) or {}
+    ta = entry.get("total_available") if isinstance(entry, dict) else None
+    ta = ta or {}
+    return all((ta.get(d, 0) or 0) > 0 for d in nights)
+
+
+def bed_config_availability(raw_availability, night_dates) -> Dict:
+    """From the RAW (un-folded) scraper output, which bed configurations have >=1 room free on EVERY
+    requested night. Returns {"separate": bool, "double": bool}. Used to answer a bed question with
+    REAL availability instead of a generic template (owner Sprint 5, Bug 1)."""
+    return {
+        "separate": any(_raw_category_free_all_nights(raw_availability, c, night_dates)
+                        for c in BED_SEPARATE_CATEGORIES),
+        "double": any(_raw_category_free_all_nights(raw_availability, c, night_dates)
+                      for c in BED_DOUBLE_CATEGORIES),
+    }
 
 
 def collapse_duplicate_group_rooms(rooms):
@@ -1033,8 +1148,10 @@ def contains_phone_number(text: str) -> bool:
 # --- payment hand-off & bot muting ------------------------------------------
 # The bot must NEVER auto-confirm a booking (it cannot verify a real transfer vs a
 # fake screenshot). A payment signal -> hand off to a human admin + tag + mute.
-ORDER_LABEL = "Замовлено"                 # Chatwoot label that mutes the bot
-MUTE_LABELS = [ORDER_LABEL]               # any of these means a human has taken over
+ORDER_LABEL = "Замовлено"                 # Chatwoot label that mutes the bot (transaction complete)
+MARKED_LABEL = "Позначено"                # KILL SWITCH (owner Sprint 5): a human has flagged the conv
+# Any of these labels is a HARD STOP: the bot halts immediately — no LLM, no reply, no processing.
+MUTE_LABELS = [ORDER_LABEL, MARKED_LABEL]
 
 # Fix 2: a completely unrecognized intent is the ONLY thing handed to a manager
 # (date searches never are). Such conversations are tagged for human follow-up.

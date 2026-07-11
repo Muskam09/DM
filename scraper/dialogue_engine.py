@@ -1126,6 +1126,24 @@ def finalize_meals(meals: Dict, month_uk: str, default_persons: int = 0) -> Opti
             .replace("{total}", str(q.total)))
 
 
+def bed_availability_reply(checkin, checkout, raw_availability) -> str:
+    """Bug 1 (owner Sprint 5): answer a bed-configuration question with REAL availability on the
+    client's dates. `raw_availability` is the UN-folded scraper output (per OtelMS sub-type), so we
+    can tell whether a separate-bed room AND a double-bed room are actually free on every night."""
+    nights = pricing_engine.night_dates(checkin, checkout)
+    avail = bot_logic.bed_config_availability(raw_availability, nights)
+    dates = dates_phrase(checkin, checkout)
+    if avail["separate"] and avail["double"]:
+        tmpl = templates.BED_AVAIL_BOTH
+    elif avail["separate"]:
+        tmpl = templates.BED_AVAIL_SEP_ONLY
+    elif avail["double"]:
+        tmpl = templates.BED_AVAIL_DBL_ONLY
+    else:
+        tmpl = templates.BED_AVAIL_NEITHER
+    return tmpl.replace("{dates}", dates)
+
+
 def nearest_reply(spec: Dict, availability: Dict) -> str:
     """A2 Step 3: forward-scan for the chosen room and propose real nearest dates."""
     room = spec.get("room_type")

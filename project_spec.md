@@ -680,3 +680,41 @@ Chatwoot session. Practical guidance so the IDs are never lost:
 - Test 27 (cottage → rooms): #333 (GREEN).
 - Persona 2 regression (УБД + food): #334 (GREEN, food 10200 / quote 16320).
 - Persona 15 regression (6+ split accept→quote): #335 (GREEN, 7100 грн).
+
+## 15. Sprint 5 (owner 2026-07-11): kill-switch + bug fixes
+
+### 15.1 LABEL KILL-SWITCH (hard stop)
+`bot_logic.MUTE_LABELS = ["Замовлено", "Позначено"]`. If a conversation carries EITHER label the bot
+HALTS immediately — the first guard in `_handle_incoming` (`is_muted(labels)`) returns before any LLM
+call or reply. `Замовлено` = transaction complete (also set on payment hand-off); `Позначено` = a human
+flagged the conversation. Used to prevent any bot output once a human takes over or a booking is closed.
+
+### 15.2 Bug fixes
+- **Beds → REAL availability (Bug 1).** A bed-configuration question WITH known dates is answered from
+  the actual per-sub-type calendar (not the generic template): `bot_logic.bed_config_availability(raw,
+  nights)` checks whether a separate-bed room (`Стандарт 4х 2Л + Д` / plain `Стандарт`/`Стандарт +` = 3
+  single) AND a double-bed room (`Стандарт[+] Сімейний В+Д`, `Напівлюкс`) are actually free every night;
+  `dialogue_engine.bed_availability_reply` renders BED_AVAIL_BOTH/SEP_ONLY/DBL_ONLY/NEITHER. Wired in
+  `bot_server` after `route_simple_topic`; a warm cache avoids a double scrape.
+- **Never "booked" without a committed stay (Bug 2).** A vague probe ("ще є вільні місця у липні") or a
+  nights-RANGE ("Днів 4-5") is not a bookable stay: `is_vague_availability_probe` / `mentions_nights_range`
+  / `has_committed_stay` gate the quote/quote_all path — it downgrades to "ask exact dates" until the
+  client commits ("на N ночей" or an explicit date range). The extractor is told not to guess a checkout
+  from a range/probe.
+- **2-rooms-for-M-adults flip-flop (Bug 3).** `normalize_rooms_for_total` parses an explicit ROOMS count
+  and TOTAL adults (digits OR Ukrainian number words, e.g. "четверо") from CLIENT-side text only and
+  rebuilds N rooms summing to M — killing the "4 adults per room" drift that leaked ROOM_TOO_SMALL on a
+  food/menu turn. An explicit per-room split ("в одному 4, в іншому 3") is respected. The FAQ re-render
+  combo resurfaces ONLY a positive result (quote/window), never a capacity error.
+- **Amenities (owner 2026-07-11).** `AIR_CONDITIONING` — the hotel has NO air conditioners in any room
+  (`is_ac_question`). Fridge/balcony → `GENERAL_INFORMATION` per-type list (`is_room_amenity_question`).
+
+### 15.3 Sprint 5 conversation IDs (2026-07-11)
+- Kill-switch (`Позначено` label): #336 (PASS — 0 bot replies, "бот мовчить").
+- Test 25 (beds → real availability): FAILED #337 (generic bed template duplicated the availability
+  answer) → FIXED #338 (GREEN — only the availability answer + 2 Стандарт 10000 грн).
+- Test 26 (Bug 2, scattered NLP): #339 (GREEN — pushed for exact dates, no premature "booked", quote
+  13500 only after "На 5 ночей з 19").
+- Persona 2 (Bug 3, food): #340 (GREEN — food 10200 / quote 16320, no ROOM_TOO_SMALL leak).
+- Persona 21 regression (date-after-split): #341 (GREEN).
+- Persona 23 regression (two families aggregate): #342 (GREEN).
