@@ -163,7 +163,8 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting | barter | unknown>",
   "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "nights": <ціле|null>, "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
-  "faq_template": "<POOL|PETS|SAUNA_VATS|FOOD_PRICES|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|DISCOUNTS|PRICE_POLICY|PET_SURCHARGE|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>"
+  "faq_template": "<POOL|CHILDREN_POOL|PETS|SAUNA_VATS|FOOD_PRICES|FOOD_MENU|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|DISCOUNTS|PRICE_POLICY|PET_SURCHARGE|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>",
+  "meals": {"persons": <ціле|null>, "three_meals_days": <ціле>, "two_meals_days": <ціле>, "breakfast_days": <ціле>, "lunch_days": <ціле>, "dinner_days": <ціле>}
 }
 
 ⛔ Ти НЕ пишеш текст для клієнта і НЕ вигадуєш описи. НІКОЛИ не генеруй опис номерів, внутрішні назви/номери кімнат (напр. "Хом'як", "Боярин", "Гропа") чи будь-яку прозу — весь клієнтський текст формує Python із готових шаблонів. Якщо клієнт просить розповісти про номери — постав topic=presentation (або faq_template=GENERAL_INFORMATION); сам опис підставить Python. Ти повертаєш ЛИШЕ JSON.
@@ -189,6 +190,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 Правила заповнення rooms:
 - Для general_price (є дати+гості, без номеру) додай ОДИН об'єкт з room_type=null.
 - КІЛЬКА НОМЕРІВ — окремий об'єкт у rooms[] на КОЖЕН номер ТІЛЬКИ якщо клієнт ЯВНО просить кілька номерів ("2 номери", "два номери", "дві сім'ї", "1 Стандарт і 1 Напівлюкс"). Якщо клієнт називає лише КІЛЬКІСТЬ ОСІБ ("4 дорослих", "нас 5", "на шістьох") — це ОДИН об'єкт rooms[] з відповідними adults/children. НЕ розбивай гостей на кілька номерів і НЕ присвоюй різні типи номерів сам — покажемо варіанти і клієнт обере.
+- ЗАПАСНИЙ ТИП — фрази "X, якщо немає тоді Y" / "краще X, або Y" / "бажано X, як ні — Y" означають ОДИН номер із бажаним типом X (Y — лише запасний варіант). Постав room_type=X (бажаний) для ОДНОГО об'єкта rooms[]. НЕ створюй два номери і НЕ дублюй гостей.
 - checkout = дата ВИЇЗДУ (остання ніч НЕ включається). "5-7 липня" => checkin 2026-07-05, checkout 2026-07-07.
 - Якщо дано дату заїзду + кількість ночей — обчисли checkout = заїзд + ночі.
 - Відносні дати ("завтра", "післязавтра", "на вихідних") рахуй від %%TODAY%%.
@@ -215,17 +217,29 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
   • ДЕКІЛЬКА ПЕРІОДІВ/МІСЯЦІВ в одному запиті ("друга половина липня або після 6 серпня", "липень чи серпень", "у липні і серпні") => збережи ВЕСЬ текст періоду у fuzzy_date разом з усіма місяцями (НЕ відкидай другий місяць!). Python сам просканує КОЖЕН названий місяць.
 - nights — кількість ночей, ЛИШЕ якщо названо ОДНЕ чітке число ("на 3 ночі"=3, "тиждень"=7, "на 5 діб"=5, "2 ночі"=2). ДІАПАЗОН ("3-5 діб", "на 3-4 ночі") або невідомо => nights=null. Для точних дат nights можна лишити null (порахується з checkin/checkout).
 - adults — кількість дорослих (ціле). "двоє дорослих" / "2 дорослих" / "на двох" / "вдвох" => adults=2; "троє" / "за трьох" / "на трьох" / "для трьох" / "трьох" => adults=3; "четверо" / "за чотирьох" => 4; одна особа => 1. Якщо клієнт лише УТОЧНЮЄ "дорослі всі" / "всі дорослі" / "дорослі" — кількість дорослих БЕРИ з попередніх повідомлень (напр., раніше "за трьох" => adults=3) і НЕ скидай у 0.
+- РОДИННІ СЛОВА → ГОСТІ: «батьки» / «мої батьки» = 2 дорослих; додай СЕБЕ, якщо клієнт каже «я»/«ми» («мої батьки, я та …» = 2+1 = adults=3); «чоловік»/«дружина»/«мама»/«тато»/«брат»/«сестра» — кожен = 1 дорослий. ДІТИ: «син»/«сина»/«синів»/«донька»/«доньки»/«дитина»/«діти»/«малюк»/«онук» = ДІТИ (children_count), а НЕ дорослі; якщо вік не названо — children_ages=[] (бот запитає вік). Приклад: «Мої батьки, я та мої 2 сина» => adults=3, children_count=2, children_ages=[].
 - children_count — ЗАГАЛЬНА кількість дітей (навіть якщо вік невідомий). children_ages — лише ВІДОМІ віки (цілі), вік не вигадуй.
 - ЗАКРИВАЙ слот дітей: "лише дорослі" / "X дорослих" / "всі дорослі" / "дорослі всі" / "на двох/трьох" БЕЗ згадки дітей => children_count=0, children_ages=[]. НІКОЛИ не перепитуй про дітей, якщо кількість дорослих відома, а дітей не згадано.
 - Якщо згадано N дітей без віку => children_count=N, children_ages=[]. Якщо вказані віки => children_count=кількість, children_ages=[віки].
 - Якщо взагалі не вказано ні дорослих, ні дітей — adults=0, children_count=0, children_ages=[].
 - ubd — true якщо клієнт згадує УБД / посвідчення УБД / військовослужбовця / ветерана / знижку для військових. Знижка діє на ВСЕ бронювання родини (-20% від загальної суми), тому постав ubd=true для УСІХ номерів у rooms[]; інакше false для всіх.
 
+ХАРЧУВАННЯ (meals) — заповнюй ЛИШЕ коли клієнт просить ПОРАХУВАТИ вартість харчування:
+- persons — на скількох осіб харчування (якщо не названо — null, Python візьме кількість гостей).
+- three_meals_days — кількість ДНІВ з 3-разовим (повним) харчуванням; two_meals_days — днів з 2-разовим;
+  breakfast_days / lunch_days / dinner_days — кількість днів з ЛИШЕ сніданком / обідом / вечерею.
+- Приклад: "3-разове на 4 особи: 2 дні повне харчування, останній день лише сніданок" =>
+  meals={"persons":4,"three_meals_days":2,"two_meals_days":0,"breakfast_days":1,"lunch_days":0,"dinner_days":0}
+- Якщо клієнт НЕ просить розрахунок харчування — усі поля 0, persons=null.
+- Питання про ЦІНИ на харчування ("скільки коштує сніданок", "яка вартість харчування") => faq_template=FOOD_PRICES, meals усі 0.
+- Питання про СТРАВИ/меню ("які страви подають", "що готують", "яке меню") => faq_template=FOOD_MENU.
+
 FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ЗАГАЛЬНЕ питання про знижки/акції ("чи є знижки", "які у вас знижки", "є якісь акції", "промокод") -> DISCOUNTS; питання про ЦІНОВУ ПОЛІТИКУ по місяцях ("чи така сама цінова політика в серпні, як у липні", "ціни однакові по місяцях", "в серпні дорожче?") -> PRICE_POLICY; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS; фен / чи є фен у номері -> HAIRDRYER; фото / відео / світлини номерів чи території -> MEDIA.
 ВАЖЛИВО: тенісного КОРТУ у готелі НЕМАЄ — НЕ пропонуй теніс як активність. Загальне питання про знижки/акції -> DISCOUNTS (шаблон перелічує лише реальні знижки — діти та військові — і відсилає за іншими акціями в Instagram). Знижку 10% / "програму лояльності" бот НЕ рахує і НЕ обіцяє окремо (це лише людина) — на питання про знижки завжди став DISCOUNTS, а не GENERAL_INFORMATION і не null.
-БАСЕЙН — РОЗРІЗНЯЙ ДВА ШАБЛОНИ:
+БАСЕЙН — РОЗРІЗНЯЙ ТРИ ШАБЛОНИ:
+- CHILDREN_POOL: питання саме про ДИТЯЧИЙ басейн ("чи є дитячий басейн", "басейн для дітей", "дитячий басейн глибина/розмір/температура").
 - GUEST_POOL: будь-яке питання про ЦІНУ/ВАРТІСТЬ басейну, про КУПАННЯ чи ВІДВІДУВАННЯ басейну БЕЗ проживання, "покупатись/поплавати в басейні", "скільки коштує басейн", "приїхати на басейн на день", "тільки/лише басейн", "можна просто скупатись".
-- POOL: ЗАГАЛЬНЕ питання про басейн як зручність для гостей ("чи є басейн", "він з підігрівом?", "графік/години роботи", "розмір/глибина", "чи входить басейн у вартість проживання").
+- POOL: ЗАГАЛЬНЕ питання про (дорослий) басейн як зручність для гостей ("чи є басейн", "він з підігрівом?", "графік/години роботи", "розмір/глибина", "чи входить басейн у вартість проживання").
 
 ІСТОРІЯ ДІАЛОГУ:
 %%HISTORY%%
@@ -298,6 +312,8 @@ _conv_seq: dict = {}      # conv_id -> latest incoming sequence (drip-burst dedu
 _slot_memory: dict = {}   # conv_id -> list of last-known booking rooms (robust to extractor drops)
 _greeted: set = set()     # conv_ids already greeted (idempotent vs Chatwoot read-after-write lag)
 _pending_window: dict = {}  # conv_id -> (checkin, checkout) of the first proposed free window
+_pending_split: dict = {}   # conv_id -> (per-room people counts, party) of the proposed room split
+_meals_memory: dict = {}    # conv_id -> last meal-request key already answered (no re-emit)
 _no_dates_mode: set = set() # conv_ids where the client said they don't know dates yet
 _cooldowns: dict = {}       # conv_id -> ts of the last ERROR_LLM_DOWN (5-min silent cooldown)
 
@@ -367,15 +383,27 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     # ОПЛАТА (скрін / квитанція / ключові слова) -> НЕ підтверджуємо бронь
     # автоматично: передаємо людині-адміністратору, тегуємо конверсацію, замовкаємо.
     if bot_logic.is_payment_intent(user_message, has_attachment):
-        print(f"[i] Виявлено оплату -> хендоф адміністратору, тег '{bot_logic.ORDER_LABEL}'")
+        print(f"[i] Виявлено оплату -> хендоф менеджеру, теги '{bot_logic.ORDER_LABEL}' + '{bot_logic.INSTAGRAM_LABEL}'")
         await asyncio.to_thread(send_chatwoot_message, conversation_id, templates.PAYMENT_RECEIVED_HANDOFF)
+        # Замовлено -> МУТИТЬ бота (майбутні повідомлення ігноруються — людина веде діалог);
+        # Instagram -> тег для менеджера (owner 2026-07-09).
         await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.ORDER_LABEL)
+        await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
         return
 
     # Клієнт залишив номер телефону -> передаємо менеджеру і зупиняємо діалог.
     if bot_logic.contains_phone_number(user_message):
         print(f"[i] Отримано контакт, передаю менеджеру: {user_message[:50]}")
         await asyncio.to_thread(send_chatwoot_message, conversation_id, templates.PHONE_RECEIVED)
+        return
+
+    # Booking.com (Persona 18): бронювання/передоплата зроблені через Booking.com — бот НЕ
+    # відповідає на такі питання (передоплата йде НЕ на наш IBAN), а передає менеджеру
+    # (тег Instagram). Перевіряємо ПЕРЕД екстракцією, щоб слово "передоплата" не пішло у BOOK_ROOM.
+    if bot_logic.is_booking_com_question(user_message):
+        print(f"[i] Booking.com -> хендоф менеджеру, тег '{bot_logic.INSTAGRAM_LABEL}': {user_message[:50]}")
+        await asyncio.to_thread(send_chatwoot_message, conversation_id, templates.BOOKING_COM)
+        await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
         return
 
     raw_history = get_chatwoot_history(conversation_id)
@@ -474,9 +502,31 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             slots["topic"] = "faq"
             slots["faq_template"] = faq_tmpl
             slots["_faq_override"] = True
-    # The bot's most recent message — context for a bare "Так" and the payment guard.
+    # The bot's most recent REAL message — context for a bare "Так" / split acceptance / payment.
+    # Skip NOTICE messages ("Секундочку…" scrape filler, greeting, outage holder): a superseded
+    # sibling fire may have emitted the scrape notice, and that must not mask the real offer that
+    # a "Так, порахуйте" is answering (live_auto_qa double-fire race).
     last_bot_msg = next((m.get("content", "") for m in reversed(raw_history)
-                         if m.get("message_type") in ("outgoing", 1) and m.get("content")), "")
+                         if m.get("message_type") in ("outgoing", 1) and m.get("content")
+                         and not bot_logic._is_notice_message(m.get("content", ""))), "")
+
+    # Owner #15/#21 (2026-07-10): the bot PROPOSED a room split last turn and the client accepts
+    # ("Так, порахуйте вартість") -> materialise that exact distribution into rooms and QUOTE it,
+    # instead of re-proposing the split forever.
+    if (conversation_id in _pending_split and bot_logic.is_split_offer_message(last_bot_msg)
+            and bot_logic.accepts_split(user_message)):
+        counts, party = _pending_split[conversation_id]
+        ci, co = party.get("checkin"), party.get("checkout")
+        if ci and co:
+            slots["rooms"] = dialogue_engine.rooms_from_split(
+                counts, party.get("adults") or 0, party.get("children_ages") or [], ci, co)
+            slots["topic"] = "price_quote"
+            _slot_memory[conversation_id] = bot_logic.remember_rooms(slots["rooms"])
+            # DON'T pop _pending_split here: live_auto_qa double-fires each message, and popping in
+            # a fire that then gets superseded would leave the surviving fire without the split.
+            # It becomes harmless once we've quoted (the last bot message is no longer a split offer).
+            slots_changed = True
+            print(f"[i] {conversation_id}: split accepted -> quoting {counts} rooms")
 
     # Decision 2: a bare confirmation ("Так" / "Давайте") means different things by the
     # bot's PREVIOUS message — accept the first proposed window, or proceed to payment.
@@ -525,9 +575,41 @@ async def _handle_incoming(user_message: str, conversation_id: int,
 
     # 2) DETERMINISTIC ROUTING — Python decides everything below.
     is_faq_reply = (slots.get("topic") == "faq")
+    # Owner 2026-07-10: an explicit meal-cost request -> compute it deterministically and prepend
+    # it to whatever the booking path returns (never let the LLM do food math).
+    meals_reply = None
+    _meals_key_to_store = None            # set the "already answered" memory only AFTER a real emit
+    _meals = slots.get("meals")
+    if not dialogue_engine.has_meal_request(_meals):
+        _parsed = bot_logic.parse_meal_request(user_message)   # deterministic fallback (food math)
+        if _parsed:
+            _meals = slots["meals"] = _parsed
+    if dialogue_engine.has_meal_request(_meals):
+        _mkey = dialogue_engine.meals_key(_meals)     # only emit ONCE per distinct meal request
+        if _meals_memory.get(conversation_id) != _mkey:
+            # Month = the booking's month. Fall back to the remembered rooms and the accepted window
+            # so a meal-cost turn that drops the dates still prices in the right month.
+            _month = (dialogue_engine.meals_month(slots)
+                      or dialogue_engine.meals_month({"rooms": _slot_memory.get(conversation_id) or []}))
+            if not _month and conversation_id in _pending_window:
+                _month = dialogue_engine.meals_month(
+                    {"rooms": [{"checkin": _pending_window[conversation_id][0]}]})
+            _persons = bot_logic.slots_total_guests(slots)
+            meals_reply = dialogue_engine.finalize_meals(_meals, _month, default_persons=_persons)
+            if meals_reply:
+                _meals_key_to_store = _mkey
+
     reply = route_simple_topic(slots)
     if reply is None:
         decision = dialogue_engine.plan(slots)
+        # Remember a PROPOSED split so the client's "так, порахуйте" can materialise & quote it.
+        if decision.get("split_counts"):
+            _rooms = slots.get("rooms") or []
+            _dates = bot_logic._shared_booking_dates(_rooms)
+            _pending_split[conversation_id] = (decision["split_counts"], {
+                "adults": sum((r.get("adults") or 0) for r in _rooms),
+                "children_ages": [a for r in _rooms for a in (r.get("children_ages") or [])],
+                "checkin": _dates.get("checkin"), "checkout": _dates.get("checkout")})
         # Bug 1: guests are known and the client already said they don't know dates ->
         # PROACTIVELY scan the open calendar and propose windows, instead of looping
         # QUESTION_ONLY_DATES (which the anti-spam guard would then suppress -> silence).
@@ -640,15 +722,21 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             return
         if has_pet and bot_logic.is_quote_message(text) and "тваринку" not in text:
             text = text + _PET_NOTE
-        if text.strip() in recent_bots:
-            print(f"[i] {conversation_id}: reply repeats a recent bot message -> suppress (anti-spam).")
+        # PART-AWARE anti-spam (owner #304): a [SPLIT] reply is delivered as SEVERAL Chatwoot
+        # messages, so compare EACH part against the recent ones. Otherwise the room-layout part
+        # gets re-sent every turn because the combined text never matches a single stored message.
+        parts = bot_logic.split_messages(text)
+        fresh = [p for p in parts if p not in recent_bots]
+        if not fresh:
+            print(f"[i] {conversation_id}: reply repeats recent bot message(s) -> suppress (anti-spam).")
             return
+        text = "[SPLIT]".join(fresh)
         out = bot_logic.prepend_greeting_if_needed(text, bot_has_spoken)
         if out != text:                       # greeting was prepended this emit
             _greeted.add(conversation_id)
         await _deliver(conversation_id, out)
         bot_has_spoken = True
-        recent_bots = ([text.strip()] + recent_bots)[:2]
+        recent_bots = (list(reversed(fresh)) + recent_bots)[:2]
 
     # Fix 3 (batch ordering): a drip burst is collapsed to this single turn, so the extractor
     # classified only the LAST question. Answer EVERY OTHER FAQ the burst raised, in the order
@@ -678,8 +766,8 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     #    a 2nd message. The nudge survives ONLY when the booking action is a QUESTION
     #    (missing data) — that path keeps faq_followup's nudge and never reaches here.
     booking_extra = None
-    if is_faq_reply:
-        d2 = dialogue_engine.plan(slots)
+    if is_faq_reply and slots_changed:      # only (re)show the booking result when it CHANGED this
+        d2 = dialogue_engine.plan(slots)    # turn — an unchanged booking must NOT re-render on every FAQ
         if d2.get("action") in _SCRAPE_ACTIONS:
             reply = reply.replace(templates.FAQ_CONTINUE_NUDGE, "")  # real result, not the nudge
             try:
@@ -699,6 +787,10 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                         _pending_window[conversation_id] = win
 
     try:
+        if meals_reply:                     # deterministic food cost, before the booking status
+            await _emit(meals_reply)
+            if _meals_key_to_store:         # mark answered ONLY after a real (non-superseded) emit
+                _meals_memory[conversation_id] = _meals_key_to_store
         if reply is not None:
             await _emit(reply)
         if booking_extra:

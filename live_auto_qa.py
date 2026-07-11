@@ -28,6 +28,8 @@ Exit 0 = every live audit passed AND no red flag; non-zero otherwise.
 import json
 import os
 import random
+import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -185,75 +187,316 @@ def red_flags(rows):
     return flags
 
 
+# --- LIVE WINDOW VALIDATION (owner mandate): every OFFERED date window must have EVERY night
+#     free. We scrape ONE availability snapshot, parse "A - B місяць" ranges from the bot text,
+#     and flag any offered window whose interior nights are booked (a bridge / hallucination). ---
+_UA_GEN_MONTH = {"січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
+                 "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12}
+_MON = "|".join(_UA_GEN_MONTH)
+_WIN_RE = re.compile(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+(" + _MON + r")")
+# cross-month: "29 липня - 8 серпня"
+_WIN_XMON_RE = re.compile(r"(\d{1,2})\s+(" + _MON + r")\s*[-–—]\s*(\d{1,2})\s+(" + _MON + r")")
+
+
+def scrape_snapshot():
+    """Best-effort {date_iso: max free count across the 3 public types} via the container.
+    Taken once, right after the personas run, so it closely matches what the bot scraped."""
+    code = (
+        "import asyncio,json\n"
+        "from hotel_scraper import fetch_hotel_availability\n"
+        "import bot_logic\n"
+        "s=bot_logic.build_simplified_availability(asyncio.run(fetch_hotel_availability()))\n"
+        "m={}\n"
+        "for v in s.values():\n"
+        " for d,c in (v or {}).items():\n"
+        "  m[d]=max(m.get(d,0), c or 0)\n"
+        "print('SNAP'+json.dumps(m))\n")
+    try:
+        out = subprocess.run(["docker", "exec", "scraper-bot-brain-1", "python", "-c", code],
+                             capture_output=True, text=True, timeout=150)
+        for line in out.stdout.splitlines():
+            if line.startswith("SNAP"):
+                return json.loads(line[4:])
+    except Exception as e:
+        print(f"   [window-validation snapshot unavailable: {e}]")
+    return None
+
+
+def window_violations(rows, snapshot, year=2026):
+    """Offered same-month windows whose interior nights [A, B) are booked in the snapshot.
+    A booked night INSIDE an offered range == the exact bridging/hallucination the owner flagged."""
+    if not snapshot:
+        return []
+    import datetime
+    def _nights_booked(start_iso, end_iso, label):
+        out = []
+        d = datetime.date.fromisoformat(start_iso)
+        end = datetime.date.fromisoformat(end_iso)
+        while d < end:                          # nights of the stay (checkout day excluded)
+            if snapshot.get(d.isoformat(), 1) <= 0:
+                out.append(f"offered «{label}» spans BOOKED night {d.isoformat()}")
+            d += datetime.timedelta(days=1)
+        return out
+
+    viol = []
+    for role, content in rows:
+        if role != "bot":
+            continue
+        for m in _WIN_XMON_RE.finditer(content):        # cross-month first (superset pattern)
+            a, m1, b, m2 = int(m.group(1)), _UA_GEN_MONTH[m.group(2)], int(m.group(3)), _UA_GEN_MONTH[m.group(4)]
+            y2 = year + 1 if m2 < m1 else year          # month wrap (Dec->Jan)
+            viol += _nights_booked(f"{year}-{m1:02d}-{a:02d}", f"{y2}-{m2:02d}-{b:02d}",
+                                   f"{a} {m.group(2)} - {b} {m.group(4)}")
+        for m in _WIN_RE.finditer(content):             # same-month
+            a, b, mon = int(m.group(1)), int(m.group(2)), _UA_GEN_MONTH[m.group(3)]
+            if b <= a:
+                continue
+            viol += _nights_booked(f"{year}-{mon:02d}-{a:02d}", f"{year}-{mon:02d}-{b:02d}",
+                                   f"{a} - {b} {m.group(3)}")
+    return sorted(set(viol))
+
+
 def has(*subs):
     return lambda t: any(s in t for s in subs)
 
 
+def lacks(*subs):
+    return lambda t: all(s not in t for s in subs)
+
+
 # (index, name, [messages], drip_seconds, [ (desc, predicate_on_lowercased_bot_text) ])
+#
+# Persona numbering matches simulate_live_chat.py. The owner's manual QA (2026-07-08) marked
+# personas 1,3,4,6,9,10,12,13,14,16 as PASSING → COMMENTED OUT below (kept, not deleted, so
+# they can be re-enabled). Personas 2,5,7,8,11,15 carried owner notes (the six Phase-2 fixes)
+# and 17-20 are NEW → all ACTIVE. See DEFAULT_SET.
 PERSONAS = {
-    2: ("2️⃣ УБД + початок серпня + оплата по приїзду",
+    # ----- PASSED without owner notes (2026-07-08) — commented out, kept for re-runs -----
+    # 1: ("1️⃣ Зміна дат на льоту",
+    #     ["Доброго дня!", "Хочу забронювати номер!", "17-19 липня",
+    #      "двоє дорослих та дитина 8 років", "Стандарт +", "що по харчуванню?",
+    #      "що входить у вартість?", "наші дати змінились, хочемо заїхати 24 липня на 3 дні",
+    #      "Хочу забрювати, треба платити передоплату?"],
+    #     DRIP_DEFAULT,
+    #     [("coherent quote/window", has("грн", "віконц", "заброньован"))]),
+
+    2: ("2️⃣ УБД + початок серпня + 2 Стандарти + харчування + меню (fix #266, food)",
         ["Четверо дорослих",
          "початок серпня",
          "харчування є?",
-         "Cтандарт +, якщо немає тоді стандарт",
+         "Давайте 2 номери Стандарт",
          "А є знижка по УБД на один номер?",
-         "Хочу забронювати",
-         "Чи можна по приїзду оплатити повністю"],
+         "Порахуйте харчування 3-разове на 4 особи: 2 дні повне харчування, а останній день лише сніданок",
+         "Які там страви подають?"],
         DRIP_DEFAULT,
         [("August period acknowledged (Fix 2 month kept)", has("серпн")),
-         ("food FAQ answered", has("350", "сніданок", "обід")),
+         ("food-prices FAQ answered", has("350", "сніданок", "обід")),
          ("military/УБД discount handled", has("20%", "убд", "військов")),
-         ("pay-on-arrival → prepayment rules, not check-in time", has("аванс", "передоплат"))]),
+         ("no removed «Стандартів більше» aside (#266)", lacks("стандартів у нас більше")),
+         ("EXACT food cost computed: (1100*4*2)+(350*4*1)=10200", has("10200")),
+         ("menu (dishes) question answered", has("узгоджуються по заїзду"))]),
 
-    3: ("3️⃣ Двоє дітей, нечіткі дати (кінець серпня)",
-        ["Доброго дня.",
-         "Двоє дорослих і двоє дітей.",
-         "Яка вартість, і вільні дати?",
-         "Орієнтовно кінець серпня",
-         "3-5 діб, не остаточно вирішено",
-         "Супер. Дякую. Визначимося з датами, відпишу",
-         "Зорієнтуйте ще будь ласка по харчуванню.",
-         "Дякую."],
-        DRIP_DEFAULT,
-        [("August period acknowledged (Fix 2)", has("серпн")),
-         ("asks child ages (were unknown)", has("вік діт", "діток", "вік дит")),
-         ("food FAQ answered", has("350", "сніданок", "обід")),
-         ("warm close on final thanks", has("гарного дня", "будемо раді", "раді допомогти"))]),
+    # 3: ("3️⃣ Двоє дітей, нечіткі дати (кінець серпня)",  # PASSED
+    #     ["Доброго дня.", "Двоє дорослих і двоє дітей.", "Яка вартість, і вільні дати?",
+    #      "Орієнтовно кінець серпня", "3-5 діб, не остаточно вирішено",
+    #      "Супер. Дякую. Визначимося з датами, відпишу",
+    #      "Зорієнтуйте ще будь ласка по харчуванню.", "Дякую."],
+    #     DRIP_DEFAULT,
+    #     [("August acknowledged", has("серпн")),
+    #      ("asks child ages", has("вік діт", "діток", "вік дит")),
+    #      ("food FAQ answered", has("350", "сніданок", "обід")),
+    #      ("warm close", has("гарного дня", "будемо раді", "раді допомогти"))]),
 
-    5: ("5️⃣ Одна особа, тиждень (22.06–02.07)",
+    # 4: ("4️⃣ Трьох + собака",  # PASSED
+    #     ["Добрий день", "Яка ціна за трьох?", "Дорослі всі )", "Орієнтовно на вихідні",
+    #      "Також ми хочем приїхати з собачкою", "Пекінес", "Собака має все",
+    #      "Треба за собаку доплачувати?"],
+    #     DRIP_DEFAULT,
+    #     [("pet surcharge 300", has("300 грн")), ("coherent", has("грн", "віконц", "дати"))]),
+
+    5: ("5️⃣ Одна особа, тиждень (22.06–02.07) — nights alignment (#274)",
         ["Які вільні дати для бронювання?",
          "Доброго дня. На 1 особу з 22.06 по 02.07. на 7 днів",
-         "Дякую"],
+         "Дякую",
+         "так"],
         DRIP_DEFAULT,
         [("coherent date/price response (solo)", has("грн", "віконц", "вільн", "заброньован", "дати")),
+         ("if a nearest window is offered, it STATES nights (#274)",
+          lambda t: "найближче вільне віконце" not in t or "ноч" in t),
          ("warm close on thanks", has("гарного дня", "будемо раді", "раді допомогти"))]),
 
-    9: ("9️⃣ Compound period: друга половина липня АБО після 6 серпня (Fix 2)",
-        ["Добрий вечір! Цікавить двомісний номер? На двох)",
-         "Ще точно не знаю, поки лише вирішуємо. Або друга половина липня, або після 6 серпня",
-         "Але відпочинок вже просто необхідний, як повітря!",
-         "Вартість доби)",
-         "В серпні актуальна, як і на липень, цінова політика?"],
-        DRIP_DEFAULT,
-        [("compound period → August NOT silently dropped", has("серпн")),
-         ("coherent scan/date response (windows or exact-date ask)",
-          has("віконц", "вільн", "точні дати", "дати", "грн"))]),
+    # 6: ("6️⃣ 2 дорослих + 3 дітей",  # PASSED
+    #     ["Де саме знаходиться готель?", "Яка ціна кімнати 2 дорослих і 3 дітей",
+    #      "Саме головне цікавить ціна проживання за добу?"],
+    #     DRIP_DEFAULT,
+    #     [("location answered", has("серці карпат", "стаїще", "верховин")),
+    #      ("asks child ages", has("вік діт", "діток"))]),
 
-    10: ("🔟 BATCH: booking(1-5 серпня) + фото/відео + знижки (Fix 1 + Fix 3)",
-         ["Доброго дня! Цікавить номер на 2 дорослих і 2 дітей (7 і 10 років) з 1 по 5 серпня",
-          "Яка вартість проживання?",
-          "Чи є фото/відео номерів?",
-          "Є якісь знижки у вас?"],
-         BURST_DRIP,      # rapid-fire so the burst collapses -> Fix 3 batch ordering engages
-         [("greeting present", has("d&t hotel")),
-          ("DISCOUNTS FAQ: children discount listed (Fix 1)", has("знижки для дітей")),
-          ("DISCOUNTS FAQ: military discount listed (Fix 1)", has("військовослужбовц")),
-          ("MEDIA FAQ answered", has("сторіс", "хайлайтс", "фото")),
-          ("booking priced or sold-out/nearest (not ignored)",
-           has("грн", "віконц", "заброньован", "вартіст"))]),
+    7: ("7️⃣ Бронь 13.07-17.07 (4 ночі) — exact dates priced/handled (#274/#299)",
+        ["Хочу забронювати",
+         "13.07-17.07",
+         "яка вартість відпочинку?",
+         "Що входить у вартість",
+         "На двох",
+         "Стандарт +"],
+        DRIP_DEFAULT,
+        [("INCLUDED-in-price FAQ answered", has("паркув", "входить", "басейн")),
+         ("coherent 4-night stay: exact price OR nearest-window/booked, never a false error",
+          has("грн", "віконц", "заброньован", "вартувати")),
+         ("if a nearest window is offered it states 4 nights (#274)",
+          lambda t: "найближче вільне віконце" not in t or "4 ноч" in t),
+         ("never claims the (future, valid) dates already passed", lacks("вже минули"))]),
+
+    # 8: PASSED 2026-07-09 (owner) — commented out, kept for re-runs.
+    # 8: ("8️⃣ Як добратися (2-7 липня, 1 дор + діти 6 і 13) — only-available (#275)",
+    #     ["Де саме знаходиться готель?", "Орієнтовно 2-7 липня",
+    #      "1 дорослий, 2 дітей 6 і 13 років", "Як до Вас добратися ?", "Бердичів, Житомирська область"],
+    #     DRIP_DEFAULT,
+    #     [("location answered", has("серці карпат", "стаїще", "верховин", "maps")),
+    #      ("directions answered", has("ворохт", "залізниц", "трансфер", "автобус")),
+    #      ("coherent booking response", has("віконц", "грн", "заброньован", "дати"))]),
+
+    # 9: ("9️⃣ Compound period липень/серпень",  # PASSED
+    #     ["Добрий вечір! Цікавить двомісний номер? На двох)",
+    #      "Ще точно не знаю, поки лише вирішуємо. Або друга половина липня, або після 6 серпня",
+    #      "Але відпочинок вже просто необхідний, як повітря!", "Вартість доби)",
+    #      "В серпні актуальна, як і на липень, цінова політика?"],
+    #     DRIP_DEFAULT,
+    #     [("August not dropped", has("серпн")),
+    #      ("coherent", has("віконц", "вільн", "точні дати", "дати", "грн"))]),
+
+    # 10: ("🔟 BATCH booking + фото/відео + знижки",  # PASSED
+    #      ["Доброго дня! Цікавить номер на 2 дорослих і 2 дітей (7 і 10 років) з 1 по 5 серпня",
+    #       "Яка вартість проживання?", "Чи є фото/відео номерів?", "Є якісь знижки у вас?"],
+    #      BURST_DRIP,
+    #      [("greeting", has("d&t hotel")), ("discounts children", has("знижки для дітей")),
+    #       ("discounts military", has("військовослужбовц")), ("media", has("сторіс", "хайлайтс", "фото")),
+    #       ("booking not ignored", has("грн", "віконц", "заброньован", "вартіст"))]),
+
+    # 11: PASSED 2026-07-09 (owner) — commented out, kept for re-runs.
+    # 11: ("1️⃣1️⃣ Троє діти + дитячий басейн (fix #278)",
+    #      ["Доброго дня! Цікавить номер на 2 дорослих і 3 дітей (5 і 10 і півроку) з 1 по 5 серпня",
+    #       "Найменша буде спати з нами)", "Чи є у вас дитячі ліжечка/манежі?",
+    #       "Чи є у вас дитячий басейн?", "Яка темперптура бесейну?"],
+    #      DRIP_DEFAULT,
+    #      [("children's pool answered with size (#278)", has("3х2", "дитячий басейн")),
+    #       ("children's pool temperature", has("28")),
+    #       ("cribs/playpens answered (none)", has("ліжечок", "манеж")),
+    #       ("August booking coherent", has("серпн", "грн", "віконц", "заброньован"))]),
+
+    # 12: ("1️⃣2️⃣ Фен", ["Добрий день", "У вас у кожному номері є фен?", "Дякую"],  # PASSED
+    #      DRIP_DEFAULT, [("hairdryer answered", has("фен")), ("warm close", has("гарного дня"))]),
+
+    # 13: ("1️⃣3️⃣ Басейн",  # PASSED
+    #      ["Добрий день, у вас басейн працює?", "А можна просто прийти завтра на день і поплавати в басейні?"],
+    #      DRIP_DEFAULT, [("pool answered", has("басейн")), ("day-visit price", has("400 грн", "600 грн"))]),
+
+    # 14: ("🧪 No-dates → proactive scan",  # PASSED
+    #      ["Доброго дня! Цікавить ціна, але дати ще не можу сказати", "Для двох дорослих"],
+    #      DRIP_DEFAULT, [("proactive scan", has("вільні віконця", "перевірив календар"))]),
+
+    15: ("🧪 6+ split: 7 дорослих → 4 і 3 → valid re-split → ACCEPT → quote (fix #282-284)",
+         ["Доброго дня! На 23-24 липня, нас 7 дорослих",
+          "Давайте 2 номери: в одному 4, в іншому 3",
+          "Добре, порахуйте, будь ласка, вартість"],
+         DRIP_DEFAULT,
+         [("explains max 3 adults per room (#282-284)", has("максимум 3 дорослих")),
+          ("suggests enough rooms (3) with a valid distribution", has("3 номери")),
+          ("shows the 2 + 2 + 3 distribution", has("2 + 2 + 3")),
+          ("after ACCEPT -> quotes the split rooms (owner #15)", has("буде вартувати", "загальна вартість"))]),
+
+    # 16: ("🧪 УБД on a sold-out window → note kept",  # PASSED
+    #      ["Доброго дня! Стандарт на 6-8 липня, двоє дорослих, я УБД"],
+    #      DRIP_DEFAULT, [("nearest window", has("віконц", "заброньован")),
+    #                     ("military note kept", has("убд", "посвідчення"))]),
+
+    # ===== NEW personas (owner 2026-07-08) =====
+    # 17: PASSED 2026-07-10 (owner) — commented out, kept for re-runs.
+    # 17: ("1️⃣7️⃣ Басейн: свій харч + вхід без купання",
+    #      ["А можна просто прийти завтра на день і поплавати в басейні?",
+    #       "Чи можна до вас приходити зі своїм.",
+    #       "Яка буде вартість якщо не будем плавати а просто посидіти"],
+    #      DRIP_DEFAULT,
+    #      [("day-visit pool price (GUEST_POOL)", has("400 грн", "600 грн", "відвідувач", "на день")),
+    #       ("no own food — kolyba/bar instead", has("колиба", "бар")),
+    #       ("own food refused", has("не можна")),
+    #       ("same price if just sitting — entrance fee", has("такою ж", "вхід", "зону відпочинку"))]),
+
+    # 18: PASSED 2026-07-09 (owner) — commented out, kept for re-runs.
+    # 18: ("1️⃣8️⃣ Booking.com передоплата → людині",
+    #      ["Доброго дня! Я забронювала вже номер на booking, мені підтвердили. Потрібно кинути передоплату. Скажіть будь ласка 50% передоплати"],
+    #      DRIP_DEFAULT,
+    #      [("cannot answer Booking.com questions", has("booking.com")),
+    #       ("does NOT send our IBAN/prepayment rules", lacks("iban", "26005064100017")),
+    #       ("hands off to a human", has("менеджер"))]),
+
+    19: ("1️⃣9️⃣ NLP родини (3 дор + 11,16) + 23-27 → ТІЛЬКИ доступні типи (#19)",
+         ["Добрий день. Яка ціна?",
+          "Мої батьки, я та мої 2 сина",
+          "11 і 16 років",
+          "23-27 липня"],
+         DRIP_DEFAULT,
+         [("parsed 3 adults + 2 children; asked the sons' ages", has("вік діт", "вік дит", "діток")),
+          # party of 5 fits only Напівлюкс, which is BOOKED on 23-27 -> offer a Стандарт-class split,
+          # naming ONLY the AVAILABLE types (owner #19).
+          ("offers Стандарт-class rooms", has("стандарт")),
+          ("does NOT offer the BOOKED Напівлюкс on these dates (#19)", lacks("напівлюкс"))]),
+
+    # 20: PASSED 2026-07-09 (owner) — commented out, kept for re-runs.
+    # 20: ("2️⃣0️⃣ Відстань до Буковелю",
+    #      ["Дізнатися вартість", "Добрий день. 2 дорослих 1 дитина (8 років) 3 ночі 20-23 липня",
+    #       "На скільки далеко Ви від Буковелю?"],
+    #      DRIP_DEFAULT,
+    #      [("distance to Bukovel answered (~35 km)", has("35 км", "буковел")),
+    #       ("booking coherent (20-23 July, 3 nights)", has("грн", "віконц", "заброньован", "дата", "3 ноч"))]),
+
+    # ===== NEW personas (owner 2026-07-09) =====
+    21: ("2️⃣1️⃣ Велика змішана компанія + гнучкий старт (6 дор + 4 діти)",
+         ["Цікавить дві доби для компанії 6 дорослих 4 дитини 2,8,11,14р",
+          "З 15 чи 16 липня"],
+         DRIP_DEFAULT,
+         [("shows capacities (max 3 adults/room)", has("максимум 3 дорослих")),
+          ("PROPOSES a valid multi-room split (owner #21)", has("розподілити", "номери")),
+          ("does NOT cram everyone into one room / no bogus quote",
+           lambda t: "буде вартувати" not in t or "загальна вартість" in t)]),
+
+    # 22: PASSED 2026-07-10 (owner) — commented out, kept for re-runs.
+    # 22: ("2️⃣2️⃣ Оплата → хендоф + мут",
+    #      ["Я оплатив, ось квитанція", "а коли буде підтвердження броні?"],
+    #      BURST_DRIP,
+    #      [("hands off — manager will verify payment", has("менеджер", "перевірить оплату")),
+    #       ("does NOT auto-confirm a booking / no IBAN", lacks("буде вартувати", "iban")),
+    #       ("stays a SINGLE handoff message (muted after)", lambda t: t.count("перевірить оплату") <= 1)]),
+
+    # NOTE: the original IG dialogue had a 14yo in family 2. Under the owner's STRICT capacity
+    # correction (2 adults + 2 children UNDER 12 only), that family no longer fits a Standard —
+    # which CONTRADICTS this round's bug-1 note. Pending the owner's decision, this persona tests
+    # the code fix actually requested (bug 2: AGGREGATE BOTH families) with a fitting composition.
+    23: ("2️⃣3️⃣ Дві сім'ї → рахуємо ОБИДВІ (multi-room aggregate, owner bug 2)",
+         ["Доброго дня! Можна дізнатись ціни?",
+          "Дві сім'ї на 20-24 липня. 1 сім'я - 2 дорослих і 2 дітей 8 і 10 років. 2 сім'я - 2 дорослих і дитина 9 років",
+          "Так, порахуйте, будь ласка, обидві сім'ї"],
+         DRIP_DEFAULT,
+         [("quotes a Стандарт-class room", has("стандарт")),
+          # bug 2: MULTIPLE rooms aggregated — either a "Загальна вартість" grand total (distinct
+          # rooms) or the collapsed "за N номери типу X" combined price (identical rooms).
+          ("AGGREGATES multiple rooms (owner bug 2)", has("загальна вартість", "2 номери", "за 2 номери")),
+          ("real prices, not stuck", has("грн")),
+          ("no capacity error leak", lacks("error", "traceback"))]),
+
+    24: ("2️⃣4️⃣ Міжсезоння (28.09–01.10) + УБД + фото (IG real)",
+         ["Доброго дня! Заїзд 28 вересня, виїзд 01 жовтня. Двоє дорослих і двоє дітей 4 і 6 років",
+          "Стандарт",
+          "Чи є знижки для військових/УБД?",
+          "Можливо маєте фото/відео номерів?"],
+         DRIP_DEFAULT,
+         [("off-season handled — price being agreed, not a made-up quote",
+           lambda t: "узгоджується" in t or "буде вартувати" not in t),
+          ("military/УБД discount answered", has("20%", "убд", "військов")),
+          ("photo/video (MEDIA) answered", has("сторіс", "хайлайтс", "фото"))]),
 }
 
-DEFAULT_SET = [2, 3, 5, 9, 10]
+DEFAULT_SET = [2, 5, 7, 15, 19, 21, 23, 24]
 
 
 # --------------------------------------------------------------------------- #
@@ -302,6 +545,10 @@ def run(selection):
     print(f"\n… settling {SETTLE_SECONDS}s for the bot to finish its real replies …")
     time.sleep(SETTLE_SECONDS)
 
+    print("\n… scraping ONE availability snapshot for live window-validation …")
+    snapshot = scrape_snapshot()
+    print(f"   snapshot: {'ok (' + str(len(snapshot)) + ' dates)' if snapshot else 'UNAVAILABLE (window-validation skipped)'}")
+
     print("\n" + "=" * 74 + "\nLIVE TRANSCRIPTS + AUDIT\n" + "=" * 74)
     total = passed = 0
     all_flags = []
@@ -311,6 +558,8 @@ def run(selection):
         print_transcript(name, conv_id, rows)
         _n, _m, _d, checks = PERSONAS[idx]
         results, flags = audit(rows, checks)
+        # Owner mandate: every offered date window must have every night free (no bridging).
+        flags = flags + window_violations(rows, snapshot)
         bot_msgs = sum(1 for r, _ in rows if r == "bot")
         print(f"   AUDIT (persona {idx}, {bot_msgs} bot messages):")
         for desc, ok in results:
@@ -324,7 +573,7 @@ def run(selection):
                 print(f"     🚩 RED FLAG: {f}")
                 all_flags.append((idx, f))
         else:
-            print("     ✅ no red flags (no hallucinated names / tennis court)")
+            print("     ✅ no red flags (no hallucinated names / tennis / bridged windows)")
 
     print("\n" + "=" * 74 + "\nLIVE AUTO-QA SUMMARY\n" + "-" * 74)
     print(f"  audits: {passed}/{total} passed | red flags: {len(all_flags)}")

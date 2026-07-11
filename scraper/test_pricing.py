@@ -167,17 +167,26 @@ def test_single_occupancy_standard_plus(engine):
     assert engine.price("Стандарт +", "2026-06-28", "2026-06-29", make_guests(adults=1)) == 2000
 
 
-# --- hard physical occupancy gate (owner rule 2026-06-24) ------------------
+# --- hard physical occupancy gate (owner rule FINALISED 2026-07-11) --------
+# Стандарт/Стандарт+: a 12+ child counts as an ADULT; MAX 3 adult-equivalents AND MAX 4 people.
+# So 3 adults + 1 child<12 fits (sofa); "2 adults + 14yo + 9yo" fits (= 3 adult-eq + 1 child<12).
 
 @pytest.mark.parametrize("room,adults,kids,fits", [
     ("Стандарт", 3, [], True),             # 3 adults OK
-    ("Стандарт", 4, [], False),            # 4 adults -> over (max 3 adults)
-    ("Стандарт", 3, [8], True),            # 3 adults + 1 child <12 -> 4 total OK
-    ("Стандарт", 3, [12], False),          # 3 adults + child 12+ (counts as adult) -> over
-    ("Стандарт", 2, [8, 10], True),        # 2 adults + 2 kids = 4 total OK
+    ("Стандарт", 4, [], False),            # 4 adults -> over
+    ("Стандарт", 2, [11], True),           # 3 people OK
+    ("Стандарт", 3, [8], True),            # 3 adults + 1 child <12 on the sofa -> OK (owner 07-11)
+    ("Стандарт", 2, [14, 9], True),        # 2 ad + 14yo(adult-eq) + 9yo = 3 adult-eq + 1 child -> OK
+    ("Стандарт", 3, [12], False),          # 3 adults + a 12+ child = 4 adult-eq -> over
+    ("Стандарт", 3, [14], False),
+    ("Стандарт", 2, [8, 12], True),        # 2 ad + 12yo(adult-eq) + 8yo = 3 adult-eq + 1 child -> OK
+    ("Стандарт", 2, [12, 14], False),      # 2 ad + two 12+ = 4 adult-eq -> over
+    ("Стандарт", 2, [8, 10], True),        # 2 adults + 2 children under 12 -> OK
+    ("Стандарт", 3, [8, 10], False),       # 5 total -> over
     ("Стандарт", 2, [8, 10, 5], False),    # 5 total -> over
     ("Стандарт +", 4, [], False),
-    ("Стандарт +", 3, [6], True),
+    ("Стандарт +", 3, [6], True),          # 3 adults + 1 child <12 -> OK
+    ("Стандарт +", 2, [6, 10], True),      # 2 adults + 2 children under 12 -> OK
     ("Напівлюкс", 5, [], True),            # Напівлюкс holds 5
     ("Напівлюкс", 4, [10], True),          # 5 total OK
     ("Напівлюкс", 5, [10], False),         # 6 total -> over
@@ -287,3 +296,34 @@ def test_is_priced_month_and_stay():
     assert stay_is_priced("2026-07-06", "2026-07-08") is True
     # checkin Aug 31 -> night of Sep 1 is off-season:
     assert stay_is_priced("2026-08-31", "2026-09-02") is False
+
+
+# --- meals (харчування) — exact food math (owner 2026-07-10) ---------------
+
+def test_meal_prices_new_structure():
+    import json, os
+    from pricing_engine import meal_prices
+    data = json.load(open(os.path.join(os.path.dirname(__file__), "pricing.json"), encoding="utf-8"))
+    p = meal_prices(data, "Серпень")
+    assert p["3-разове"] == 1100 and p["2-разове"] == 850
+    assert p["сніданок"] == 350 and p["обід"] == 450 and p["вечеря"] == 450
+
+
+def test_meal_cost_owner_example():
+    # Owner example: 3-разове for 4 people for 2 days + ONLY breakfast on the last day, August:
+    #   (1100*4*2) + (350*4*1) = 8800 + 1400 = 10200 грн
+    import json, os
+    from pricing_engine import meal_cost
+    data = json.load(open(os.path.join(os.path.dirname(__file__), "pricing.json"), encoding="utf-8"))
+    q = meal_cost(data, "Серпень", 4, three_meals_days=2, breakfast_days=1)
+    assert q.total == 10200
+    assert q.persons == 4
+    assert any("8800" in ln for ln in q.lines) and any("1400" in ln for ln in q.lines)
+
+
+def test_meal_cost_zero_when_empty():
+    import json, os
+    from pricing_engine import meal_cost
+    data = json.load(open(os.path.join(os.path.dirname(__file__), "pricing.json"), encoding="utf-8"))
+    q = meal_cost(data, "Липень", 3)
+    assert q.total == 0 and q.lines == []

@@ -585,3 +585,72 @@ no-dates-режим → велика група / faq_override → bare-confirma
 * **`simulate_live_chat.py`** (gitignored, локально): строгий персона-за-персоною цикл, 16
   персон; кожен транскрипт читається ВРУЧНУ. 503 Gemini — інфраструктура, не код (мітка
   Instagram + 5-хв кулдаун), персона перезапускається на свіжій conv.
+
+## 13. Owner QA rounds 2026-07-08 … 2026-07-11 (calendar, capacity, food, splits)
+
+Three strict live-QA rounds (owner reviewed real Chatwoot dialogues #266–#308). 425 pytest +
+56 auto_qa green; 8 live personas (2,5,7,15,19,21,23,24) verified per-persona.
+
+### 13.1 Room capacity — FINAL rule (owner resolved 2026-07-11)
+`pricing_engine.fits_room` for **Стандарт / Стандарт +** (and sub-types, incl. the "Сімейний В+Д"
+rooms with a sofa): a child aged **12+ counts as an ADULT** (adult-equivalent); a room holds
+**MAX 3 adult-equivalents AND MAX 4 people**. So:
+* 3 adults ✔; 3 adults + 1 child **<12** ✔ (4th on the sofa); 2 adults + 2 children <12 ✔;
+* **"2 adults + 14yo + 9yo" ✔** (= 3 adult-eq + 1 child <12) — the owner's explicit allowance;
+* 4 adults ✘; 3 adults + a 12+ child (= 4 adult-eq) ✘; 5 people ✘.
+Напівлюкс: max 5 people. **Age drives PRICING (дитяче<12 / додаткове≥12) independently of this
+capacity gate.**
+
+### 13.2 Food/meals — deterministic math (2026-07-10)
+* `pricing.json → "Харчування"[<місяць>]["будні/вихідні"]`: `{2-разове, 3-разове, окремо:{сніданок,обід,вечеря}}`.
+* `pricing_engine.meal_cost(data, month, persons, three_meals_days, two_meals_days, breakfast_days,
+  lunch_days, dinner_days)` = Σ unit×persons×days. Example (owner): 3-разове 4 ppl 2 days +
+  breakfast 1 day, August = (1100·4·2)+(350·4·1)=**10200**.
+* Extraction: `EXTRACTION_PROMPT` gained a `meals{}` slot; **deterministic fallback**
+  `bot_logic.parse_meal_request` parses the request from the message (food math must not depend
+  on the LLM). `dialogue_engine.finalize_meals` renders the breakdown; month from the booking
+  (checkin/fuzzy, with slot-memory + `_pending_window` fallback). `_meals_memory[conv]` emits a
+  given calc **once** (set only AFTER a real, non-superseded emit).
+* **Menu (dishes) vs prices:** `bot_logic.is_menu_question` ("які страви подають", "яке меню") →
+  `templates.FOOD_MENU` = "Точне меню та страви узгоджуються по заїзду."; price questions → FOOD_PRICES.
+
+### 13.3 Past dates (2026-07-10)
+`dialogue_engine._stay_before_calendar` (checkin earlier than ANY scraped date) → `templates.PAST_DATES`
+("Здається, ви помилилися з датами (вказані дати вже минули)…") in `finalize_quote` /
+`finalize_quote_all`. Never "all rooms booked" / invented offset for a past stay. Data-driven (no clock).
+
+### 13.4 Calendar (owner "bridging"/"hallucination" reports — root cause)
+* `_free_windows` / `find_nearest_window` are provably non-bridging (`_stay_all_free` gates every
+  night). Deterministic tests replicate #287 (17-18 booked) / #296 (Aug 1-5 booked). The live
+  "12-22"/"1-10"/"29 Jul-8 Aug" were **OtelMS mutating between scrape and review** — NOT a parser bug.
+* **#4 investigation (owner CONFIRMED the code was right, 2026-07-11):** "29.07-06.08 booked" — the
+  scraper is CORRECT (marks each day); the "free" 29.07 is a real **`Стандарт + Сімейний В+Д`**
+  sub-room that folds into public "Стандарт +" (the owner had missed it on the grid). **DECISION: KEEP
+  folding** the family sub-types (`Стандарт сімейний В+Д`, `Стандарт 4х 2Л + Д`, `Стандарт + Сімейний
+  В+Д`) into public availability (`build_simplified_availability`) — do NOT hide them.
+* `find_nearest_window` is exact-inclusive (off=0). `live_auto_qa.window_violations` re-scrapes ONE
+  snapshot and flags any offered same-month OR cross-month range whose interior nights are booked.
+
+### 13.5 Room splits (2026-07-09/10)
+* **Standard-priority** `dialogue_engine.suggest_group_distribution`: split a big group into
+  Стандарт-sized rooms (≤3 people/room), biggest first — 6 adults + 4 kids → **3+3+2+2** (four
+  Standards), never 3+3+4. `plan`'s 6+ path PROACTIVELY proposes it (dates-prefixed so a follow-up
+  turn isn't a dedup-duplicate).
+* **Accept a proposed split** (`bot_logic.accepts_split` = agreement word, NO digits — a message
+  with its own numbers is a counter-proposal) → `_pending_split` + `rooms_from_split` (round-robin
+  adults so no kids-only room) → quote all N rooms. `_pending_split` is NOT popped (double-fire safe).
+* **No available single room fits** → `finalize_quote_all` offers a `SUGGEST_STANDARD_SPLIT` naming
+  ONLY the types actually free on the dates (owner #19: party of 5 → Стандарт/Стандарт+, not booked Напівлюкс).
+* **Multi-room partial availability** (#23): a sold-out room no longer short-circuits — quote the
+  available rooms, flag booked ones (`PARTIAL_MULTIROOM_SOLDOUT`); all sold out → first room's nearest window.
+
+### 13.6 Payment (2026-07-09)
+`PAYMENT_RECEIVED_HANDOFF` reworded (concise: "менеджер … перевірить оплату"); tags BOTH `Замовлено`
+(mute) AND `Instagram`. The mute self-corrects the live_auto_qa double-fire.
+
+### 13.7 Live-harness note
+`live_auto_qa.py` double-fires each message (public-API webhook + manual `trigger_bot`). Hardening
+for state-mutating branches: set memory/pop state only AFTER a non-superseded emit; `last_bot_msg`
+skips NOTICE messages ("Секундочку"/greeting) so a superseded sibling's scrape-notice can't mask the
+real offer. Production Chatwoot fires once. Active persona set: {2,5,7,15,19,21,23,24}; passed
+personas commented out (kept). 23/24 mined from `your_instagram_activity/` (1091 real threads).

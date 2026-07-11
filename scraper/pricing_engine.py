@@ -211,23 +211,21 @@ def _is_napivlux(room_type: str) -> bool:
 
 
 def fits_room(room_type: str, adults: int, children_ages: Optional[List[int]] = None) -> bool:
-    """Physical occupancy gate (owner rule 2026-06-24).
+    """Physical occupancy gate (owner rule FINALISED 2026-07-11).
 
-    Стандарт / Стандарт + (and their sub-types): MAX 3 adults; MAX 4 people total; a child
-    aged 12+ counts as an adult (so 3 adults + a 12+ child is over capacity). Напівлюкс: MAX 5.
+    Стандарт / Стандарт + (and their sub-types, e.g. the 'Сімейний В+Д' rooms with a sofa):
+      * a child aged **12+** counts as an ADULT (адульт-еквівалент);
+      * MAX **3 adult-equivalents** AND MAX **4 people** total.
+    So 3 adults + 1 child <12 FITS (the 4th on the sofa), and "2 adults + 14yo + 9yo" fits too
+    (= 3 adult-equivalents + 1 child <12). 4 adults, 3 adults + a 12+ child, or 5 people do NOT.
+    Напівлюкс: MAX 5 people.
     """
     ages = children_ages or []
     total = adults + len(ages)
     if _is_napivlux(room_type):
         return total <= NAPIVLUX_MAX_TOTAL
-    over12 = sum(1 for a in ages if a is not None and a >= CHILD_PLACE_MAX_AGE)
-    if adults > STANDARD_MAX_ADULTS:
-        return False
-    if adults == STANDARD_MAX_ADULTS and over12 > 0:
-        return False
-    if total > STANDARD_MAX_TOTAL:
-        return False
-    return True
+    adult_equiv = adults + sum(1 for a in ages if a is not None and a >= CHILD_PLACE_MAX_AGE)
+    return adult_equiv <= STANDARD_MAX_ADULTS and total <= STANDARD_MAX_TOTAL
 
 
 # --- Pricing engine --------------------------------------------------------
@@ -400,6 +398,61 @@ class PricingEngine:
             else:
                 quotes.append(self.quote(*b))
         return MultiQuote(total=sum(q.total for q in quotes), rooms=quotes)
+
+
+# --- Meal (харчування) pricing --------------------------------------------
+# Owner 2026-07-10: the bot must compute the exact food cost, e.g. a 3-day stay eating full
+# board for 2 days and only breakfast on the last day, for 4 people, in August:
+#   (1100 * 4 * 2) + (350 * 4 * 1) = 10200 грн
+# Combo ("комплексне") prices are PER PERSON PER DAY and depend on the month; single meals
+# (сніданок/обід/вечеря) are flat per person per serving.
+
+MEAL_KEYS = ("three_meals_days", "two_meals_days", "breakfast_days", "lunch_days", "dinner_days")
+
+
+@dataclass
+class MealQuote:
+    total: int
+    persons: int
+    lines: List[str] = field(default_factory=list)
+
+
+def meal_prices(pricing_data: dict, month_uk: str) -> dict:
+    """{'3-разове','2-разове','сніданок','обід','вечеря'} unit prices for a given UA month name.
+
+    Reads the owner's `Харчування[<month>]["будні/вихідні"]` block (meal prices don't vary by day
+    of week): {"2-разове", "3-разове", "окремо": {"сніданок","обід","вечеря"}}."""
+    food = pricing_data.get("Харчування") or pricing_data.get("харчування") or {}
+    month = food.get(month_uk)
+    if not month:
+        raise OffSeasonError(f"No meal prices for month {month_uk!r}")
+    block = month.get("будні/вихідні") or next(iter(month.values()))
+    return {"2-разове": block["2-разове"], "3-разове": block["3-разове"], **block["окремо"]}
+
+
+def meal_cost(pricing_data: dict, month_uk: str, persons: int, three_meals_days: int = 0,
+              two_meals_days: int = 0, breakfast_days: int = 0, lunch_days: int = 0,
+              dinner_days: int = 0) -> MealQuote:
+    """Deterministic food total. Each component = unit_price * persons * days."""
+    if persons <= 0:
+        raise ValueError("persons must be >= 1")
+    p = meal_prices(pricing_data, month_uk)
+    parts = [
+        ("3-разове харчування", p["3-разове"], three_meals_days),
+        ("2-разове харчування", p["2-разове"], two_meals_days),
+        ("Сніданок", p["сніданок"], breakfast_days),
+        ("Обід", p["обід"], lunch_days),
+        ("Вечеря", p["вечеря"], dinner_days),
+    ]
+    total, lines = 0, []
+    for label, unit, days in parts:
+        days = int(days or 0)
+        if days <= 0:
+            continue
+        sub = unit * persons * days
+        total += sub
+        lines.append(f"• {label}: {unit} грн × {persons} ос. × {days} дн. = {sub} грн")
+    return MealQuote(total=total, persons=persons, lines=lines)
 
 
 # --- Convenience parsing for guest specs -----------------------------------

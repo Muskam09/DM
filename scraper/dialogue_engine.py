@@ -323,6 +323,74 @@ def _assign_fitting_type(room: Dict) -> Dict:
     return {**room, "room_type": OFFERABLE_ROOMS[-1]}  # largest (Напівлюкс) fallback
 
 
+# STANDARD-PRIORITY (owner 2026-07-10): the hotel sells Стандарт / Стандарт+ first, so a big
+# group is split into Стандарт-sized rooms (comfortably 3 people: base 2 + one extra bed/sofa)
+# rather than packed into a few Напівлюкси.
+STANDARD_COMFORT_PER_ROOM = 3
+
+
+def suggest_group_distribution(adults: int, children_ages) -> List[int]:
+    """Standard-first split of a group into rooms — the people count per room, biggest first.
+
+    Constraints: <= STANDARD_COMFORT_PER_ROOM (3) people per room, and <= 3 adults per room.
+    e.g. 6 adults + 4 kids (2,8,11,14) = 10 people -> [3, 3, 2, 2] (FOUR Стандарти, owner #21),
+    never [3, 3, 4] which would push people into a Напівлюкс and violate the Standard priority.
+    """
+    ages = list(children_ages or [])
+    total = adults + len(ages)
+    if total <= 0:
+        return []
+    n = max(1,
+            -(-total // STANDARD_COMFORT_PER_ROOM),                   # ceil: <=3 people per room
+            -(-adults // pricing_engine.STANDARD_MAX_ADULTS))         # ceil: <=3 adults per room
+    base, rem = divmod(total, n)
+    return [base + (1 if i < rem else 0) for i in range(n)]           # biggest rooms first
+
+
+def rooms_from_split(counts: List[int], adults: int, children_ages, checkin, checkout) -> List[Dict]:
+    """Turn an ACCEPTED split (per-room people counts) into concrete room objects. Adults are
+    SPREAD round-robin (each room gets >=1 adult where possible, <=3 adults, <= its people count),
+    then children fill the remaining slots — so we never propose a kids-only room."""
+    kids = list(children_ages or [])
+    n = len(counts)
+    a_per = [0] * n
+    a_left = adults
+    changed = True
+    while a_left > 0 and changed:                       # round-robin one adult at a time
+        changed = False
+        for i in range(n):
+            if a_left <= 0:
+                break
+            if a_per[i] < counts[i] and a_per[i] < pricing_engine.STANDARD_MAX_ADULTS:
+                a_per[i] += 1
+                a_left -= 1
+                changed = True
+    rooms = []
+    for i in range(n):
+        k = [kids.pop(0) for _ in range(min(counts[i] - a_per[i], len(kids)))]
+        rooms.append({"room_type": None, "checkin": checkin, "checkout": checkout,
+                      "adults": a_per[i], "children_count": len(k), "children_ages": k})
+    return rooms
+
+
+def _calendar_min_date(availability: Dict):
+    """Earliest date the scraped calendar knows about (None when the scrape is empty)."""
+    ds = [d for v in (availability or {}).values() for d in (v or {})]
+    return min(ds) if ds else None
+
+
+def _stay_before_calendar(availability: Dict, checkin) -> bool:
+    """True when the requested check-in is EARLIER than anything the calendar shows — i.e. the
+    dates have already passed. Data-driven (no clock), so we never claim "all rooms booked" for a
+    stay that is simply in the past (owner #288/#299)."""
+    lo = _calendar_min_date(availability)
+    return bool(lo and checkin and str(checkin) < lo)
+
+
+def _past_dates_reply(checkin, checkout) -> str:
+    return templates.PAST_DATES
+
+
 def _fuzzy_offseason(fuzzy: str) -> bool:
     t = (fuzzy or "").lower()
     return any(w in t for w in _OFFSEASON_WORDS)
@@ -344,38 +412,66 @@ def _nights(room: Dict) -> Optional[int]:
     return n if isinstance(n, int) and n > 0 else None
 
 
+def _stay_all_free(avail_map: Dict, checkin, checkout, room_count: int = 1) -> bool:
+    """THE single source of truth for "is this exact stay bookable": True IFF EVERY night in
+    [checkin, checkout) has >= room_count free rooms. A date missing from the scrape counts as
+    0 (booked). Owner mandate (#287/#296): a window is valid ONLY when every single one of its
+    nights is free — never bridge/hallucinate over a booked day."""
+    ci = pricing_engine._as_date(checkin)
+    co = pricing_engine._as_date(checkout)
+    if co <= ci:
+        return False
+    night = ci
+    while night < co:
+        if avail_map.get(night.isoformat(), 0) < room_count:
+            return False
+        night += timedelta(days=1)
+    return True
+
+
 def find_nearest_window(availability, room_type, after, nights, room_count=1, horizon=90):
-    """Forward-scan up to `horizon` days (default 90) after `after` for the first block
-    of `nights` consecutive dates where `room_type` has >= room_count free."""
+    """Earliest bookable `nights`-night window for `room_type`, scanning from `after` forward up
+    to `horizon` days. EXACT-INCLUSIVE (off starts at 0): if the requested check-in itself begins
+    a fully-free block, that exact window is returned unchanged (owner #274/#288: propose the exact
+    dates when free). Every candidate is gated by `_stay_all_free`, so a window is NEVER returned
+    if ANY of its nights is booked — no bridging over booked days (#287)."""
     key = bot_logic.match_availability_key(availability, room_type)
     if not key:
         return None
     avail = availability.get(key) or {}
     start = pricing_engine._as_date(after)
-    for off in range(1, horizon + 1):
+    for off in range(0, horizon + 1):
         d0 = start + timedelta(days=off)
-        block = [(d0 + timedelta(days=i)).isoformat() for i in range(nights)]
-        if all(avail.get(x, 0) >= room_count for x in block):
-            return (d0.isoformat(), (d0 + timedelta(days=nights)).isoformat())
+        co = d0 + timedelta(days=nights)
+        if _stay_all_free(avail, d0.isoformat(), co.isoformat(), room_count):
+            return (d0.isoformat(), co.isoformat())
     return None
 
 
 def _free_windows(avail: Dict, dates: List[str], min_nights: int, room_count: int):
-    """Maximal continuous free stretches (>= min_nights) within `dates` (sorted)."""
-    windows, run, prev = [], [], None
-    for d in dates:
-        if avail.get(d, 0) < room_count:
-            if len(run) >= min_nights:
-                windows.append((run[0], run[-1]))
-            run, prev = [], None
-            continue
-        cur = pricing_engine._as_date(d)
-        if prev is not None and (cur - prev).days != 1:
-            if len(run) >= min_nights:
+    """Maximal continuous free stretches (>= min_nights) within `dates` (sorted).
+
+    Contiguity is enforced CALENDAR-DAY by calendar-day between the first and last date:
+    ANY day that is missing from `dates` OR has fewer than `room_count` free rooms BREAKS
+    the run. Non-contiguous free spans are therefore NEVER bridged into one window — the
+    owner fix for #271 (the illegal "12 - 22 липня" merge over booked 17-18 липня).
+    """
+    if not dates:
+        return []
+    date_set = set(dates)
+    lo = pricing_engine._as_date(dates[0])
+    hi = pricing_engine._as_date(dates[-1])
+    windows, run = [], []
+    day = lo
+    while day <= hi:
+        iso = day.isoformat()
+        if iso in date_set and avail.get(iso, 0) >= room_count:
+            run.append(iso)                         # this night is free -> extend the run
+        else:
+            if len(run) >= min_nights:              # a booked/absent day CLOSES the run
                 windows.append((run[0], run[-1]))
             run = []
-        run.append(d)
-        prev = cur
+        day += timedelta(days=1)
     if len(run) >= min_nights:
         windows.append((run[0], run[-1]))
     return windows
@@ -425,8 +521,7 @@ def propose_windows(spec: Dict, availability: Dict, count: int = 2) -> str:
     # The period is fully visible but booked there -> offer the nearest real window.
     nearest = _free_windows(avail, all_dates, min_nights, room_count)
     if nearest:
-        w = nearest[0]
-        return templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(w[0], w[1]))
+        return _found_nearest_reply(nearest[0])
     return templates.NEAREST_NONE
 
 
@@ -548,8 +643,28 @@ def plan(slots: Dict) -> Dict:
     # them BEFORE quoting (owner rule 2026-06-23). Only when the client packed everyone
     # into ONE room object; an explicit multi-room request (>1 room) is already split.
     if len(rooms) == 1 and _room_guests(rooms[0]) >= 6:
-        # Fix (2026-06-24): show the room capacities FIRST (so the client knows the limits),
-        # then ask how to split. [SPLIT] -> two messages.
+        # Show room capacities FIRST (client knows the limits), then handle the group.
+        r0 = rooms[0]
+        cc0, known_ages0 = _child_count(r0), len(r0.get("children_ages") or [])
+        if cc0 == known_ages0:
+            # Owner #21: composition fully known -> PROACTIVELY propose a STANDARD-priority split.
+            counts = suggest_group_distribution(r0.get("adults") or 0, r0.get("children_ages") or [])
+            # A dates/period prefix makes a follow-up turn's message DIFFERENT from the first one,
+            # so the anti-dedup doesn't silence it and the room list isn't repeated (owner #304).
+            if r0.get("checkin") and r0.get("checkout"):
+                prefix = f"На дати {dates_phrase(r0['checkin'], r0['checkout'])}: "
+            elif r0.get("fuzzy_date"):
+                prefix = f"Орієнтуємось на {r0['fuzzy_date']}: "
+            else:
+                prefix = ""
+            return {"action": "reply",
+                    "split_counts": counts,
+                    "reply": templates.PRESENTATION_ROOMS + "[SPLIT]"
+                    + templates.SUGGEST_GROUP_SPLIT
+                    .replace("{dates_prefix}", prefix)
+                    .replace("{rooms}", room_count_phrase(len(counts)))
+                    .replace("{distribution}", " + ".join(str(c) for c in counts))}
+        # Ages still unknown -> we can't compute a precise valid split; ask how to distribute.
         return {"action": "reply",
                 "reply": templates.PRESENTATION_ROOMS + "[SPLIT]" + templates.ASK_ROOM_DISTRIBUTION}
 
@@ -566,7 +681,18 @@ def plan(slots: Dict) -> Dict:
         if chosen:
             return {"action": "quote", "rooms": chosen}
         if len(dated) > 1:
-            # Multi-room split WITHOUT chosen types (e.g. "2 номери: 4 і 3") — auto-assign the
+            # Owner fix #282-284: a requested split that packs MORE THAN 3 adults into ONE room
+            # can't be honoured (max 3 adults per room). Don't just fail / cram them into a
+            # Напівлюкс — suggest a VALID split into enough rooms (7 adults -> 3 номери 2+2+3).
+            if any((r.get("adults") or 0) > pricing_engine.STANDARD_MAX_ADULTS for r in dated):
+                total_adults = sum((r.get("adults") or 0) for r in dated)
+                split = sorted(_adult_split(total_adults))
+                return {"action": "reply",
+                        "split_counts": split,
+                        "reply": templates.SUGGEST_ADULT_SPLIT
+                        .replace("{rooms}", room_count_phrase(len(split)))
+                        .replace("{distribution}", " + ".join(str(a) for a in split))}
+            # Multi-room split WITHOUT chosen types (e.g. "2 номери: 3 і 2") — auto-assign the
             # smallest FITTING type per room (Стандарт-first) and quote EVERY room, never just
             # the first (owner Rule 1 fix, caught live in Persona 15).
             return {"action": "quote", "rooms": [_assign_fitting_type(r) for r in dated]}
@@ -633,6 +759,16 @@ def _with_ubd_note(reply: str, ubd: bool) -> str:
     return (reply + "\n\n" + templates.MILITARY) if ubd else reply
 
 
+def _found_nearest_reply(win) -> str:
+    """SOLD_OUT_FOUND_NEAREST with BOTH the dates AND the explicit nights count filled in.
+    The offered window is exactly `checkout - checkin` nights long, so the stated nights ALWAYS
+    match the stated dates (owner fix #274: night count and exact dates must align)."""
+    n = pricing_engine.nights_between(win[0], win[1])
+    return (templates.SOLD_OUT_FOUND_NEAREST
+            .replace("{dates}", dates_phrase(win[0], win[1]))
+            .replace("{nights}", nights_phrase(n)))
+
+
 def _room_too_small_reply(rooms: List[Dict]) -> str:
     """Multi-room booking where one or more chosen rooms can't physically hold their party.
     Name each bad room and ask to redistribute — never silently drop the valid rooms."""
@@ -645,47 +781,56 @@ def _room_too_small_reply(rooms: List[Dict]) -> str:
             + templates.ROOM_TOO_SMALL.replace("{деталі}", "; ".join(parts)))
 
 
+def _soldout_reply(r: Dict, simplified_availability: Dict, ubd_booking: bool) -> str:
+    """The sold-out response for ONE requested room: a capacity-aware cross-sell of other FITTING
+    free types on the SAME dates (Case 4), else the nearest free window (Case 5), else NEAREST_NONE."""
+    room_type = r.get("room_type")
+    checkin = r.get("checkin")
+    nights = pricing_engine.night_dates(checkin, r.get("checkout"))
+    free = [rt for rt in bot_logic.free_room_types(simplified_availability, nights)
+            if pricing_engine.fits_room(rt, r.get("adults") or 0, r.get("children_ages") or [])]
+    if free:  # other FITTING categories free on the SAME dates -> cross-sell
+        return _with_ubd_note(templates.ROOM_BOOKED
+                              .replace("{тип номеру}", room_type)
+                              .replace("{вільні_номери}", ", ".join(free)), ubd_booking)
+    win = find_nearest_window(simplified_availability, room_type, checkin, len(nights))
+    if not win:  # never ask permission — scan ANY fitting room type before giving up
+        win = nearest_window_any(simplified_availability, checkin, len(nights),
+                                 fit_adults=r.get("adults"), fit_children=r.get("children_ages"))
+    if win:
+        return _with_ubd_note(_found_nearest_reply(win), ubd_booking)
+    return templates.NEAREST_NONE
+
+
 def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGINE) -> str:
     """Gate on availability, compute the price deterministically, format rigidly.
 
-    AVAILABILITY GATING: if ANY requested room is sold out on the dates, we return
-    the sold-out alternative and never quote a price. УБД (-20%) applies to the WHOLE
-    booking, so when it's flagged we also append the MILITARY note to those alternatives.
+    AVAILABILITY GATING: a sold-out room is never quoted. For a SINGLE room -> the sold-out
+    alternative (cross-sell / nearest window). For a MULTI-room booking, a sold-out room must NOT
+    short-circuit the others (owner #23): the available rooms are quoted and the booked ones are
+    flagged separately. УБД (-20%) applies to the WHOLE booking, so the MILITARY note is appended
+    to sold-out alternatives when flagged.
     """
     ubd_booking = any(bool(r.get("ubd")) for r in rooms)
     priced = []
     too_small = []
+    sold_out = []
     for r in rooms:
         room_type = r.get("room_type")
         checkin, checkout = r.get("checkin"), r.get("checkout")
         nights = pricing_engine.night_dates(checkin, checkout)
 
+        # Owner #299: dates EARLIER than the whole visible calendar have already passed. Say so —
+        # never report "all rooms booked" and never invent an offset window for a past stay.
+        if _stay_before_calendar(simplified_availability, checkin):
+            return _past_dates_reply(checkin, checkout)
+
         status = bot_logic.is_room_available(simplified_availability, room_type, nights)
         if status == "sold_out":
-            # Case 4: other room types are still free on these dates -> offer them.
-            # Case 5: nothing free at all -> offer to find the nearest free dates.
-            free = bot_logic.free_room_types(simplified_availability, nights)
-            # Capacity-aware cross-sell (owner Rule 1 fix, caught live in Persona 15): only offer
-            # free types that PHYSICALLY hold this room's party — never suggest a Стандарт for a
-            # 4-adult room. If none of the free types fit, fall through to the nearest window.
-            free = [rt for rt in free
-                    if pricing_engine.fits_room(rt, r.get("adults") or 0, r.get("children_ages") or [])]
-            if free:  # Step 1: other FITTING categories free on the SAME dates -> cross-sell.
-                return _with_ubd_note(templates.ROOM_BOOKED
-                                      .replace("{тип номеру}", room_type)
-                                      .replace("{вільні_номери}", ", ".join(free)), ubd_booking)
-            # Step 2: everything booked -> forward-scan THIS room for the nearest block.
-            win = find_nearest_window(simplified_availability, room_type, checkin, len(nights))
-            if not win:
-                # Fix 5: NEVER ask permission — ALWAYS offer the nearest window. If the chosen
-                # room has none, scan ANY room type that fits the party before giving up.
-                win = nearest_window_any(simplified_availability, checkin, len(nights),
-                                         fit_adults=r.get("adults"), fit_children=r.get("children_ages"))
-            if win:  # exact dates were sold out -> "found nearest" wording (NOT "ще не визначились").
-                return _with_ubd_note(
-                    templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1])),
-                    ubd_booking)
-            return templates.NEAREST_NONE
+            if len(rooms) == 1:
+                return _soldout_reply(r, simplified_availability, ubd_booking)
+            sold_out.append(r)      # multi-room: collect, handle after the loop (never drop the rest)
+            continue
 
         adults = r.get("adults") or 0
         children_ages = r.get("children_ages") or []
@@ -717,6 +862,15 @@ def finalize_quote(rooms: List[Dict], simplified_availability: Dict, engine=ENGI
         if len(rooms) == 1:
             return finalize_quote_all(too_small[0], simplified_availability)
         return _room_too_small_reply(too_small)
+
+    # Multi-room booking where SOME rooms are sold out (owner #23): quote the available rooms and
+    # flag the booked ones separately — never drop a valid room because a sibling is booked.
+    if sold_out:
+        if not priced:
+            return _soldout_reply(sold_out[0], simplified_availability, ubd_booking)
+        types = ", ".join(dict.fromkeys(r.get("room_type") for r in sold_out if r.get("room_type")))
+        return (build_quote_reply(priced, ubd_booking) + "\n\n"
+                + templates.PARTIAL_MULTIROOM_SOLDOUT.replace("{зайняті}", types))
 
     # УБД (2026-06-23): -20% applies to the WHOLE booking (a veteran's family), so a single
     # flagged room discounts the entire total. The discount is rendered on the grand total.
@@ -788,11 +942,27 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
         adults = 2
     ubd = bool(spec.get("ubd"))
 
+    # Owner #299: the requested stay is entirely before the visible calendar -> it has passed.
+    if _stay_before_calendar(simplified_availability, checkin):
+        return _past_dates_reply(checkin, checkout)
+
+    # Availability status per public type on the requested nights. When the scrape COVERS this
+    # window (at least one type has a definite available/sold_out status) we recommend ONLY types
+    # confirmed AVAILABLE — never a type OtelMS didn't confirm free (owner fix #275: no blind
+    # recommendations). A window entirely OUTSIDE the visible calendar (every type 'unknown')
+    # stays lenient (far-future exact dates still list all priced types).
+    statuses = {rt: bot_logic.is_room_available(simplified_availability, rt, nights)
+                for rt in OFFERABLE_ROOMS}
+    window_covered = any(s != "unknown" for s in statuses.values())
+
     # Single-room options that FIT the party, in Стандарт-first order (Напівлюкс stays LAST).
     single = []  # (room_type, price)
     for room_type in OFFERABLE_ROOMS:
-        if bot_logic.is_room_available(simplified_availability, room_type, nights) == "sold_out":
+        status = statuses[room_type]
+        if status == "sold_out":
             continue
+        if window_covered and status != "available":
+            continue  # Fix #275: within a covered window, only offer confirmed-available types
         try:
             guests = pricing_engine.make_guests(adults=adults, children_ages=children_ages)
             quote = engine.quote(room_type, checkin, checkout, guests)
@@ -806,37 +976,60 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
                                      simplified_availability, engine, ubd)
 
     if not single and not splits:
+        # Owner #19 (2026-07-10): the party fits no AVAILABLE single room on these dates (too big,
+        # or the only fitting type — Напівлюкс — is booked). Before jumping to another date, offer a
+        # STANDARD-priority split across the types that are ACTUALLY free on these nights.
+        counts = suggest_group_distribution(adults, children_ages)
+        if len(counts) > 1:
+            free_std = [rt for rt in STANDARD_TYPES
+                        if _min_free_on_nights(simplified_availability, rt, nights) >= 1]
+            total_free = sum(_min_free_on_nights(simplified_availability, rt, nights)
+                             for rt in STANDARD_TYPES)
+            if free_std and total_free >= len(counts):
+                reply = (templates.SUGGEST_STANDARD_SPLIT
+                         .replace("{dates}", dates_phrase(checkin, checkout))
+                         .replace("{nights}", nights_phrase(len(nights)))
+                         .replace("{guests}", guests_phrase(adults, children_ages))
+                         .replace("{rooms}", room_count_phrase(len(counts)))
+                         .replace("{distribution}", " + ".join(str(c) for c in counts))
+                         .replace("{типи}", ", ".join(free_std)))
+                return _with_ubd_note(reply, ubd)
+
         # Everything sold out -> AUTO-propose the nearest free window (don't ask permission);
         # only NEAREST_NONE if nothing free in the whole window. УБД -> append MILITARY note.
         win = nearest_window_any(simplified_availability, checkin, len(nights),
                                  fit_adults=adults, fit_children=children_ages)
         if win:
-            return _with_ubd_note(
-                templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1])), ubd)
+            return _with_ubd_note(_found_nearest_reply(win), ubd)
         return templates.NEAREST_NONE
 
     dates_ph = dates_phrase(checkin, checkout)
     nights_ph = nights_phrase(len(nights))
     guests_ph = guests_phrase(adults, children_ages)
 
+    # Owner fix #266: put the exact "(з урахуванням знижки УБД -20%)" note on the price line
+    # itself, so the discount is unmistakable on the FIRST priced message.
+    ubd_note = " (з урахуванням знижки УБД -20%)" if ubd else ""
+
     if splits:
         # Group of adults -> several standard rooms PRIMARY; a single Напівлюкс only as a
         # secondary "roomier" option (owner rule 2026-07-06).
         lines = [f"{_ROOM_EMOJI.get(rt, '•')} {room_count_phrase(len(split))} {rt} "
-                 f"(розподіл {' + '.join(str(a) for a in split)} дорослих) — {total} грн"
+                 f"(розподіл {' + '.join(str(a) for a in split)} дорослих) — {total} грн{ubd_note}"
                  for rt, split, total in splits]
         napiv = next((p for (t, p) in single if pricing_engine._is_napivlux(t)), None)
-        fallback = (f"\nАбо один просторий Напівлюкс — {napiv} грн (радше для родини з дітьми)."
+        fallback = (f"\nАбо один просторий Напівлюкс — {napiv} грн{ubd_note} (радше для родини з дітьми)."
                     if napiv is not None else "")
+        # Owner fix #266: dropped the "(Стандартів у нас більше, ніж Напівлюксів)" aside.
         header = (f"На дати {dates_ph} ({nights_ph}) для {guests_ph} рекомендуємо кілька "
-                  f"окремих номерів (Стандартів у нас більше, ніж Напівлюксів):")
+                  f"окремих номерів:")
         reply = header + "\n" + "\n".join(lines) + fallback + "\nЯкий варіант обираєте? 💙"
         if ubd:
-            reply += "\n\n💚 Вказані ціни вже враховують знижку УБД -20%.\n\n" + templates.MILITARY
+            reply += "\n\n" + templates.MILITARY
         return reply
 
     # Small party / family -> single-room listing, Стандарт/Стандарт+ first, Напівлюкс last.
-    lines = [f"{_ROOM_EMOJI.get(rt, '•')} {rt} — {price} грн" for (rt, price) in single]
+    lines = [f"{_ROOM_EMOJI.get(rt, '•')} {rt} — {price} грн{ubd_note}" for (rt, price) in single]
     header = f"На дати {dates_ph} ({nights_ph}) для {guests_ph} доступні такі номери:"
 
     # Family recommendation (owner rule 2026-07-06, REVERSED from the old Напівлюкс-first):
@@ -850,8 +1043,81 @@ def finalize_quote_all(spec: Dict, simplified_availability: Dict, engine=ENGINE)
 
     reply = header + "\n" + "\n".join(lines) + family_note + "\nЯкий тип номеру обираєте? 💙"
     if ubd:
-        reply += "\n\n💚 Вказані ціни вже враховують знижку УБД -20%.\n\n" + templates.MILITARY
+        reply += "\n\n" + templates.MILITARY
     return reply
+
+
+# --- meals (харчування) — deterministic food math (owner 2026-07-10) -------
+
+def meals_month(slots: Dict) -> Optional[str]:
+    """The UA month name to price meals in: the booking's check-in month, else the fuzzy period's
+    month. None when we cannot tell (then we don't guess a price)."""
+    for r in slots.get("rooms") or []:
+        if r.get("checkin"):
+            try:
+                return pricing_engine.month_name_uk(pricing_engine._as_date(r["checkin"]))
+            except Exception:
+                pass
+    for r in slots.get("rooms") or []:
+        if r.get("fuzzy_date"):
+            m = _fuzzy_month(str(r["fuzzy_date"]).lower())
+            if m:
+                return pricing_engine._UA_MONTHS[m]
+    return None
+
+
+def _meal_days(meals: Dict, key: str) -> int:
+    v = meals.get(key)
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def has_meal_request(meals) -> bool:
+    """True when the extractor captured an ACTIONABLE meal-cost request (>=1 day of something)."""
+    if not isinstance(meals, dict):
+        return False
+    return any(_meal_days(meals, k) > 0 for k in pricing_engine.MEAL_KEYS)
+
+
+def meals_key(meals) -> tuple:
+    """A stable key for a meal request, so an already-answered calc isn't re-emitted every turn."""
+    if not isinstance(meals, dict):
+        return ()
+    return tuple(_meal_days(meals, k) for k in pricing_engine.MEAL_KEYS) + (meals.get("persons"),)
+
+
+def finalize_meals(meals: Dict, month_uk: str, default_persons: int = 0) -> Optional[str]:
+    """Exact food cost, e.g. 3-разове × 2 дні + сніданок × 1 день for 4 people in Серпень:
+    (1100*4*2) + (350*4*1) = 10200 грн. Returns None when we can't price it."""
+    if not has_meal_request(meals) or not month_uk:
+        return None
+    persons = meals.get("persons")
+    try:
+        persons = int(persons)
+        if persons <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        persons = int(default_persons or 0)     # extractor gave null/garbage -> use the guest count
+    if persons <= 0:
+        return None
+    try:
+        q = pricing_engine.meal_cost(
+            ENGINE.data, month_uk, persons,
+            three_meals_days=_meal_days(meals, "three_meals_days"),
+            two_meals_days=_meal_days(meals, "two_meals_days"),
+            breakfast_days=_meal_days(meals, "breakfast_days"),
+            lunch_days=_meal_days(meals, "lunch_days"),
+            dinner_days=_meal_days(meals, "dinner_days"))
+    except (pricing_engine.OffSeasonError, KeyError, ValueError):
+        return None
+    if not q.lines:
+        return None
+    return (templates.FOOD_CALCULATION
+            .replace("{persons}", str(q.persons))
+            .replace("{lines}", "\n".join(q.lines))
+            .replace("{total}", str(q.total)))
 
 
 def nearest_reply(spec: Dict, availability: Dict) -> str:
@@ -863,5 +1129,5 @@ def nearest_reply(spec: Dict, availability: Dict) -> str:
         return templates.QUESTION_ONLY_DATES
     win = find_nearest_window(availability, room, after, nights)
     if win:
-        return templates.SOLD_OUT_FOUND_NEAREST.replace("{dates}", dates_phrase(win[0], win[1]))
+        return _found_nearest_reply(win)
     return templates.NEAREST_NONE

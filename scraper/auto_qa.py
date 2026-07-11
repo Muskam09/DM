@@ -86,7 +86,8 @@ class Harness:
         """Fresh per-conversation state so personas never bleed into each other."""
         bs = bot_server
         for d in (bs.AVAILABILITY_CACHE, bs._conv_seq, bs._slot_memory,
-                  bs._pending_window, bs._cooldowns, bs._conv_locks):
+                  bs._pending_window, bs._cooldowns, bs._conv_locks,
+                  bs._pending_split, bs._meals_memory):
             d.clear()
         bs._greeted.clear()
         bs._no_dates_mode.clear()
@@ -304,14 +305,15 @@ PERSONAS = [
                     ("no room math", lacks("буде вартувати"))]},
     ]},
 
-    # ---- 6+ guests in one room -> ask distribution first -----------------
-    {"name": "6+ в одному номері -> запит розселення", "conv": 9012, "turns": [
+    # ---- 6+ guests in one room -> proactively propose a valid split (owner #21) -----
+    {"name": "6+ в одному номері -> пропозиція розподілу", "conv": 9012, "turns": [
         {"client": "нас 6, на 6-8 липня",
          "slots": {"topic": "price_quote", "rooms": [
              {"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
               "adults": 6, "children_count": 0, "children_ages": []}]},
          "expect": [("shows capacities first", has("максимум 3 дорослих")),
-                    ("then asks how to split", has("як вас краще розселити")),
+                    ("proposes a valid split", has("розподілити")),
+                    ("2 rooms of 3", order("2 номери", "3 + 3")),
                     ("no premature quote", lacks("буде вартувати"))]},
     ]},
 
@@ -325,12 +327,17 @@ PERSONAS = [
                     ("no price", lacks("буде вартувати"))]},
     ]},
 
-    # ---- Payment hand-off: never auto-confirm ----------------------------
-    {"name": "Оплата -> хендоф людині", "conv": 9014, "turns": [
+    # ---- Payment hand-off: never auto-confirm (owner #22 2026-07-09) ------
+    {"name": "Оплата -> хендоф менеджеру + мут", "conv": 9014, "turns": [
         {"client": "Оплатив, ось квитанція",
          "slots": {"topic": "greeting", "rooms": []},
-         "expect": [("hands off to admin", has("адміністратор")),
+         "expect": [("hands off to manager", has("менеджер")),
+                    ("says manager will verify payment", has("перевірить оплату")),
                     ("does NOT auto-confirm the booking", lacks("буде вартувати"))]},
+        {"client": "а коли буде підтвердження?",   # bot is now MUTED (Замовлено) -> silent
+         "slots": {"topic": "greeting", "rooms": []},
+         "labels": ["Замовлено"],
+         "expect": [("stays silent while muted", lambda out: out == "")]},
     ]},
 
     # ---- Barter/blogger: silent + tag ------------------------------------
@@ -360,6 +367,35 @@ PERSONAS = [
          "slots": {"topic": "faq", "faq_template": "CHECK_IN_OUT", "rooms": []},
          "expect": [("prepayment rules (IBAN)", has("аванс")),
                     ("not the check-in time answer", lacks("Заїзд у нас з 14:00"))]},
+    ]},
+
+    # ---- Owner fix #278: children's pool question -> dedicated CHILDREN_POOL answer ----
+    {"name": "Дитячий басейн -> окрема відповідь (fix #278)", "conv": 9019, "turns": [
+        {"client": "Чи є у вас дитячий басейн?",
+         "slots": {"topic": "faq", "faq_template": "POOL", "rooms": []},
+         "expect": [("answers about the children's pool", has("дитячий басейн")),
+                    ("gives size & depth", has("3х2")),
+                    ("gives temperature", has("28"))]},
+    ]},
+
+    # ---- Owner fix #282-284: split with >3 adults in a room -> suggest a valid split ----
+    {"name": "7 дорослих: 4 і 3 -> валідний розподіл (fix #282-284)", "conv": 9020, "turns": [
+        {"client": "На 23-24 липня, нас 7 дорослих",
+         "slots": {"topic": "price_quote", "rooms": [
+             {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24",
+              "adults": 7, "children_count": 0, "children_ages": []}]},
+         "avail": {"Стандарт": {"2026-07-23": 5, "2026-07-24": 5}},
+         "expect": [("proposes a valid split first", has("розподілити")),
+                    ("shows capacities", has("максимум 3 дорослих"))]},
+        {"client": "Давайте 2 номери: в одному 4, в іншому 3",
+         "slots": {"topic": "price_quote", "rooms": [
+             {"room_type": None, "checkin": None, "checkout": None, "adults": 4, "children_ages": []},
+             {"room_type": None, "checkin": None, "checkout": None, "adults": 3, "children_ages": []}]},
+         "avail": {"Стандарт": {"2026-07-23": 5, "2026-07-24": 5}},
+         "expect": [("max-3-adults explained", has("максимум 3 дорослих")),
+                    ("suggests 3 rooms", has("3 номери")),
+                    ("shows an even distribution", has("2 + 2 + 3")),
+                    ("never quotes the invalid room", lacks("буде вартувати"))]},
     ]},
 ]
 

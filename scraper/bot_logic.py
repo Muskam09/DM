@@ -107,7 +107,15 @@ def match_availability_key(simplified: Dict, room_type: str):
             return key
     for key in simplified:                       # lenient substring
         nk = _norm_room(key)
-        if target and (target in nk or nk in target):
+        if not target:
+            continue
+        # NEVER cross-match "Стандарт" and "Стандарт +" — they are DISTINCT public types
+        # ("стандарт" is a substring of "стандарт+"). Without this guard, a scrape holding only
+        # "Стандарт" would report "Стандарт +" as available and the bot would blindly recommend
+        # it (owner fix #275: only recommend types actually confirmed in the calendar).
+        if ("+" in target) != ("+" in nk):
+            continue
+        if target in nk or nk in target:
             return key
     return None
 
@@ -275,6 +283,130 @@ def _pool_template(t: str) -> str:
     return "POOL"
 
 
+# A CHILDREN'S pool question ("чи є дитячий басейн?", "басейн для дітей") gets its own
+# answer (size 3x2, depth 30 cm, water from 28°C) — owner fix #278. Detected when the pool
+# question is explicitly about a CHILDREN'S pool (not the general/adult pool).
+_CHILD_POOL_MARKERS = ["дитячий басейн", "дитячого басейн", "дитячим басейн", "дитячі басейн",
+                       "дитбасейн", "басейн для дітей", "басейн для діток", "басейн для малеч",
+                       "дитячий бесейн", "дитячого бесейн"]
+
+
+def is_children_pool_question(text: str) -> bool:
+    """True for a question specifically about the CHILDREN'S pool (owner fix #278)."""
+    t = (text or "").lower()
+    return any(m in t for m in _CHILD_POOL_MARKERS)
+
+
+# Persona 17: "чи можна приходити зі своїм [їжею/напоями]" -> NO (we have a kolyba/bar).
+_OWN_FOOD_MARKERS = [
+    "зі своїм", "зі своєю", "зі своїми", "свою їжу", "своєю їжею", "своя їжа", "своєї їжі",
+    "свої напої", "своїми напоями", "свій алкоголь", "своє спиртне", "власну їжу",
+    "власною їжею", "власні напої", "власний алкоголь", "приносити своє", "принести своє",
+    "принести свою", "приходити зі своїм", "прийти зі своїм",
+]
+
+
+def is_outside_food_question(text: str) -> bool:
+    """True for "can we bring our own food/drinks?" (owner: NO — we have a kolyba/bar).
+    Excludes pet ("зі своїм собакою") and car ("зі своїм авто") so those aren't hijacked."""
+    t = (text or "").lower()
+    if mentions_pet(t) or "авто" in t or "машин" in t or "паркув" in t:
+        return False
+    return any(m in t for m in _OWN_FOOD_MARKERS)
+
+
+# Persona 17: "вартість, якщо не будемо плавати, а просто посидіти" -> same price (entrance
+# to the territory / recreation area, not per-swim).
+_POOL_SIT_MARKERS = [
+    "не будем плава", "не будемо плава", "не буду плава", "не плаваю", "не плаватим",
+    "не будем купат", "не будемо купат", "не буду купат", "не купатись", "не купатися",
+    "не купаємось", "не купаюсь", "без купання", "не хочемо плавати", "не хочу плавати",
+    "просто посидіти", "просто посидим", "просто посидіть", "просто відпочи", "лише посидіти",
+]
+
+
+def is_pool_sit_question(text: str) -> bool:
+    """True for "how much if we don't swim, just sit?" (owner: same price — entrance fee)."""
+    t = (text or "").lower()
+    return any(m in t for m in _POOL_SIT_MARKERS)
+
+
+# Persona 18: any Booking.com question -> the bot can't help, hand to a human (+ Instagram tag).
+def is_booking_com_question(text: str) -> bool:
+    """True for a Booking.com-related question (reservation/prepayment made on Booking.com)."""
+    t = (text or "").lower()
+    return "booking" in t or "букінг" in t or "букинг" in t
+
+
+# Owner 2026-07-10: "Які там страви подають?" / "яке меню?" asks about the DISHES, not the price.
+_MENU_MARKERS = ["страв", "що готують", "які страви", "яке меню", "меню яке", "що подають",
+                 "чим годують", "склад меню", "меню"]
+_MENU_PRICE_WORDS = ["скільки кошт", "вартіст", "ціна", "по чому", "почому", "прайс"]
+
+
+def is_menu_question(text: str) -> bool:
+    """True for a question about WHICH DISHES are served (menu content). A price word ("вартість
+    меню") flips it back to the FOOD_PRICES list."""
+    t = (text or "").lower()
+    if not any(m in t for m in _MENU_MARKERS):
+        return False
+    return not any(w in t for w in _MENU_PRICE_WORDS)
+
+
+_MEAL_ANY = ("харчув", "разове", "разов харч", "повне харч", "сніданок", "обід", "вечер")
+
+
+def parse_meal_request(text: str):
+    """Deterministically extract a meal-cost request from ONE message (owner 2026-07-10) — food
+    math must not depend on the LLM. Returns a meals dict or None. Handles the owner's phrasing:
+    "3-разове на 4 особи: 2 дні повне харчування, а останній день лише сніданок" ->
+    {persons:4, three_meals_days:2, breakfast_days:1, ...}."""
+    t = (text or "").lower()
+    if not any(w in t for w in _MEAL_ANY):
+        return None
+    m = {"persons": None, "three_meals_days": 0, "two_meals_days": 0,
+         "breakfast_days": 0, "lunch_days": 0, "dinner_days": 0}
+    mp = re.search(r"на\s+(\d+)\s*(?:особ|осіб|людин|гост|дорослих|чол)", t)
+    if mp:
+        m["persons"] = int(mp.group(1))
+    _DAY = r"(?:дн\w*|діб|доб|день)"
+    for pat in (r"(\d+)\s*" + _DAY + r"[^\d]{0,25}(?:повн\w*\s*харч|3[-\s]?разов|триразов)",
+                r"(?:повн\w*\s*харч|3[-\s]?разов|триразов)\w*[^\d]{0,20}(\d+)\s*" + _DAY):
+        for g in re.finditer(pat, t):
+            m["three_meals_days"] += int(g.group(1))
+    for pat in (r"(\d+)\s*" + _DAY + r"[^\d]{0,25}(?:2[-\s]?разов|дворазов)",
+                r"(?:2[-\s]?разов|дворазов)\w*[^\d]{0,20}(\d+)\s*" + _DAY):
+        for g in re.finditer(pat, t):
+            m["two_meals_days"] += int(g.group(1))
+    if re.search(r"(?:лише|тільки|лиш|тілько)\s+сніданок", t) or re.search(r"останн\w*\s+день\s+сніданок", t):
+        m["breakfast_days"] += 1
+    if not any(m[k] for k in ("three_meals_days", "two_meals_days", "breakfast_days",
+                              "lunch_days", "dinner_days")):
+        return None
+    return m
+
+
+def is_split_offer_message(text: str) -> bool:
+    """True if the bot's previous message PROPOSED a room split — so a bare 'Так, порахуйте'
+    means: accept that distribution and quote it (owner #15/#21, 2026-07-10)."""
+    t = (text or "").lower()
+    return "розподілити" in t or "розділити вашу компанію" in t
+
+
+_SPLIT_ACCEPT_MARKERS = ["порахуйте", "розрахуйте", "порахувати", "підходить", "підійде",
+                         "згоден", "згодна", "давайте", "так", "добре", "гаразд", "ок"]
+
+
+def accepts_split(text: str) -> bool:
+    """True when the client AGREES to the proposed room distribution. A message that carries its
+    OWN numbers ("давайте 2 номери: 4 і 3") is a COUNTER-proposal, not acceptance — let the
+    extractor/plan handle that. So acceptance requires an agreement word and NO digits."""
+    t = (text or "").lower()
+    if any(c.isdigit() for c in t):
+        return False
+    return any(m in t for m in _SPLIT_ACCEPT_MARKERS)
+
+
 # Payment-RULES questions (prepayment / deposit / "pay on arrival") -> BOOK_ROOM.
 # Pinned deterministically because the extractor, in a booking context, keeps routing these
 # to a booking topic (or CHECK_IN_OUT, on the word "приїзд") instead of the deposit rules.
@@ -414,17 +546,29 @@ def faq_override(text: str):
         return "BOOK_ROOM"
     if is_price_policy_question(text):
         return "PRICE_POLICY"
+    t = (text or "").lower()
+    if is_menu_question(text):                  # "які страви подають?" -> dishes, not prices
+        return "FOOD_MENU"
+    if "буковел" in t:                          # Persona 20: distance to Bukovel
+        return "DISTANCE_BUKOVEL"
+    if is_pool_sit_question(text):              # Persona 17: same price if only sitting
+        return "POOL_ENTRY_SAME_PRICE"
+    if is_outside_food_question(text):          # Persona 17: no own food/drinks
+        return "OUTSIDE_FOOD"
     if is_location_question(text):
         return "PLACE"
-    t = (text or "").lower()
     if is_pet_surcharge_question(text):        # concise pet-fee answer (before the verbose PETS)
         return "PET_SURCHARGE"
     if is_discount_question(text):
         # A military-specific discount question keeps the precise MILITARY answer; a general
         # "чи є знижки?" gets the DISCOUNTS overview (children + military + Instagram promos).
         return "MILITARY" if any(m in t for m in _MILITARY_MARKERS) else "DISCOUNTS"
-    if "басейн" in t:                       # pool questions split into POOL / GUEST_POOL
-        return _pool_template(t)
+    if "басейн" in t or "басейн" in t.replace("бесейн", "басейн"):  # tolerate "бесейн" typo
+        # Children's pool is its own answer (owner fix #278): "дитячий басейн" / "басейн для
+        # дітей" -> CHILDREN_POOL; everything else splits into POOL / GUEST_POOL.
+        if is_children_pool_question(text):
+            return "CHILDREN_POOL"
+        return _pool_template(t.replace("бесейн", "басейн"))
     for keywords, template in _FAQ_OVERRIDE:
         if any(k in t for k in keywords):
             return template

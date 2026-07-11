@@ -557,21 +557,47 @@ def test_finalize_ubd_whole_booking_discounts_all_rooms():
 
 # --- 6+ guest distribution (owner rule 2026-06-23) -------------------------
 
-def test_plan_six_plus_guests_in_one_room_asks_distribution():
-    # 6+ guests can't share one room (max ~5) -> show capacities THEN ask HOW to split.
+def test_plan_six_plus_guests_in_one_room_proposes_split():
+    # Owner #21: 6+ guests can't share one room -> show capacities THEN PROACTIVELY propose a
+    # valid split (composition known) rather than only asking how to split.
     out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
                               "adults": 6, "children_count": 0, "children_ages": []}]})
     assert out["action"] == "reply"
     assert templates.PRESENTATION_ROOMS in out["reply"]       # capacities shown first
-    assert templates.ASK_ROOM_DISTRIBUTION in out["reply"]    # then the split question
     assert "[SPLIT]" in out["reply"]
+    assert "розподілити" in out["reply"]                       # SUGGEST_GROUP_SPLIT
+    assert "2 номери" in out["reply"] and "3 + 3" in out["reply"]   # 6 adults -> 2 rooms of 3
 
 
-def test_plan_six_guests_counts_children_too():
-    # 2 adults + 4 children still = 6 bodies -> distribution ask.
+def test_plan_six_guests_counts_children_too_proposes_split():
+    # 2 adults + 4 children still = 6 bodies -> a proposed split (composition known).
     out = de.plan({"rooms": [{"room_type": "Стандарт", "checkin": "2026-07-06", "checkout": "2026-07-08",
                               "adults": 2, "children_count": 4, "children_ages": [5, 7, 9, 11]}]})
+    assert "розподілити" in out["reply"] and "2 номери" in out["reply"]
+
+
+def test_plan_six_plus_unknown_ages_still_asks_distribution():
+    # If a child's age is UNKNOWN we can't compute a precise valid split -> ask how to split.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
+                              "adults": 2, "children_count": 4, "children_ages": []}]})
     assert templates.ASK_ROOM_DISTRIBUTION in out["reply"]
+
+
+def test_suggest_group_distribution():
+    # STANDARD-priority (owner 2026-07-10): split into Стандарт-sized rooms (<=3 people), biggest
+    # first. 6 adults + 4 kids -> FOUR Standards 3+3+2+2, never 3+3+4 (which needs a Напівлюкс).
+    assert de.suggest_group_distribution(6, []) == [3, 3]                    # 6 adults -> 2×3
+    assert de.suggest_group_distribution(7, []) == [3, 2, 2]                 # 7 adults -> 3 rooms
+    assert de.suggest_group_distribution(6, [2, 8, 11, 14]) == [3, 3, 2, 2]  # owner #21: 4 Standards
+    assert de.suggest_group_distribution(2, [5, 7, 9, 11]) == [3, 3]         # 2 ad + 4 kids -> 2×3
+    # every room respects <=3 people (Standard priority) AND <=3 adults; sums to the party size.
+    for a, ages in [(6, []), (7, []), (6, [2, 8, 11, 14]), (2, [5, 7, 9, 11]), (10, [3, 4])]:
+        counts = de.suggest_group_distribution(a, ages)
+        assert all(c <= 3 for c in counts)
+        assert sum(counts) == a + len(ages)
+        # the accepted split materialises into valid rooms (no kids-only room; each fits a Стандарт)
+        for r in de.rooms_from_split(counts, a, ages, "2026-07-06", "2026-07-08"):
+            assert r["adults"] >= 1 or not r["children_ages"]
 
 
 def test_plan_five_guests_one_room_still_quotes():
@@ -582,14 +608,27 @@ def test_plan_five_guests_one_room_still_quotes():
 
 
 def test_plan_multiroom_no_type_assigns_fitting_and_quotes_all():
-    # Persona 15 live bug: "2 номери: 4 і 3" (no types) must quote BOTH rooms with fitting
-    # types, never just the first. 4 adults -> Напівлюкс; 3 adults -> Стандарт.
+    # A VALID split ("2 номери: 3 і 2", every room <= 3 adults, no types) must quote BOTH rooms
+    # with fitting types, never just the first. 3 adults -> Стандарт; 2 adults -> Стандарт.
+    out = de.plan({"rooms": [
+        {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24", "adults": 3, "children_ages": []},
+        {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24", "adults": 2, "children_ages": []}]})
+    assert out["action"] == "quote"
+    assert len(out["rooms"]) == 2                                   # BOTH rooms kept
+    assert [r["room_type"] for r in out["rooms"]] == ["Стандарт", "Стандарт"]
+
+
+def test_plan_multiroom_over_adult_cap_suggests_valid_split():
+    # Owner fix #282-284: "2 номери: 4 і 3" packs 4 adults into ONE room (> max 3 adults). The
+    # bot must NOT quote it — it suggests a VALID split into enough rooms (7 adults -> 3 номери,
+    # distribution 2 + 2 + 3), never a bare rejection.
     out = de.plan({"rooms": [
         {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24", "adults": 4, "children_ages": []},
         {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24", "adults": 3, "children_ages": []}]})
-    assert out["action"] == "quote"
-    assert len(out["rooms"]) == 2                                   # BOTH rooms kept
-    assert [r["room_type"] for r in out["rooms"]] == ["Напівлюкс", "Стандарт"]
+    assert out["action"] == "reply"
+    assert "максимум 3 дорослих" in out["reply"]
+    assert "3 номери" in out["reply"]           # 7 adults -> 3 rooms
+    assert "2 + 2 + 3" in out["reply"]          # even, ascending distribution
 
 
 def test_assign_fitting_type():
@@ -752,3 +791,203 @@ def test_finalize_quote_all_family_recommends_standard_first():
     assert "добре підійде Стандарт" in reply          # standard prioritised for the family
     assert "два окремі номери" not in reply            # no longer the old Напівлюкс/split pitch
     assert reply.index("Стандарт") < reply.index("Напівлюкс")   # standard listed BEFORE Напівлюкс
+
+
+# --- OWNER LIVE-QA FIXES 2026-07-08 (dialogues #266/#271/#274/#275/#278/#282-284) ----
+
+def test_free_windows_never_bridges_noncontiguous_zero_middle():
+    # Fix #271: 12-16 free, 17-18 BOOKED (count 0), 19-27 free -> TWO windows, never one
+    # bridged "12-27" span. The bot must never merge over unavailable days.
+    avail = {**{f"2026-07-{d:02d}": 2 for d in range(12, 17)},
+             "2026-07-17": 0, "2026-07-18": 0,
+             **{f"2026-07-{d:02d}": 2 for d in range(19, 28)}}
+    dates = sorted(avail)
+    wins = de._free_windows(avail, dates, min_nights=2, room_count=1)
+    assert wins == [("2026-07-12", "2026-07-16"), ("2026-07-19", "2026-07-27")]
+
+
+def test_free_windows_never_bridges_missing_middle_dates():
+    # Same, but 17-18 are entirely ABSENT from the scrape (not present as 0). Missing days must
+    # STILL break the run — a gap in the calendar is unavailable, never bridged.
+    avail = {**{f"2026-07-{d:02d}": 2 for d in range(12, 17)},
+             **{f"2026-07-{d:02d}": 2 for d in range(19, 28)}}
+    dates = sorted(avail)      # 17,18 not present
+    wins = de._free_windows(avail, dates, min_nights=2, room_count=1)
+    assert wins == [("2026-07-12", "2026-07-16"), ("2026-07-19", "2026-07-27")]
+
+
+def test_propose_windows_offers_both_noncontiguous_windows_not_bridged():
+    # End-to-end #271: a fuzzy July scan over a calendar free 12-16 and 19-27 must offer BOTH
+    # discrete windows, never the illegal merged "12 - 22"/"12 - 27".
+    avail = {"Стандарт": {**{f"2026-07-{d:02d}": 2 for d in range(12, 17)},
+                          "2026-07-17": 0, "2026-07-18": 0,
+                          **{f"2026-07-{d:02d}": 2 for d in range(19, 28)}}}
+    reply = de.propose_windows({"room_type": "Стандарт", "fuzzy_date": "липень"}, avail)
+    assert "12 - 16 липня" in reply and "19 - 27 липня" in reply
+    assert "12 - 22" not in reply and "12 - 27" not in reply
+
+
+def test_sold_out_found_nearest_states_matching_nights():
+    # Fix #274: SOLD_OUT_FOUND_NEAREST states the nights, and they ALIGN with the offered dates.
+    # Requested 4-night stay (8-12 July) is booked; the nearest 4-night window is offered WITH
+    # "(4 ночі)". (Dates are WITHIN the visible calendar, so this is a real sold-out, not "past".)
+    avail = {"Стандарт +": {**{f"2026-07-{d:02d}": 0 for d in range(1, 12)},
+                            **{f"2026-07-{d:02d}": 2 for d in range(12, 20)}}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт +", "checkin": "2026-07-08", "checkout": "2026-07-12",
+          "adults": 2, "children_ages": []}], avail)
+    assert "найближче вільне віконце" in reply
+    assert "4 ночі" in reply                       # nights stated
+    assert "12 - 16 липня" in reply                # exactly 4 nights (12,13,14,15) -> checkout 16
+
+
+def test_finalize_past_dates_asks_for_real_dates():
+    # Owner #299 (2026-07-10): a stay EARLIER than the whole visible calendar has passed -> say so,
+    # never "all rooms booked", never invent an offset window.
+    avail = {"Стандарт +": {f"2026-07-{d:02d}": 2 for d in range(10, 20)}}   # calendar starts 10 Jul
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт +", "checkin": "2026-06-13", "checkout": "2026-06-17",
+          "adults": 2, "children_ages": []}], avail)
+    assert reply == templates.PAST_DATES
+    assert "минули" in reply and "найближче вільне віконце" not in reply
+
+
+def test_finalize_quote_all_skips_type_absent_in_covered_window():
+    # Fix #275: only Стандарт is in the scrape (window covered) — Стандарт+/Напівлюкс are ABSENT.
+    # The bot must recommend ONLY Стандарт, never a type OtelMS didn't confirm free.
+    avail = {"Стандарт": {"2026-07-06": 3, "2026-07-07": 3}}   # the ONLY type present
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-07-06", "checkout": "2026-07-07", "adults": 2, "children_ages": []}, avail)
+    assert "Стандарт" in reply and "грн" in reply
+    assert "Напівлюкс" not in reply and "Стандарт +" not in reply   # absent types NOT recommended
+
+
+def test_finalize_quote_all_far_future_all_unknown_stays_lenient():
+    # A window entirely OUTSIDE the visible calendar (empty scrape -> every type 'unknown') stays
+    # lenient: still list the priced types (far-future exact dates aren't sold-out).
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-08-20", "checkout": "2026-08-21", "adults": 2, "children_ages": []}, {})
+    assert "Стандарт" in reply and "Напівлюкс" in reply and "грн" in reply
+
+
+def test_finalize_quote_all_ubd_note_on_price_and_no_aside():
+    # Fix #266: the UBD note "(з урахуванням знижки УБД -20%)" is on the priced message, and the
+    # "(Стандартів у нас більше, ніж Напівлюксів)" aside is gone (4 adults -> standard split).
+    avail = {"Стандарт": {"2026-08-01": 3, "2026-08-02": 3},
+             "Стандарт +": {"2026-08-01": 3, "2026-08-02": 3},
+             "Напівлюкс": {"2026-08-01": 2, "2026-08-02": 2}}
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-08-01", "checkout": "2026-08-02", "adults": 4,
+         "children_ages": [], "ubd": True}, avail)
+    assert "(з урахуванням знижки УБД -20%)" in reply
+    assert "Стандартів у нас більше" not in reply
+    assert templates.MILITARY in reply
+
+
+def test_finalize_quote_all_ubd_note_single_listing():
+    # The UBD note also lands on a single-room-listing (2 adults) priced message.
+    avail = {"Стандарт": {"2026-08-01": 3, "2026-08-02": 3}}
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-08-01", "checkout": "2026-08-02", "adults": 2,
+         "children_ages": [], "ubd": True}, avail)
+    assert "(з урахуванням знижки УБД -20%)" in reply
+    assert templates.MILITARY in reply
+
+
+# --- OWNER CALENDAR-MATH ROUND 2 (2026-07-09): bridging / hallucination (deterministic) ----
+# These replicate the EXACT owner scenarios (#287, #296, #288) with a FIXED availability map,
+# so they PROVE no-bridging immune to the live OtelMS calendar mutating between runs.
+
+def test_stay_all_free_validator():
+    m = {"2026-07-12": 2, "2026-07-13": 2, "2026-07-14": 0, "2026-07-15": 2}
+    assert de._stay_all_free(m, "2026-07-12", "2026-07-14") is True    # nights 12,13 free
+    assert de._stay_all_free(m, "2026-07-12", "2026-07-15") is False   # night 14 booked
+    assert de._stay_all_free(m, "2026-07-13", "2026-07-16") is False   # night 14 booked
+    assert de._stay_all_free(m, "2026-07-15", "2026-07-16") is True
+    assert de._stay_all_free(m, "2026-07-20", "2026-07-21") is False   # missing date == booked
+    assert de._stay_all_free(m, "2026-07-12", "2026-07-12") is False   # zero-night range
+
+
+def _avail_287():
+    # free 10-16, BOOKED 17-18, free 19-27 — the exact owner #287 calendar.
+    a = {}
+    for d in range(10, 17): a[f"2026-07-{d:02d}"] = 5
+    a["2026-07-17"] = 0; a["2026-07-18"] = 0
+    for d in range(19, 28): a[f"2026-07-{d:02d}"] = 5
+    return {"Стандарт": a}
+
+
+def test_find_nearest_window_never_bridges_booked_gap_287():
+    av = _avail_287()
+    # A 4- or 7-night block fits BEFORE the booked 17-18; a 10-night block CANNOT exist
+    # contiguously (17-18 break it) -> None, never a bridged "12-22".
+    assert de.find_nearest_window(av, "Стандарт", "2026-06-22", 4) == ("2026-07-10", "2026-07-14")
+    assert de.find_nearest_window(av, "Стандарт", "2026-06-22", 7) == ("2026-07-10", "2026-07-17")
+    assert de.find_nearest_window(av, "Стандарт", "2026-06-22", 10) is None
+    # nearest_window_any (used by finalize_quote_all) must also refuse a 10-night bridge.
+    assert de.nearest_window_any(av, "2026-06-22", 10, fit_adults=1) is None
+
+
+def test_propose_windows_owner_287_offers_two_separate_windows():
+    reply = de.propose_windows({"room_type": "Стандарт", "fuzzy_date": "липень"}, _avail_287())
+    assert "10 - 16 липня" in reply and "19 - 27 липня" in reply     # two DISTINCT windows
+    assert "12 - 22" not in reply and "10 - 27" not in reply and "10 - 22" not in reply  # never bridged
+
+
+def test_finalize_quote_all_owner_296_no_soldout_hallucination():
+    # Aug 1-5 BOOKED, 6-15 free. A request for 1-5 Aug must NOT be quoted; the nearest window is
+    # 6-10, never a hallucinated "1-10 серпня" that spans the booked 1-5.
+    a = {}
+    for d in range(1, 6): a[f"2026-08-{d:02d}"] = 0
+    for d in range(6, 16): a[f"2026-08-{d:02d}"] = 5
+    av = {"Стандарт": a}
+    reply = de.finalize_quote_all(
+        {"checkin": "2026-08-01", "checkout": "2026-08-05", "adults": 2, "children_ages": []}, av)
+    assert "буде вартувати" not in reply                # never priced the booked dates
+    assert "6 - 10 серпня" in reply                      # the genuine nearest window
+    assert "1 - 10 серпня" not in reply and "1 - 5 серпня" not in reply
+    # and propose over the same booked-prefix period offers only the free tail.
+    p = de.propose_windows({"room_type": "Стандарт", "fuzzy_date": "початок серпня"}, av)
+    assert "6 - 10 серпня" in reply and "1 - 10" not in p
+
+
+def test_find_nearest_window_exact_inclusive_when_free():
+    # Owner #288/#274: when the requested check-in itself starts a fully-free block, return it
+    # unchanged (do not skip to a later "weird offset").
+    av = {"Стандарт": {f"2026-07-{d:02d}": 3 for d in range(13, 20)}}
+    assert de.find_nearest_window(av, "Стандарт", "2026-07-13", 4) == ("2026-07-13", "2026-07-17")
+
+
+def test_finalize_multiroom_partial_soldout_quotes_available_flags_booked():
+    # Owner #23 (2026-07-09, IG two-family case): a MULTI-room booking where one room type is sold
+    # out on the dates must QUOTE the available room and flag the booked one — never drop the valid
+    # room by short-circuiting on the sold-out sibling.
+    avail = {"Стандарт": {"2026-07-20": 5, "2026-07-21": 5, "2026-07-22": 5, "2026-07-23": 5},
+             "Напівлюкс": {"2026-07-20": 1, "2026-07-21": 1, "2026-07-22": 1, "2026-07-23": 0}}  # 23 booked
+    rooms = [
+        {"room_type": "Стандарт", "checkin": "2026-07-20", "checkout": "2026-07-24",
+         "adults": 2, "children_ages": [8, 9]},     # 2 adults + 2 children <12 -> fits Стандарт
+        {"room_type": "Напівлюкс", "checkin": "2026-07-20", "checkout": "2026-07-24",
+         "adults": 3, "children_ages": [13]},
+    ]
+    reply = de.finalize_quote(rooms, avail)
+    assert "Вартість номеру типу Стандарт" in reply        # the AVAILABLE room IS quoted
+    assert "грн" in reply
+    assert "Напівлюкс" in reply and "зайняті" in reply       # the booked room flagged separately
+    assert reply != templates.NEAREST_NONE
+
+
+def test_finalize_multiroom_all_soldout_offers_nearest():
+    # If EVERY room in a multi-room booking is sold out, fall back to the first room's sold-out
+    # reply (nearest window), not a partial quote.
+    avail = {"Стандарт": {"2026-07-20": 0, "2026-07-21": 0, "2026-07-22": 0, "2026-07-23": 0,
+                          "2026-07-25": 5, "2026-07-26": 5, "2026-07-27": 5, "2026-07-28": 5}}
+    rooms = [
+        {"room_type": "Стандарт", "checkin": "2026-07-20", "checkout": "2026-07-22",
+         "adults": 2, "children_ages": []},
+        {"room_type": "Стандарт", "checkin": "2026-07-20", "checkout": "2026-07-22",
+         "adults": 2, "children_ages": []},
+    ]
+    reply = de.finalize_quote(rooms, avail)
+    assert "буде вартувати" not in reply
+    assert "найближче вільне віконце" in reply

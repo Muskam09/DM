@@ -344,6 +344,109 @@ def test_faq_override_pool_vs_guest_pool(text, expected):
 
 
 @pytest.mark.parametrize("text,expected", [
+    # Owner fix #278: a CHILDREN'S-pool question routes to the dedicated CHILDREN_POOL answer.
+    ("Чи є у вас дитячий басейн?", "CHILDREN_POOL"),
+    ("а дитячий басейн є?", "CHILDREN_POOL"),
+    ("розкажіть про басейн для дітей", "CHILDREN_POOL"),
+    ("який розмір дитячого басейну?", "CHILDREN_POOL"),
+    # a general/adult pool question stays POOL, a price question stays GUEST_POOL.
+    ("а у вас є басейн?", "POOL"),
+    ("скільки коштує басейн?", "GUEST_POOL"),
+])
+def test_faq_override_children_pool(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+def test_children_pool_template_content():
+    assert "дитячий басейн" in templates.CHILDREN_POOL
+    assert "3х2" in templates.CHILDREN_POOL and "30 см" in templates.CHILDREN_POOL
+    assert "28" in templates.CHILDREN_POOL
+
+
+@pytest.mark.parametrize("text,expected", [
+    # Persona 17: own food/drinks -> NO (OUTSIDE_FOOD); sitting w/o swimming -> same price.
+    ("Чи можна до вас приходити зі своїм.", "OUTSIDE_FOOD"),
+    ("а можна зі своєю їжею?", "OUTSIDE_FOOD"),
+    ("Яка буде вартість якщо не будем плавати а просто посидіти", "POOL_ENTRY_SAME_PRICE"),
+    ("а якщо просто посидіти, не купатись?", "POOL_ENTRY_SAME_PRICE"),
+    # Persona 20: distance to Bukovel.
+    ("На скільки далеко Ви від Буковелю?", "DISTANCE_BUKOVEL"),
+    ("скільки км до Буковеля?", "DISTANCE_BUKOVEL"),
+    # own-dog must NOT be read as own-food.
+    ("можна приїхати зі своїм песиком?", "PETS"),
+])
+def test_faq_override_persona_17_20(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    # Owner 2026-07-10: WHICH dishes -> FOOD_MENU (not the price list).
+    ("Які там страви подають?", "FOOD_MENU"),
+    ("яке у вас меню?", "FOOD_MENU"),
+    ("що готують на кухні?", "FOOD_MENU"),
+    # price questions still go to FOOD_PRICES
+    ("скільки коштує харчування?", "FOOD_PRICES"),
+    ("а харчування у вас є?", "FOOD_PRICES"),
+])
+def test_faq_override_food_menu(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+def test_parse_meal_request_owner_phrasing():
+    import dialogue_engine as de
+    m = bot_logic.parse_meal_request(
+        "Порахуйте харчування 3-разове на 4 особи: 2 дні повне харчування, а останній день лише сніданок")
+    assert m["persons"] == 4 and m["three_meals_days"] == 2 and m["breakfast_days"] == 1
+    assert m["two_meals_days"] == 0
+    # end-to-end via finalize_meals in August -> 10200
+    assert "10200" in de.finalize_meals(m, "Серпень", default_persons=4)
+    # a plain price FAQ (no days) is NOT a calc request
+    assert bot_logic.parse_meal_request("а харчування у вас є?") is None
+    assert bot_logic.parse_meal_request("скільки коштує сніданок?") is None
+
+
+def test_e2e_meal_cost_deterministic_fallback(server):
+    # Even if the LLM leaves the meals slot EMPTY, the deterministic parser computes the cost.
+    bs = server.configure(
+        slots={"topic": "faq", "faq_template": "FOOD_PRICES", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2026-08-06", "checkout": "2026-08-09",
+             "adults": 2, "children_ages": []}]},   # NOTE: no "meals" slot from the LLM
+        history=_bot_spoke())
+    _run(bs.process_incoming_message(
+        "Порахуйте харчування 3-разове на 4 особи: 2 дні повне харчування, а останній день лише сніданок", 613))
+    assert any("10200 грн" in m for m in server.sent)
+
+
+def test_food_menu_template_and_accepts_split():
+    assert "узгоджуються по заїзду" in templates.FOOD_MENU
+    assert bot_logic.accepts_split("так, порахуйте будь ласка") is True
+    assert bot_logic.accepts_split("давайте") is True
+    assert bot_logic.accepts_split("Давайте 2 номери: 4 і 3") is False   # counter-proposal (digits)
+    assert bot_logic.accepts_split("яка ціна?") is False
+
+
+def test_past_dates_template_content():
+    assert "минули" in templates.PAST_DATES and "актуальні дати" in templates.PAST_DATES
+
+
+def test_persona_17_20_templates_content():
+    assert "колиба" in templates.OUTSIDE_FOOD and "не можна" in templates.OUTSIDE_FOOD
+    assert "такою ж" in templates.POOL_ENTRY_SAME_PRICE and "вхід" in templates.POOL_ENTRY_SAME_PRICE
+    assert "Booking.com" in templates.BOOKING_COM
+    assert "35 км" in templates.DISTANCE_BUKOVEL and "Буковел" in templates.DISTANCE_BUKOVEL
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Я забронювала номер на booking, потрібно кинути передоплату", True),
+    ("на букінг мені підтвердили бронь", True),
+    ("Стандарт на 5-7 липня", False),
+    ("яка передоплата потрібна?", False),
+])
+def test_is_booking_com_question(text, expected):
+    assert bot_logic.is_booking_com_question(text) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
     # New DISCOUNTS FAQ: a GENERAL discount question was falling through to a room description.
     ("Є якісь знижки у вас?", "DISCOUNTS"),
     ("а які у вас знижки?", "DISCOUNTS"),
@@ -549,8 +652,9 @@ def test_is_muted():
 
 
 def test_payment_handoff_template():
+    # Owner 2026-07-09: concise handoff — the bot never verifies payment itself.
     t = templates.PAYMENT_RECEIVED_HANDOFF
-    assert "адміністратор" in t and "ПІБ" in t and "Instagram" in t
+    assert "менеджер" in t and "перевірить оплату" in t and "підтвердження" in t
 
 
 # ===========================================================================
@@ -586,6 +690,8 @@ def server(monkeypatch):
     bot_server._pending_window.clear()  # fresh pending-window state per test
     bot_server._no_dates_mode.clear()   # fresh no-dates mode per test
     bot_server._cooldowns.clear()       # fresh 503-cooldown state per test
+    bot_server._pending_split.clear()   # fresh pending-split state per test
+    bot_server._meals_memory.clear()    # fresh meals memory per test
 
     def configure(slots=None, slots_text=None, history=None, availability=None,
                   labels=None, dynamic_history=False):
@@ -1121,7 +1227,8 @@ def test_e2e_barter_via_extractor_silent_and_labeled(server):
 
 
 def test_e2e_six_plus_guests_asks_distribution(server):
-    # 6+ guests packed into one room -> ask HOW to distribute; no scrape, no premature quote.
+    # Owner #21: 6+ guests packed into one room -> proactively PROPOSE a valid split; no scrape,
+    # no premature quote.
     bs = server.configure(
         slots={"topic": "price_quote", "rooms": [
             {"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-08",
@@ -1129,34 +1236,136 @@ def test_e2e_six_plus_guests_asks_distribution(server):
         history=_bot_spoke())
     _run(bs.process_incoming_message("нас 6, хочемо до вас на 6-8 липня", 450))
     assert server.state["scraped"] is False
-    assert any(m == templates.ASK_ROOM_DISTRIBUTION for m in server.sent)
+    assert any("розподілити" in m for m in server.sent)       # proactive split proposal
+    assert not any("буде вартувати" in m for m in server.sent)
 
 
 def test_e2e_six_plus_split_uses_stored_dates(server):
-    # Fix (2026-06-24): after ASK_ROOM_DISTRIBUTION, the split reply must SCRAPE using the
-    # STORED dates (not re-ask for dates). Turn 1 sets memory (dates + 7 guests); turn 2
-    # splits into 2 dateless rooms -> the engine backfills the dates and scrapes.
+    # Fix (2026-06-24): after ASK_ROOM_DISTRIBUTION, a VALID split (<=3 adults per room) must
+    # SCRAPE using the STORED dates (not re-ask for dates). Turn 1 sets memory (dates + 6
+    # guests); turn 2 splits into 2 dateless rooms of 3 -> the engine backfills the dates & scrapes.
+    avail = _raw({"Стандарт": {"2026-07-23": 5, "2026-07-24": 5}})
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24",
+             "adults": 6, "children_count": 0, "children_ages": []}]},
+        history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("На 23-24 липня, нас 6 дорослих", 470))
+    assert any("розподілити" in m for m in server.sent)   # proactive split proposal (owner #21)
+    assert server.state["scraped"] is False        # distribution proposed first, no scrape yet
+
+    server.sent.clear()
+    server.configure(                               # turn 2: valid split, dates DROPPED by extractor
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": None, "checkout": None, "adults": 3, "children_ages": []},
+            {"room_type": None, "checkin": None, "checkout": None, "adults": 3, "children_ages": []}]},
+        history=_bot_spoke(), availability=avail)
+    _run(bs.process_incoming_message("Зробіть 2 номери по 3 дорослих", 470))
+    assert server.state["scraped"] is True          # used STORED dates -> scraped, didn't re-ask
+    full = "\n".join(server.sent)
+    assert templates.QUESTION_ONLY_DATES not in full and templates.ASK_DATES_ONLY not in full
+    assert templates.ASK_ROOM_DISTRIBUTION not in full
+
+
+def test_e2e_six_plus_split_over_adult_cap_suggests_valid_split(server):
+    # Owner fix #282-284: after ASK_ROOM_DISTRIBUTION, "2 номери: 4 і 3" packs 4 adults into
+    # ONE room (> max 3). The bot must SUGGEST a valid re-split (3 rooms 2+2+3), never quote or
+    # bare-reject. No scrape (nothing quotable yet).
     avail = _raw({"Стандарт": {"2026-07-23": 5, "2026-07-24": 5}})
     bs = server.configure(
         slots={"topic": "price_quote", "rooms": [
             {"room_type": None, "checkin": "2026-07-23", "checkout": "2026-07-24",
              "adults": 7, "children_count": 0, "children_ages": []}]},
         history=_bot_spoke(), availability=avail)
-    _run(bs.process_incoming_message("На 23-24 липня, нас 7 дорослих", 470))
-    assert any(m == templates.ASK_ROOM_DISTRIBUTION for m in server.sent)
-    assert server.state["scraped"] is False        # distribution asked first, no scrape yet
-
+    _run(bs.process_incoming_message("На 23-24 липня, нас 7 дорослих", 471))
     server.sent.clear()
-    server.configure(                               # turn 2: split, dates DROPPED by extractor
+    server.configure(
         slots={"topic": "price_quote", "rooms": [
             {"room_type": None, "checkin": None, "checkout": None, "adults": 4, "children_ages": []},
             {"room_type": None, "checkin": None, "checkout": None, "adults": 3, "children_ages": []}]},
         history=_bot_spoke(), availability=avail)
-    _run(bs.process_incoming_message("Зробіть 2 номери: 4 і 3 дорослих", 470))
-    assert server.state["scraped"] is True          # used STORED dates -> scraped, didn't re-ask
+    _run(bs.process_incoming_message("Зробіть 2 номери: 4 і 3 дорослих", 471))
     full = "\n".join(server.sent)
-    assert templates.QUESTION_ONLY_DATES not in full and templates.ASK_DATES_ONLY not in full
-    assert templates.ASK_ROOM_DISTRIBUTION not in full
+    assert "максимум 3 дорослих" in full and "3 номери" in full and "2 + 2 + 3" in full
+    assert "буде вартувати" not in full             # never quoted the invalid 4-adult room
+
+
+def test_e2e_meal_cost_computed(server):
+    # Owner 2026-07-10: an explicit meal request is priced deterministically — 3-разове for 4
+    # people 2 days + only breakfast the last day, August: (1100*4*2)+(350*4*1)=10200 грн.
+    bs = server.configure(
+        slots={"topic": "faq", "faq_template": "FOOD_PRICES",
+                "meals": {"persons": 4, "three_meals_days": 2, "two_meals_days": 0,
+                          "breakfast_days": 1, "lunch_days": 0, "dinner_days": 0},
+                "rooms": [{"room_type": "Стандарт", "checkin": "2026-08-06", "checkout": "2026-08-09",
+                           "adults": 2, "children_ages": []}]},
+        history=_bot_spoke())
+    _run(bs.process_incoming_message("порахуйте 3-разове на 4 особи: 2 дні повне, останній лише сніданок", 610))
+    full = "\n".join(server.sent)
+    assert "10200 грн" in full                  # the exact food total
+    assert "8800" in full and "1400" in full     # the breakdown lines
+
+
+def test_e2e_menu_question_answered(server):
+    bs = server.configure(slots={"topic": "faq", "faq_template": "FOOD_PRICES", "rooms": []},
+                          history=_bot_spoke())
+    _run(bs.process_incoming_message("а які там страви подають?", 611))
+    assert any("узгоджуються по заїзду" in m for m in server.sent)
+
+
+def test_e2e_split_accepted_then_quoted(server):
+    # Owner #15/#21: the bot proposed a split last turn; a bare "так, порахуйте" must MATERIALISE
+    # that distribution and QUOTE it (not re-propose forever).
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-07",
+             "adults": 6, "children_count": 0, "children_ages": []}]},
+        history=_bot_spoke(),
+        availability=_raw({"Стандарт": {"2026-07-06": 5, "2026-07-07": 5}}))
+    _run(bs.process_incoming_message("нас 6 на 6-7 липня", 612))
+    assert 612 in bs._pending_split and any("розподілити" in m for m in server.sent)
+    server.sent.clear()
+    # accept — the bot's last message was the split offer; slots re-emit the group
+    server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": None, "checkin": "2026-07-06", "checkout": "2026-07-07",
+             "adults": 6, "children_count": 0, "children_ages": []}]},
+        history=[{"id": 1, "message_type": "outgoing",
+                  "content": "Ваша компанія завелика — пропонуємо розподілити її на 2 номери (наприклад: 3 + 3 осіб)"}],
+        availability=_raw({"Стандарт": {"2026-07-06": 5, "2026-07-07": 5}}))
+    _run(bs.process_incoming_message("так, порахуйте будь ласка", 612))
+    full = "\n".join(server.sent)
+    assert "буде вартувати" in full and "2 номери" in full   # quoted the two Standard rooms
+
+
+def test_e2e_booking_com_hands_off_and_tags_instagram(server):
+    # Persona 18: a Booking.com prepayment question must NOT get our IBAN (BOOK_ROOM) — the bot
+    # replies it can't help with Booking.com and tags the conversation Instagram for a human.
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, history=_bot_spoke())
+    _run(bs.process_incoming_message(
+        "Доброго дня! Я забронювала номер на booking, потрібно кинути 50% передоплати", 490))
+    full = "\n".join(server.sent)
+    assert "Booking.com" in full                     # the can't-help handoff
+    assert "IBAN" not in full                         # NOT the prepayment/IBAN rules
+    assert bot_logic.INSTAGRAM_LABEL in server.added_labels
+
+
+def test_e2e_payment_handoff_tags_and_mutes(server):
+    # Owner #22 (2026-07-09): a payment submission -> concise handoff, tag BOTH Замовлено (mute)
+    # and Instagram, never verify/confirm. The Замовлено label then mutes all future messages.
+    bs = server.configure(slots={"topic": "greeting", "rooms": []}, history=_bot_spoke())
+    _run(bs.process_incoming_message("Я оплатив, ось квитанція", 495))
+    full = "\n".join(server.sent)
+    assert "перевірить оплату" in full and "менеджер" in full   # concise handoff text
+    assert "буде вартувати" not in full and "IBAN" not in full  # never auto-confirms
+    assert bot_logic.ORDER_LABEL in server.added_labels         # mute label
+    assert bot_logic.INSTAGRAM_LABEL in server.added_labels     # owner's Instagram tag
+    # Now the conversation is muted -> the bot ignores follow-ups.
+    server.sent.clear()
+    server.configure(slots={"topic": "greeting", "rooms": []},
+                     history=_bot_spoke(), labels=[bot_logic.ORDER_LABEL])
+    _run(bs.process_incoming_message("а коли підтвердження броні?", 495))
+    assert server.sent == []                                    # muted -> silent
 
 
 def test_e2e_ubd_soldout_includes_military_note(server):
@@ -1425,7 +1634,8 @@ def test_e2e_payment_keyword_handoff_and_label(server):
     bs = server.configure(slots={"topic": "greeting", "rooms": []})
     _run(bs.process_incoming_message("Оплатив! Ось квитанція 🙂", 401))
     assert server.sent == [templates.PAYMENT_RECEIVED_HANDOFF]
-    assert server.added_labels == [bot_logic.ORDER_LABEL]   # tagged "Замовлено"
+    # Owner #22: mute label (Замовлено) AND the Instagram manager tag.
+    assert server.added_labels == [bot_logic.ORDER_LABEL, bot_logic.INSTAGRAM_LABEL]
     assert server.prompts == []                             # LLM never triggered
 
 
@@ -1434,7 +1644,7 @@ def test_e2e_payment_attachment_handoff(server):
     bs = server.configure(slots={"topic": "greeting", "rooms": []})
     _run(bs.process_incoming_message("", 402, True))
     assert server.sent == [templates.PAYMENT_RECEIVED_HANDOFF]
-    assert server.added_labels == [bot_logic.ORDER_LABEL]
+    assert server.added_labels == [bot_logic.ORDER_LABEL, bot_logic.INSTAGRAM_LABEL]
 
 
 # -- mute switch: a human-owned ("Замовлено") conversation is ignored -------
