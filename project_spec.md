@@ -652,5 +652,31 @@ capacity gate.**
 `live_auto_qa.py` double-fires each message (public-API webhook + manual `trigger_bot`). Hardening
 for state-mutating branches: set memory/pop state only AFTER a non-superseded emit; `last_bot_msg`
 skips NOTICE messages ("Секундочку"/greeting) so a superseded sibling's scrape-notice can't mask the
-real offer. Production Chatwoot fires once. Active persona set: {2,5,7,15,19,21,23,24}; passed
-personas commented out (kept). 23/24 mined from `your_instagram_activity/` (1091 real threads).
+real offer. Production Chatwoot fires once. Active persona set (Sprint 4, 2026-07-11):
+{2,15,21,23,25,26,27}; passed personas commented out (kept). 23/24 mined from
+`your_instagram_activity/` (1091 real threads).
+
+## 14. QA reporting protocol (MANDATORY — owner rule 2026-07-11)
+
+**MANDATORY RULE: Every QA or test report MUST include the exact Chatwoot Conversation IDs for
+every run. Never omit IDs and never use ranges (e.g. #310-315). The owner needs exact IDs for
+manual verification.**
+
+Applies to EVERY sign-off, whether via `live_auto_qa.py`, `simulate_live_chat.py`, or a manual
+Chatwoot session. Practical guidance so the IDs are never lost:
+- The harness prints `✓ conversation #XXX` per persona — capture it from the run output at the time.
+- If the output scrolled off, recover the exact IDs from the Chatwoot API (list conversations in the
+  "Bot Simulator (API)" inbox and map each by its first client message), NOT from memory.
+- Report EACH run on its own line as `Test X (Description): Conv ID #XXX`, and list EVERY
+  intermediate/failed run separately (e.g. a fix that took two attempts → report both conv IDs).
+- One exact ID per run; never a range, never "approximately", never a bare count.
+
+### 13.8 Sprint 4 conversation IDs (2026-07-11) — reference
+- Test 21 (date-after-split, 6 adults + 4 kids): FAILED #326 (false large-group redirect) → FIXED #327.
+- Test 23 (two families aggregate): #328 (GREEN, 27600 грн).
+- Test 25 (2 rooms/4 adults + beds): FAILED #329 (phantom 8-adult split) → FAILED #330 (quote not
+  surfaced) → FIXED #331 (2 Стандарт 10000 грн).
+- Test 26 (scattered NLP, 24 msgs): #332 (GREEN; false-failed on truncated fetch, re-audited 6/6 same conv).
+- Test 27 (cottage → rooms): #333 (GREEN).
+- Persona 2 regression (УБД + food): #334 (GREEN, food 10200 / quote 16320).
+- Persona 15 regression (6+ split accept→quote): #335 (GREEN, 7100 грн).
