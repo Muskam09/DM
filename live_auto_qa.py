@@ -135,11 +135,30 @@ def inject_persona(identifier, name, messages, drip):
 
 
 def fetch_rows(conv_id):
-    data = app_api("GET", f"/api/v1/accounts/{ACCOUNT_ID}/conversations/{conv_id}/messages")
-    msgs = data if isinstance(data, list) else (
-        data.get("payload") or data.get("messages") or data.get("data") or [])
+    # Chatwoot returns only the LAST ~20 messages per page; a long persona (Persona 26 = 24 msgs +
+    # bot replies) overflows that, truncating the EARLY FAQ answers (e.g. the address) from the audit.
+    # Paginate backward via ?before=<id> so the audit sees the WHOLE conversation.
+    seen = {}
+    before = None
+    for _ in range(30):                        # safety cap on pages
+        path = f"/api/v1/accounts/{ACCOUNT_ID}/conversations/{conv_id}/messages"
+        if before is not None:
+            path += f"?before={before}"
+        data = app_api("GET", path)
+        msgs = data if isinstance(data, list) else (
+            data.get("payload") or data.get("messages") or data.get("data") or [])
+        ids = [m.get("id") for m in msgs if m.get("id") is not None]
+        if not ids:
+            break
+        for m in msgs:
+            if m.get("id") is not None:
+                seen[m["id"]] = m
+        page_min = min(ids)
+        if before is not None and page_min >= before:   # no older messages returned -> done
+            break
+        before = page_min
     rows = []
-    for m in sorted(msgs, key=lambda x: x.get("id", 0)):
+    for m in sorted(seen.values(), key=lambda x: x.get("id", 0)):
         content = (m.get("content") or "").strip()
         if not content or m.get("private"):
             continue
@@ -314,16 +333,17 @@ PERSONAS = {
     #     DRIP_DEFAULT,
     #     [("pet surcharge 300", has("300 грн")), ("coherent", has("грн", "віконц", "дати"))]),
 
-    5: ("5️⃣ Одна особа, тиждень (22.06–02.07) — nights alignment (#274)",
-        ["Які вільні дати для бронювання?",
-         "Доброго дня. На 1 особу з 22.06 по 02.07. на 7 днів",
-         "Дякую",
-         "так"],
-        DRIP_DEFAULT,
-        [("coherent date/price response (solo)", has("грн", "віконц", "вільн", "заброньован", "дати")),
-         ("if a nearest window is offered, it STATES nights (#274)",
-          lambda t: "найближче вільне віконце" not in t or "ноч" in t),
-         ("warm close on thanks", has("гарного дня", "будемо раді", "раді допомогти"))]),
+    # 5: PASSED (owner Sprint 4) — commented out, kept for re-runs. (past-dates: 22.06–02.07)
+    # 5: ("5️⃣ Одна особа, тиждень (22.06–02.07) — nights alignment (#274)",
+    #     ["Які вільні дати для бронювання?",
+    #      "Доброго дня. На 1 особу з 22.06 по 02.07. на 7 днів",
+    #      "Дякую",
+    #      "так"],
+    #     DRIP_DEFAULT,
+    #     [("coherent date/price response (solo)", has("грн", "віконц", "вільн", "заброньован", "дати")),
+    #      ("if a nearest window is offered, it STATES nights (#274)",
+    #       lambda t: "найближче вільне віконце" not in t or "ноч" in t),
+    #      ("warm close on thanks", has("гарного дня", "будемо раді", "раді допомогти"))]),
 
     # 6: ("6️⃣ 2 дорослих + 3 дітей",  # PASSED
     #     ["Де саме знаходиться готель?", "Яка ціна кімнати 2 дорослих і 3 дітей",
@@ -332,20 +352,21 @@ PERSONAS = {
     #     [("location answered", has("серці карпат", "стаїще", "верховин")),
     #      ("asks child ages", has("вік діт", "діток"))]),
 
-    7: ("7️⃣ Бронь 13.07-17.07 (4 ночі) — exact dates priced/handled (#274/#299)",
-        ["Хочу забронювати",
-         "13.07-17.07",
-         "яка вартість відпочинку?",
-         "Що входить у вартість",
-         "На двох",
-         "Стандарт +"],
-        DRIP_DEFAULT,
-        [("INCLUDED-in-price FAQ answered", has("паркув", "входить", "басейн")),
-         ("coherent 4-night stay: exact price OR nearest-window/booked, never a false error",
-          has("грн", "віконц", "заброньован", "вартувати")),
-         ("if a nearest window is offered it states 4 nights (#274)",
-          lambda t: "найближче вільне віконце" not in t or "4 ноч" in t),
-         ("never claims the (future, valid) dates already passed", lacks("вже минули"))]),
+    # 7: PASSED (owner Sprint 4) — commented out, kept for re-runs. (exact dates 13.07-17.07)
+    # 7: ("7️⃣ Бронь 13.07-17.07 (4 ночі) — exact dates priced/handled (#274/#299)",
+    #     ["Хочу забронювати",
+    #      "13.07-17.07",
+    #      "яка вартість відпочинку?",
+    #      "Що входить у вартість",
+    #      "На двох",
+    #      "Стандарт +"],
+    #     DRIP_DEFAULT,
+    #     [("INCLUDED-in-price FAQ answered", has("паркув", "входить", "басейн")),
+    #      ("coherent 4-night stay: exact price OR nearest-window/booked, never a false error",
+    #       has("грн", "віконц", "заброньован", "вартувати")),
+    #      ("if a nearest window is offered it states 4 nights (#274)",
+    #       lambda t: "найближче вільне віконце" not in t or "4 ноч" in t),
+    #      ("never claims the (future, valid) dates already passed", lacks("вже минули"))]),
 
     # 8: PASSED 2026-07-09 (owner) — commented out, kept for re-runs.
     # 8: ("8️⃣ Як добратися (2-7 липня, 1 дор + діти 6 і 13) — only-available (#275)",
@@ -430,17 +451,18 @@ PERSONAS = {
     #       ("does NOT send our IBAN/prepayment rules", lacks("iban", "26005064100017")),
     #       ("hands off to a human", has("менеджер"))]),
 
-    19: ("1️⃣9️⃣ NLP родини (3 дор + 11,16) + 23-27 → ТІЛЬКИ доступні типи (#19)",
-         ["Добрий день. Яка ціна?",
-          "Мої батьки, я та мої 2 сина",
-          "11 і 16 років",
-          "23-27 липня"],
-         DRIP_DEFAULT,
-         [("parsed 3 adults + 2 children; asked the sons' ages", has("вік діт", "вік дит", "діток")),
-          # party of 5 fits only Напівлюкс, which is BOOKED on 23-27 -> offer a Стандарт-class split,
-          # naming ONLY the AVAILABLE types (owner #19).
-          ("offers Стандарт-class rooms", has("стандарт")),
-          ("does NOT offer the BOOKED Напівлюкс on these dates (#19)", lacks("напівлюкс"))]),
+    # 19: PASSED (owner Sprint 4) — commented out, kept for re-runs. (NLP family 5 pax)
+    # 19: ("1️⃣9️⃣ NLP родини (3 дор + 11,16) + 23-27 → ТІЛЬКИ доступні типи (#19)",
+    #      ["Добрий день. Яка ціна?",
+    #       "Мої батьки, я та мої 2 сина",
+    #       "11 і 16 років",
+    #       "23-27 липня"],
+    #      DRIP_DEFAULT,
+    #      [("parsed 3 adults + 2 children; asked the sons' ages", has("вік діт", "вік дит", "діток")),
+    #       # party of 5 fits only Напівлюкс, which is BOOKED on 23-27 -> offer a Стандарт-class split,
+    #       # naming ONLY the AVAILABLE types (owner #19).
+    #       ("offers Стандарт-class rooms", has("стандарт")),
+    #       ("does NOT offer the BOOKED Напівлюкс on these dates (#19)", lacks("напівлюкс"))]),
 
     # 20: PASSED 2026-07-09 (owner) — commented out, kept for re-runs.
     # 20: ("2️⃣0️⃣ Відстань до Буковелю",
@@ -451,12 +473,15 @@ PERSONAS = {
     #       ("booking coherent (20-23 July, 3 nights)", has("грн", "віконц", "заброньован", "дата", "3 ноч"))]),
 
     # ===== NEW personas (owner 2026-07-09) =====
-    21: ("2️⃣1️⃣ Велика змішана компанія + гнучкий старт (6 дор + 4 діти)",
+    21: ("2️⃣1️⃣ Велика змішана компанія + гнучкий старт (6 дор + 4 діти) — date-after-split (Sprint-4)",
          ["Цікавить дві доби для компанії 6 дорослих 4 дитини 2,8,11,14р",
           "З 15 чи 16 липня"],
          DRIP_DEFAULT,
          [("shows capacities (max 3 adults/room)", has("максимум 3 дорослих")),
-          ("PROPOSES a valid multi-room split (owner #21)", has("розподілити", "номери")),
+          ("PROPOSES a valid multi-room split (owner #21)", has("розподілити")),
+          # Sprint-4 Test 21 FIX: the follow-up "З 15 чи 16 липня" must be CAPTURED, not ignored —
+          # the split is re-proposed with the July dates attached (never silent).
+          ("captures the dates sent right after the split (Test 21 fix)", has("липня")),
           ("does NOT cram everyone into one room / no bogus quote",
            lambda t: "буде вартувати" not in t or "загальна вартість" in t)]),
 
@@ -484,19 +509,78 @@ PERSONAS = {
           ("real prices, not stuck", has("грн")),
           ("no capacity error leak", lacks("error", "traceback"))]),
 
-    24: ("2️⃣4️⃣ Міжсезоння (28.09–01.10) + УБД + фото (IG real)",
-         ["Доброго дня! Заїзд 28 вересня, виїзд 01 жовтня. Двоє дорослих і двоє дітей 4 і 6 років",
-          "Стандарт",
-          "Чи є знижки для військових/УБД?",
-          "Можливо маєте фото/відео номерів?"],
+    # 24: PASSED (owner Sprint 4) — commented out, kept for re-runs. (off-season 28.09–01.10)
+    # 24: ("2️⃣4️⃣ Міжсезоння (28.09–01.10) + УБД + фото (IG real)",
+    #      ["Доброго дня! Заїзд 28 вересня, виїзд 01 жовтня. Двоє дорослих і двоє дітей 4 і 6 років",
+    #       "Стандарт",
+    #       "Чи є знижки для військових/УБД?",
+    #       "Можливо маєте фото/відео номерів?"],
+    #      DRIP_DEFAULT,
+    #      [("off-season handled — price being agreed, not a made-up quote",
+    #        lambda t: "узгоджується" in t or "буде вартувати" not in t),
+    #       ("military/УБД discount answered", has("20%", "убд", "військов")),
+    #       ("photo/video (MEDIA) answered", has("сторіс", "хайлайтс", "фото"))]),
+
+    # ===== NEW personas (owner Sprint 4, 2026-07-11) =====
+    25: ("2️⃣5️⃣ Beds check: 2 номери 4 дор 24-26.07 + роздільні vs двоспальне ліжко",
+         ["Дізнатися вартість",
+          "Потрібно 2 номери для 4-х дорослих на 24-26.07.26",
+          "Нам потрібен один номер з роздільними ліжками а один номер на двох з одним ліжком, такі 2 є?"],
          DRIP_DEFAULT,
-         [("off-season handled — price being agreed, not a made-up quote",
-           lambda t: "узгоджується" in t or "буде вартувати" not in t),
-          ("military/УБД discount answered", has("20%", "убд", "військов")),
-          ("photo/video (MEDIA) answered", has("сторіс", "хайлайтс", "фото"))]),
+         [("quotes a Стандарт-class room for the 2-room, 4-adult booking", has("стандарт")),
+          ("gives a real price / aggregate (2 rooms)",
+           has("грн", "загальна вартість", "2 номери", "за 2 номери")),
+          ("answers the twin/double bed question (BED_CONFIG)", has("ліжк")),
+          ("does NOT invent a hard per-date bed guarantee / no hallucination",
+           lacks("гарантуємо саме", "точно буде"))]),
+
+    26: ("2️⃣6️⃣ Scattered NLP stress client (3 дор, pool/address/food, 15-24.07)",
+         ["Добрий день яка вартість номеру на трьох дорослих",
+          "Басейн фходить у вартість номеру",
+          "Можна точну адресу",
+          "Що з харчуванням",
+          "Яка вартість",
+          "Днів 4-5",
+          "Вибачте що не відповіла на попередні повідомлення",
+          "Підкажіть спілкувалися щодо 3 місного номеру для дорослих",
+          "Ще є вільні місця у липні",
+          "Бажано з 15.07",
+          "На 5 ночей з 19",
+          "Уточніть будь ласка",
+          "Вартість",
+          "Як минулого разу спілкувалися 15000 було з басейном",
+          "А зараз як?",
+          "Трішки не зрозуміла якщо брати стандарт за 13500 що в ньог входить",
+          "Тобто не входить холодильник і балкон",
+          "Кондиціонер входить?",
+          "Кімната одно чи дах кімната",
+          "І чи входить басейн",
+          "?",
+          "А в стандарт + входить холодильник, кондиціонер, міні холодильник та басейн",
+          "І це також однокімнатний номер з диваном чи двокімнатний?",
+          "Дякую"],
+         DRIP_DEFAULT,
+         [("pool 'included in price' answered", has("басейн", "входить у вартість")),
+          ("address answered", has("стаїще", "верховин", "карпат", "maps")),
+          ("food answered", has("сніданок", "350", "харчуванн")),
+          ("included-in-price / Стандарт+ amenities answered", has("холодильник", "балкон", "входить")),
+          ("gives a coherent price", has("грн")),
+          ("survives the chaos — warm close, never silent on 'Дякую'",
+           has("гарного дня", "будемо раді", "раді допомогти", "дякуємо"))]),
+
+    27: ("2️⃣7️⃣ Cottage → no cottage, pivot to room split (5 дор + 2 діти, 1-11 серпня)",
+         ["Добрий день цікавить котедж на 7 чоловік , 5 дорослих і 2 дітей",
+          "які є варіанти з 1 го по 11 серпня, дякую"],
+         DRIP_DEFAULT,
+         [("acknowledges there is NO cottage (we are a hotel)", has("котедж", "готель")),
+          ("offers the real room types instead", has("стандарт", "напівлюкс")),
+          ("handles the 7-person group (asks distribution / proposes split)",
+           has("розсел", "розподіл", "як вас краще", "оптимальні номери")),
+          ("no bogus single-room quote for 7 people",
+           lambda t: "буде вартувати" not in t or "загальна вартість" in t)]),
 }
 
-DEFAULT_SET = [2, 5, 7, 15, 19, 21, 23, 24]
+DEFAULT_SET = [2, 15, 21, 23, 25, 26, 27]
 
 
 # --------------------------------------------------------------------------- #

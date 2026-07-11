@@ -645,18 +645,23 @@ def plan(slots: Dict) -> Dict:
     if len(rooms) == 1 and _room_guests(rooms[0]) >= 6:
         # Show room capacities FIRST (client knows the limits), then handle the group.
         r0 = rooms[0]
+        # A dates/period prefix makes a follow-up turn's message DIFFERENT from the first one, so the
+        # anti-dedup doesn't silence a date the client sent right after the split proposal ("З 15 чи
+        # 16 липня") and the room list isn't repeated (owner #304 + Sprint-4 Test 21). ANY captured
+        # date form (exact range / a single check-in / a fuzzy period) yields a non-empty prefix.
+        if r0.get("checkin") and r0.get("checkout"):
+            prefix = f"На дати {dates_phrase(r0['checkin'], r0['checkout'])}: "
+        elif r0.get("checkin"):
+            _ci = pricing_engine._as_date(r0["checkin"])
+            prefix = f"На дату {_ci.day} {_GEN_MONTHS[_ci.month]}: "
+        elif r0.get("fuzzy_date"):
+            prefix = f"Орієнтуємось на {r0['fuzzy_date']}: "
+        else:
+            prefix = ""
         cc0, known_ages0 = _child_count(r0), len(r0.get("children_ages") or [])
         if cc0 == known_ages0:
             # Owner #21: composition fully known -> PROACTIVELY propose a STANDARD-priority split.
             counts = suggest_group_distribution(r0.get("adults") or 0, r0.get("children_ages") or [])
-            # A dates/period prefix makes a follow-up turn's message DIFFERENT from the first one,
-            # so the anti-dedup doesn't silence it and the room list isn't repeated (owner #304).
-            if r0.get("checkin") and r0.get("checkout"):
-                prefix = f"На дати {dates_phrase(r0['checkin'], r0['checkout'])}: "
-            elif r0.get("fuzzy_date"):
-                prefix = f"Орієнтуємось на {r0['fuzzy_date']}: "
-            else:
-                prefix = ""
             return {"action": "reply",
                     "split_counts": counts,
                     "reply": templates.PRESENTATION_ROOMS + "[SPLIT]"
@@ -664,9 +669,10 @@ def plan(slots: Dict) -> Dict:
                     .replace("{dates_prefix}", prefix)
                     .replace("{rooms}", room_count_phrase(len(counts)))
                     .replace("{distribution}", " + ".join(str(c) for c in counts))}
-        # Ages still unknown -> we can't compute a precise valid split; ask how to distribute.
+        # Ages still unknown -> we can't compute a precise valid split; ask how to distribute
+        # (dates-prefixed so a follow-up naming the dates isn't anti-dedup-silenced either).
         return {"action": "reply",
-                "reply": templates.PRESENTATION_ROOMS + "[SPLIT]" + templates.ASK_ROOM_DISTRIBUTION}
+                "reply": templates.PRESENTATION_ROOMS + "[SPLIT]" + prefix + templates.ASK_ROOM_DISTRIBUTION}
 
     cc = max((_child_count(r) for r in rooms), default=0)
     ages = max((len(r.get("children_ages") or []) for r in rooms), default=0)

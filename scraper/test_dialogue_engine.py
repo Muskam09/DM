@@ -583,6 +583,32 @@ def test_plan_six_plus_unknown_ages_still_asks_distribution():
     assert templates.ASK_ROOM_DISTRIBUTION in out["reply"]
 
 
+def test_plan_six_plus_split_carries_dates_prefix():
+    # Sprint-4 Test 21: a group-split proposal made AFTER the dates are known must carry a dated
+    # prefix ("На дати 15 - 17 липня: …") so a follow-up date turn is NOT anti-dedup-silenced.
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-15", "checkout": "2026-07-17",
+                              "adults": 6, "children_count": 4, "children_ages": [2, 8, 11, 14]}]})
+    assert "На дати 15 - 17 липня" in out["reply"]
+    assert "розподілити" in out["reply"]
+
+
+def test_plan_six_plus_checkin_only_still_dates_prefix():
+    # A single check-in (no check-out yet — e.g. the earliest of "15 чи 16 липня") still yields a
+    # non-empty dated prefix, so the re-proposed split differs from the original (never silenced).
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-07-15", "checkout": None,
+                              "adults": 6, "children_count": 4, "children_ages": [2, 8, 11, 14]}]})
+    assert "На дату 15 липня" in out["reply"]
+
+
+def test_plan_six_plus_unknown_ages_dates_prefix():
+    # The ages-unknown ASK_ROOM_DISTRIBUTION path is ALSO dates-prefixed (Persona 27: a follow-up
+    # naming dates for a group must not be anti-dedup-silenced).
+    out = de.plan({"rooms": [{"room_type": None, "checkin": "2026-08-01", "checkout": "2026-08-11",
+                              "adults": 5, "children_count": 2, "children_ages": []}]})
+    assert templates.ASK_ROOM_DISTRIBUTION in out["reply"]
+    assert "На дати 1 - 11 серпня" in out["reply"]
+
+
 def test_suggest_group_distribution():
     # STANDARD-priority (owner 2026-07-10): split into Стандарт-sized rooms (<=3 people), biggest
     # first. 6 adults + 4 kids -> FOUR Standards 3+3+2+2, never 3+3+4 (which needs a Напівлюкс).

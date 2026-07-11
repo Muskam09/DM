@@ -3,7 +3,7 @@ import time
 import asyncio
 import requests
 import uvicorn
-from datetime import date
+from datetime import date, timedelta
 from fastapi import FastAPI, Request, BackgroundTasks
 from google import genai
 from dotenv import load_dotenv
@@ -163,7 +163,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 {
   "topic": "<один з: price_quote | general_price | faq | presentation | group_event | thinking | reject_dates | booking_confirm | fuzzy_dates | nearest_dates | greeting | barter | unknown>",
   "rooms": [ {"room_type": "<Стандарт|Стандарт +|Напівлюкс|null>", "checkin": "YYYY-MM-DD|null", "checkout": "YYYY-MM-DD|null", "fuzzy_date": "<текст нечіткого періоду|null>", "nights": <ціле|null>, "adults": <ціле>, "children_count": <ціле>, "children_ages": [<вік>, ...], "ubd": <true|false>} ],
-  "faq_template": "<POOL|CHILDREN_POOL|PETS|SAUNA_VATS|FOOD_PRICES|FOOD_MENU|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|SMOKING|PLACE|BOOK_ROOM|MILITARY|DISCOUNTS|PRICE_POLICY|PET_SURCHARGE|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>",
+  "faq_template": "<POOL|CHILDREN_POOL|PETS|SAUNA_VATS|FOOD_PRICES|FOOD_MENU|TRANSFER_PARKING|HOW_TO_GET_THERE|ROOM_AMENITIES|AIR_CONDITIONING|SMOKING|PLACE|BOOK_ROOM|MILITARY|DISCOUNTS|PRICE_POLICY|PET_SURCHARGE|CHILDREN|CHILDREN_AMENITIES|CHECK_IN_OUT|DOCUMENTS|HAIRDRYER|MEDIA|BAR|GUEST_POOL|KITCHEN|INCLUDED_IN_THE_PRICE|BREAKFAST_IN_THE_PRICE|GENERAL_INFORMATION|null>",
   "meals": {"persons": <ціле|null>, "three_meals_days": <ціле>, "two_meals_days": <ціле>, "breakfast_days": <ціле>, "lunch_days": <ціле>, "dinner_days": <ціле>}
 }
 
@@ -190,6 +190,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 Правила заповнення rooms:
 - Для general_price (є дати+гості, без номеру) додай ОДИН об'єкт з room_type=null.
 - КІЛЬКА НОМЕРІВ — окремий об'єкт у rooms[] на КОЖЕН номер ТІЛЬКИ якщо клієнт ЯВНО просить кілька номерів ("2 номери", "два номери", "дві сім'ї", "1 Стандарт і 1 Напівлюкс"). Якщо клієнт називає лише КІЛЬКІСТЬ ОСІБ ("4 дорослих", "нас 5", "на шістьох") — це ОДИН об'єкт rooms[] з відповідними adults/children. НЕ розбивай гостей на кілька номерів і НЕ присвоюй різні типи номерів сам — покажемо варіанти і клієнт обере.
+- ЗАГАЛЬНА vs ПОКІМНАТНА кількість (ВАЖЛИВО — не подвоюй гостей!): "N номерів для M дорослих" / "N номери на M осіб" означає M гостей ЗАГАЛОМ, рівномірно РОЗПОДІЛЕНИХ по N номерах. Створи N об'єктів rooms[] так, щоб СУМА adults по ВСІХ номерах дорівнювала M — а НЕ M у кожному номері. Приклад: "2 номери для 4 дорослих" => ДВА об'єкти з adults=2 кожен (сума=4), А НЕ adults=4 у кожному (сума=8). Клади повну кількість M у КОЖЕН номер ЛИШЕ якщо клієнт це ЯВНО каже ("по 4 в кожному"). Якщо клієнт САМ називає покімнатний розподіл ("в одному 4, в іншому 3", "2 номери: 3 і 2") — постав саме ці числа в окремі об'єкти.
 - ЗАПАСНИЙ ТИП — фрази "X, якщо немає тоді Y" / "краще X, або Y" / "бажано X, як ні — Y" означають ОДИН номер із бажаним типом X (Y — лише запасний варіант). Постав room_type=X (бажаний) для ОДНОГО об'єкта rooms[]. НЕ створюй два номери і НЕ дублюй гостей.
 - checkout = дата ВИЇЗДУ (остання ніч НЕ включається). "5-7 липня" => checkin 2026-07-05, checkout 2026-07-07.
 - Якщо дано дату заїзду + кількість ночей — обчисли checkout = заїзд + ночі.
@@ -234,7 +235,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - Питання про ЦІНИ на харчування ("скільки коштує сніданок", "яка вартість харчування") => faq_template=FOOD_PRICES, meals усі 0.
 - Питання про СТРАВИ/меню ("які страви подають", "що готують", "яке меню") => faq_template=FOOD_MENU.
 
-FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ЗАГАЛЬНЕ питання про знижки/акції ("чи є знижки", "які у вас знижки", "є якісь акції", "промокод") -> DISCOUNTS; питання про ЦІНОВУ ПОЛІТИКУ по місяцях ("чи така сама цінова політика в серпні, як у липні", "ціни однакові по місяцях", "в серпні дорожче?") -> PRICE_POLICY; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS; фен / чи є фен у номері -> HAIRDRYER; фото / відео / світлини номерів чи території -> MEDIA.
+FAQ-підказки (faq_template за останнім питанням): як добратися / як доїхати / потягом / залізницею / автобусом / звідки їхати -> HOW_TO_GET_THERE; вартість трансферу / парковка -> TRANSFER_PARKING; знижка військовим / УБД (як окреме питання без розрахунку) -> MILITARY; ЗАГАЛЬНЕ питання про знижки/акції ("чи є знижки", "які у вас знижки", "є якісь акції", "промокод") -> DISCOUNTS; питання про ЦІНОВУ ПОЛІТИКУ по місяцях ("чи така сама цінова політика в серпні, як у липні", "ціни однакові по місяцях", "в серпні дорожче?") -> PRICE_POLICY; ОПЛАТА/ПЕРЕДОПЛАТА — правила оплати / передоплата / аванс / завдаток / "чи можна без передоплати" / "оплата по приїзду" / "оплатити повністю по приїзду" / коли і скільки потрібно платити -> BOOK_ROOM (УВАГА: слова "приїзд"/"по приїзду" РАЗОМ з оплатою означають правила ПЕРЕДОПЛАТИ, а НЕ час заселення); час заїзду/виїзду / о котрій заселення / до котрої звільнити номер (БЕЗ згадки оплати) -> CHECK_IN_OUT; дитяче ліжечко / манеж / коляска / дитячий майданчик / зручності для дітей -> CHILDREN_AMENITIES; рахунок / акт наданих послуг / фіскальний чек / документи для оплати / свідоцтво про народження -> DOCUMENTS; фен / чи є фен у номері -> HAIRDRYER; фото / відео / світлини номерів чи території -> MEDIA; кондиціонер / кондиціонування / клімат-контроль -> AIR_CONDITIONING (кондиціонерів у номерах НЕМАЄ, відповідай чесно); холодильник / балкон / мінібар (які саме зручності в конкретному типі номеру) -> GENERAL_INFORMATION.
 ВАЖЛИВО: тенісного КОРТУ у готелі НЕМАЄ — НЕ пропонуй теніс як активність. Загальне питання про знижки/акції -> DISCOUNTS (шаблон перелічує лише реальні знижки — діти та військові — і відсилає за іншими акціями в Instagram). Знижку 10% / "програму лояльності" бот НЕ рахує і НЕ обіцяє окремо (це лише людина) — на питання про знижки завжди став DISCOUNTS, а не GENERAL_INFORMATION і не null.
 БАСЕЙН — РОЗРІЗНЯЙ ТРИ ШАБЛОНИ:
 - CHILDREN_POOL: питання саме про ДИТЯЧИЙ басейн ("чи є дитячий басейн", "басейн для дітей", "дитячий басейн глибина/розмір/температура").
@@ -468,8 +469,42 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     # gave (LLM variance), causing the bot to re-ask / forget a 2nd room. Python remembers
     # the booking rooms per conversation and refills anything the fresh extraction left
     # empty, BY INDEX (new values win; un-mentioned rooms are preserved — never forget).
+    # Normalize "N номери для M дорослих" (M adults TOTAL) when the extractor put M adults in EACH
+    # room (Persona 25: "2 номери для 4-х дорослих" -> 8 adults -> a bogus 3-room split), THEN collapse
+    # the LLM's date-CHOICE duplication (e.g. "15 чи 16 липня" -> two rooms EACH holding the whole
+    # 10-person party). Both run BEFORE the merge/large-group count so a party isn't inflated.
+    slots["rooms"] = bot_logic.normalize_rooms_for_total(
+        slots.get("rooms") or [], f"{dialogue_history}\n{user_message}")
+    slots["rooms"] = bot_logic.collapse_duplicate_group_rooms(slots.get("rooms") or [])
+
     prev_mem = _slot_memory.get(conversation_id)
     merged_rooms = bot_logic.merge_rooms(prev_mem, slots.get("rooms") or [])
+
+    # DETERMINISTIC DATE FALLBACK (owner Sprint-4 Test 21): the extractor sometimes DROPS a date the
+    # client sent right after a group-split proposal ("З 15 чи 16 липня") — the bot would then just
+    # re-propose the same split, which anti-spam suppresses -> silence. If NO room carries any date
+    # but the message names an explicit calendar date, fill the check-in in (never a bare number).
+    if not any(r.get("checkin") or r.get("checkout") or r.get("fuzzy_date") for r in merged_rooms):
+        parsed = bot_logic.parse_date_request(user_message)
+        if parsed and parsed.get("checkin"):
+            for _r in merged_rooms:
+                if _r.get("checkin") or _r.get("checkout") or _r.get("fuzzy_date"):
+                    continue
+                _r["checkin"] = parsed["checkin"]
+                if parsed.get("checkout"):
+                    _r["checkout"] = parsed["checkout"]
+            print(f"[i] {conversation_id}: LLM dropped the date -> deterministic parse {parsed}")
+
+    # Derive a concrete check-out from check-in + the remembered nights (a "дві доби" group that then
+    # says "15 липня" -> checkout 17), so the dated split re-proposal differs from the first one.
+    for _r in merged_rooms:
+        if _r.get("checkin") and not _r.get("checkout") and _r.get("nights"):
+            try:
+                _r["checkout"] = (date.fromisoformat(_r["checkin"])
+                                  + timedelta(days=int(_r["nights"]))).isoformat()
+            except (ValueError, TypeError):
+                pass
+
     slots["rooms"] = merged_rooms
     new_mem = bot_logic.remember_rooms(merged_rooms)
     if any(any(r.get(f) for f in bot_logic.MERGE_FIELDS) for r in new_mem):
@@ -766,8 +801,14 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     #    a 2nd message. The nudge survives ONLY when the booking action is a QUESTION
     #    (missing data) — that path keeps faq_followup's nudge and never reaches here.
     booking_extra = None
-    if is_faq_reply and slots_changed:      # only (re)show the booking result when it CHANGED this
-        d2 = dialogue_engine.plan(slots)    # turn — an unchanged booking must NOT re-render on every FAQ
+    # (Re)show the booking result after an FAQ when it CHANGED this turn, OR when a complete booking's
+    # quote was SUPERSEDED by a rapid FAQ follow-up (drip < scrape latency): a warm cache exists but the
+    # last real bot message isn't a quote yet, so resurface it from cache (the anti-spam dedup drops it
+    # if it was already shown). An unchanged booking whose quote IS already visible won't re-render.
+    _resurface = (peek_cached_availability(conversation_id) is not None
+                  and not bot_logic.is_quote_message(last_bot_msg))
+    if is_faq_reply and (slots_changed or _resurface):
+        d2 = dialogue_engine.plan(slots)    # an unchanged, already-quoted booking must NOT re-render
         if d2.get("action") in _SCRAPE_ACTIONS:
             reply = reply.replace(templates.FAQ_CONTINUE_NUDGE, "")  # real result, not the nudge
             try:

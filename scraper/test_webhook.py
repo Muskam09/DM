@@ -226,6 +226,149 @@ def test_merge_rooms_split_respects_new_dates():
     assert merged[1]["checkin"] == "2026-07-25"   # shared from THIS turn, not the stale 23rd
 
 
+def test_merge_room_inherits_nights_even_with_new_checkin():
+    # Sprint-4 Test 21: `nights` is a STAY LENGTH, inherited even when the fresh turn names a NEW
+    # check-in ("15 липня" after "дві доби") — so bot_server can derive the check-out.
+    remembered = {"nights": 2, "adults": 6, "children_ages": [2, 8, 11, 14]}
+    merged = bot_logic.merge_room(remembered, {"checkin": "2026-07-15"})
+    assert merged["checkin"] == "2026-07-15" and merged["nights"] == 2
+    # A fresh explicit nights still wins over the remembered one.
+    assert bot_logic.merge_room({"nights": 2}, {"nights": 3})["nights"] == 3
+
+
+@pytest.mark.parametrize("text,expected_ci,expected_co", [
+    ("З 15 чи 16 липня", "2026-07-15", None),          # choice -> earliest check-in, no checkout
+    ("15-17 липня", "2026-07-15", "2026-07-17"),        # month-name range
+    ("з 13 по 17 липня", "2026-07-13", "2026-07-17"),   # "з N по M" range
+    ("з 1 го по 11 серпня", "2026-08-01", "2026-08-11"),# ordinal suffix "1 го"
+    ("15 липня", "2026-07-15", None),                   # single day + month
+    ("з 20 серпня", "2026-08-20", None),
+    ("13.07-17.07", "2026-07-13", "2026-07-17"),        # dotted range
+    ("24-26.07.26", "2026-07-24", "2026-07-26"),        # day-range + dotted month + year
+    ("20.07", "2026-07-20", None),                       # single dotted
+])
+def test_parse_date_request_explicit_dates(text, expected_ci, expected_co):
+    out = bot_logic.parse_date_request(text)
+    assert out is not None and out.get("checkin") == expected_ci
+    assert out.get("checkout") == expected_co
+
+
+@pytest.mark.parametrize("text", [
+    "На 5 ночей з 19",                 # a bare day number (no month/dot) -> NOT a date
+    "як минулого разу 15000 було",     # a price -> not a date
+    "стандарт за 13500",               # a price -> not a date
+    "нас 6 дорослих 4 дитини 2,8,11",  # ages/counts -> not a date
+    "Дякую",
+    "",
+])
+def test_parse_date_request_ignores_bare_numbers(text):
+    # The fallback must fire ONLY on an explicit month name / dotted date, never a bare number.
+    assert bot_logic.parse_date_request(text) is None
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Нам потрібен один номер з роздільними ліжками а один на двох з одним ліжком", "BED_CONFIG"),
+    ("а є номер з двоспальним ліжком?", "BED_CONFIG"),
+    ("цікавить котедж на 7 чоловік", "COTTAGE"),
+    ("є будиночок для великої компанії?", "COTTAGE"),
+])
+def test_faq_override_beds_and_cottage(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+# Owner 2026-07-11: NO air conditioners; fridge/balcony answered from GENERAL_INFORMATION.
+@pytest.mark.parametrize("text,expected", [
+    ("Кондиціонер входить?", "AIR_CONDITIONING"),
+    ("чи є кондиціонування в номерах?", "AIR_CONDITIONING"),
+    ("є клімат-контроль?", "AIR_CONDITIONING"),
+    ("а в стандарт + входить холодильник, кондиціонер та басейн", "AIR_CONDITIONING"),  # AC wins
+    ("Тобто не входить холодильник і балкон", "GENERAL_INFORMATION"),
+    ("чи є холодильник у номері?", "GENERAL_INFORMATION"),
+    ("а балкон є?", "GENERAL_INFORMATION"),
+])
+def test_faq_override_ac_and_amenities(text, expected):
+    assert bot_logic.faq_override(text) == expected
+
+
+def test_ac_and_amenity_helpers():
+    assert bot_logic.is_ac_question("Кондиціонер входить?") is True
+    assert bot_logic.is_ac_question("а холодильник є?") is False
+    assert bot_logic.is_room_amenity_question("чи є холодильник") is True
+    # "курити на балконі" is a SMOKING question, NOT an amenity list.
+    assert bot_logic.is_room_amenity_question("чи можна курити на балконі?") is False
+    assert bot_logic.faq_override("чи можна курити на балконі?") == "SMOKING"
+
+
+def test_bed_config_and_cottage_templates_content():
+    # BED_CONFIG names BOTH configs the client asked about (owner-confirmed mapping).
+    assert "роздільн" in templates.BED_CONFIG and "двоспальн" in templates.BED_CONFIG
+    assert "котедж" in templates.COTTAGE and "готель" in templates.COTTAGE
+    # AIR_CONDITIONING states there are NO air conditioners.
+    assert "кондиціонер" in templates.AIR_CONDITIONING.lower() and "немає" in templates.AIR_CONDITIONING
+    # authoritative sub-type -> bed-config knowledge base is present.
+    assert bot_logic.BED_CONFIG_MAP["Стандарт 4х 2Л + Д"].startswith("2 роздільні")
+    assert "двоспальне" in bot_logic.BED_CONFIG_MAP["Напівлюкс"]
+
+
+def test_collapse_duplicate_group_rooms_date_choice():
+    # Sprint-4 Test 21: "З 15 чи 16 липня" -> the extractor duplicated one 10-person party into TWO
+    # dated rooms (10+10=20 -> false large-group). Collapse to ONE group (earliest check-in).
+    rooms = [
+        {"adults": 6, "children_count": 4, "children_ages": [2, 8, 11, 14],
+         "checkin": "2026-07-15", "checkout": "2026-07-17", "nights": 2},
+        {"adults": 6, "children_count": 4, "children_ages": [2, 8, 11, 14],
+         "checkin": "2026-07-16", "checkout": None, "nights": None},
+    ]
+    out = bot_logic.collapse_duplicate_group_rooms(rooms)
+    assert len(out) == 1
+    assert out[0]["checkin"] == "2026-07-15" and out[0]["nights"] == 2
+    assert out[0].get("checkout") is None                 # re-derived downstream from check-in+nights
+    assert bot_logic.slots_total_guests({"rooms": out}) == 10   # not the doubled 20
+
+
+def test_normalize_rooms_for_total_distributes_adults():
+    # Persona 25: "2 номери для 4-х дорослих" — the extractor put 4 adults in EACH room (8 total).
+    # Redistribute 4 adults across 2 rooms -> [2, 2], so no bogus 8-adult over-capacity split.
+    rooms = [
+        {"adults": 4, "children_ages": [], "checkin": "2026-07-24", "checkout": "2026-07-26", "nights": 2},
+        {"adults": 4, "children_ages": [], "checkin": "2026-07-24", "checkout": "2026-07-26", "nights": 2},
+    ]
+    out = bot_logic.normalize_rooms_for_total(rooms, "Потрібно 2 номери для 4-х дорослих на 24-26.07.26")
+    assert [r["adults"] for r in out] == [2, 2]
+    assert all(r["checkin"] == "2026-07-24" and r["checkout"] == "2026-07-26" for r in out)
+
+
+def test_normalize_rooms_for_total_noop_when_correct_or_absent():
+    # Already correct (2 rooms, 2 adults each = 4) -> untouched.
+    ok = [{"adults": 2, "children_ages": []}, {"adults": 2, "children_ages": []}]
+    assert bot_logic.normalize_rooms_for_total(ok, "2 номери для 4 дорослих") == ok
+    # No "N rooms for M people" phrase -> untouched.
+    other = [{"adults": 4, "children_ages": []}]
+    assert bot_logic.normalize_rooms_for_total(other, "давайте порахуйте") == other
+    # A family request (children present) is never redistributed.
+    fam = [{"adults": 2, "children_ages": [8]}, {"adults": 2, "children_ages": [8]}]
+    assert bot_logic.normalize_rooms_for_total(fam, "2 номери для 4 дорослих") == fam
+
+
+def test_collapse_leaves_real_multiroom_untouched():
+    # A genuine multi-room booking must NOT be collapsed.
+    same_dates_group = [   # identical over-capacity rooms on the SAME dates -> a real (big) ask
+        {"adults": 6, "children_ages": [], "checkin": "2026-07-20", "checkout": "2026-07-22"},
+        {"adults": 6, "children_ages": [], "checkin": "2026-07-20", "checkout": "2026-07-22"},
+    ]
+    assert len(bot_logic.collapse_duplicate_group_rooms(same_dates_group)) == 2
+    two_families = [       # distinct compositions (Persona 23) -> untouched
+        {"adults": 2, "children_ages": [8, 10], "checkin": "2026-07-20", "checkout": "2026-07-24"},
+        {"adults": 2, "children_ages": [9], "checkin": "2026-07-20", "checkout": "2026-07-24"},
+    ]
+    assert len(bot_logic.collapse_duplicate_group_rooms(two_families)) == 2
+    fits_one_room = [      # 2 rooms of 2 adults each (Persona 25) -> under capacity, untouched
+        {"adults": 2, "children_ages": [], "checkin": "2026-07-24", "checkout": "2026-07-26"},
+        {"adults": 2, "children_ages": [], "checkin": "2026-07-24", "checkout": "2026-07-26"},
+    ]
+    assert len(bot_logic.collapse_duplicate_group_rooms(fits_one_room)) == 2
+
+
 @pytest.mark.parametrize("text,expected", [
     ("Так", True), ("так, давайте", True), ("Давайте", True), ("Добре, бронюємо", True),
     ("ок", True), ("Погоджуюсь", True),

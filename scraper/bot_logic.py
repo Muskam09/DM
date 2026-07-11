@@ -11,6 +11,7 @@ guarantees the live server and the tests exercise the very same code.
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Dict, List
 
 # Categories that must NEVER be offered to a client as a bookable room.
@@ -386,6 +387,237 @@ def parse_meal_request(text: str):
     return m
 
 
+# --- deterministic date parsing (fallback when the LLM drops a date) --------
+# Dates normally come from the LLM extractor, but it sometimes DROPS a date a client sent right
+# after a group-split proposal ("З 15 чи 16 липня") — leaving the bot to silently re-propose the
+# SAME split, which the anti-spam guard then suppresses (silence — the owner's Sprint-4 Test 21
+# bug). This PURE parser is a safety net: it fires ONLY on an explicit month name or a dotted date
+# (never a bare number, so it can't misfire on prices/ages/counts), so bot_server can fill in a
+# check-in the extractor missed. Bookings are 2026 (any month parses; only summer is priced later).
+_DATE_YEAR = 2026
+
+# Longest stems first so "серпн" wins before "серп", etc. Genitive + short forms cover "15 липня",
+# "1 серпня", the "лип"/"серп" abbreviations, etc.
+_UA_MONTH_STEMS = [
+    ("січн", 1), ("січ", 1), ("лютог", 2), ("лют", 2), ("березн", 3), ("берез", 3),
+    ("квітн", 4), ("квіт", 4), ("травн", 5), ("трав", 5), ("червн", 6), ("черв", 6),
+    ("липн", 7), ("лип", 7), ("серпн", 8), ("серп", 8), ("вересн", 9), ("верес", 9),
+    ("жовтн", 10), ("жовт", 10), ("листопад", 11), ("грудн", 12), ("груд", 12),
+]
+
+
+def _month_from_word(word: str):
+    w = (word or "").lower()
+    for stem, mon in _UA_MONTH_STEMS:
+        if w.startswith(stem):
+            return mon
+    return None
+
+
+def _safe_iso(day: int, month: int, year: int = _DATE_YEAR):
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+# A trailing ordinal suffix ("1-го", "15 го", "20 числа") sits between the day number and the
+# range connector; tolerate it so "з 1 го по 11 серпня" parses as 1 → 11.
+_ORD = r"(?:\s*-?\s*(?:го|е|му|числа))?"
+
+
+def parse_date_request(text, year: int = _DATE_YEAR):
+    """Best-effort deterministic check-in (and, when stated, check-out) from ONE message.
+
+    Fires ONLY on an explicit month name ("15 липня", "15 чи 16 липня", "з 13 по 17 липня") or a
+    dotted date ("13.07", "13.07-17.07", "24-26.07") — never a bare number — so it is a SAFE
+    fallback for a date the LLM extractor dropped right after a group-split proposal. A CHOICE
+    ("15 чи 16 липня") returns the earliest option as the check-in (check-out is derived later from
+    the remembered nights). Returns {"checkin", "checkout"?} (ISO) or None.
+    """
+    t = (text or "").lower()
+
+    # 1) day-range with a DOTTED month: "24-26.07(.26)" -> 24..26 of month 07. The first day must
+    #    NOT be the tail of an already-dotted date (so "13.07-17.07" is handled by the dotted rule,
+    #    not mis-read as "07-17.07").
+    m = re.search(r"(?<![\d.])(\d{1,2})\s*[-–—]\s*(\d{1,2})\.(\d{1,2})(?:\.\d{2,4})?", t)
+    if m:
+        ci = _safe_iso(int(m.group(1)), int(m.group(3)), year)
+        co = _safe_iso(int(m.group(2)), int(m.group(3)), year)
+        if ci:
+            out = {"checkin": ci}
+            if co and co > ci:
+                out["checkout"] = co
+            return out
+
+    # 2) dotted date, optional dotted range: "13.07-17.07" / "20.07" / "20.07.26".
+    dotted = re.findall(r"\b(\d{1,2})\.(\d{1,2})(?:\.\d{2,4})?", t)
+    if dotted:
+        ci = _safe_iso(int(dotted[0][0]), int(dotted[0][1]), year)
+        co = _safe_iso(int(dotted[1][0]), int(dotted[1][1]), year) if len(dotted) > 1 else None
+        if ci:
+            out = {"checkin": ci}
+            if co and co > ci:
+                out["checkout"] = co
+            return out
+
+    # 3) month-name based, two days joined by a connector: range ("13-17"/"з 13 по 17") sets a
+    #    check-out; a CHOICE ("15 чи 16") gives only the earliest check-in.
+    m = re.search(r"(\d{1,2})" + _ORD + r"\s*(?:[-–—]|по|чи|або|/|,)\s*(\d{1,2})" + _ORD
+                  + r"\s+([а-яіїєґ']+)", t)
+    if m and _month_from_word(m.group(3)) is not None:
+        mon = _month_from_word(m.group(3))
+        d1, d2, sep = int(m.group(1)), int(m.group(2)), m.group(0)
+        ci = _safe_iso(d1, mon, year)
+        if ci:
+            out = {"checkin": ci}
+            if (("-" in sep) or ("–" in sep) or ("—" in sep) or ("по" in sep)) and d2 > d1:
+                co = _safe_iso(d2, mon, year)
+                if co:
+                    out["checkout"] = co
+            return out
+
+    # 4) a single "<day> <month>" ("15 липня", "з 20 серпня").
+    m = re.search(r"(\d{1,2})" + _ORD + r"\s+([а-яіїєґ']+)", t)
+    if m and _month_from_word(m.group(2)) is not None:
+        ci = _safe_iso(int(m.group(1)), _month_from_word(m.group(2)), year)
+        if ci:
+            return {"checkin": ci}
+    return None
+
+
+# "N номери для M дорослих" — N rooms for M adults TOTAL. The extractor sometimes reads M as a
+# PER-ROOM count and puts M adults in EACH of the N rooms (N*M total), which then triggers a bogus
+# over-capacity split ("2 номери для 4-х" -> 8 adults -> "split into 3 rooms"). Distribute deterministically.
+_ROOMS_FOR_COUNT_RE = re.compile(
+    r"(\d+)\s*(?:номер\w*|кімнат\w*)\s+(?:для|на)\s+(\d+)[\s\-–]*(?:х|ти|ьох|ох|и)?\s*"
+    r"(?:дорослих|дорослі|осіб|особ|гостей|людей|чол)", re.IGNORECASE)
+
+
+def normalize_rooms_for_total(rooms, text):
+    """When the client says "N номери для M дорослих" (M adults TOTAL across N rooms) but the
+    extractor put M adults in EACH of the N rooms, redistribute the M adults evenly across N rooms.
+    Fires ONLY for a pure-adult request (no children) with an explicit "N rooms for M people" phrase,
+    so a real per-room breakdown is never touched."""
+    m = _ROOMS_FOR_COUNT_RE.search(text or "")
+    if not m:
+        return rooms
+    n_rooms, total = int(m.group(1)), int(m.group(2))
+    rooms = [r for r in (rooms or []) if isinstance(r, dict)]
+    if not (1 < n_rooms <= 8) or total < n_rooms:
+        return rooms                        # need 2+ rooms and at least one adult per room
+    if any(r.get("children_ages") or r.get("children_count") for r in rooms):
+        return rooms                        # families carry per-room composition -> leave it
+    if len(rooms) == n_rooms and sum((r.get("adults") or 0) for r in rooms) == total:
+        return rooms                        # already EXACTLY N rooms summing to M -> correct
+    base = rooms[0] if rooms else {}
+    shared = {k: base.get(k) for k in ("checkin", "checkout", "nights", "fuzzy_date", "ubd")}
+    per = [total // n_rooms + (1 if i < total % n_rooms else 0) for i in range(n_rooms)]
+    return [{**shared, "room_type": None, "adults": a, "children_count": 0, "children_ages": []}
+            for a in per]
+
+
+def collapse_duplicate_group_rooms(rooms):
+    """Collapse the LLM's date-CHOICE duplication of a single over-capacity party.
+
+    The extractor sometimes turns "З 15 чи 16 липня" (a flexible START date for ONE group) into
+    SEVERAL room objects that each carry the WHOLE party (e.g. 6 adults + 4 children in room A dated
+    the 15th AND again in room B dated the 16th). That doubles the guest count (10 -> 20) and falsely
+    trips the 20+ large-group redirect. When every emitted room has the IDENTICAL guest composition,
+    that composition already OVERFLOWS one room (>=6 people, physically impossible per room), and the
+    rooms differ only by DATE (a choice, not a real per-room split), collapse them to ONE group room
+    (earliest check-in; check-out re-derived from the nights) so the 6+ split path handles it. A real
+    multi-room booking (distinct compositions, or identical rooms sharing the SAME dates) is untouched.
+    """
+    rooms = [r for r in (rooms or []) if isinstance(r, dict)]
+    if len(rooms) < 2:
+        return rooms
+
+    def comp(r):
+        return ((r.get("adults") or 0), tuple(sorted(a for a in (r.get("children_ages") or []) if a is not None)))
+
+    def size(r):
+        cc = r.get("children_count")
+        return (r.get("adults") or 0) + (cc if cc is not None else len(r.get("children_ages") or []))
+
+    def datesig(r):
+        return (r.get("checkin"), r.get("checkout"), r.get("fuzzy_date"), r.get("nights"))
+
+    if not all(comp(r) == comp(rooms[0]) for r in rooms) or size(rooms[0]) < 6:
+        return rooms                       # not a single over-capacity party -> real multi-room ask
+    if len({datesig(r) for r in rooms}) < 2:
+        return rooms                       # identical over-capacity rooms on the SAME dates -> leave it
+
+    merged = dict(rooms[0])
+    merged.pop("checkout", None)           # re-derive the check-out from the earliest check-in + nights
+    for r in rooms[1:]:
+        for k in ("nights", "fuzzy_date", "room_type", "ubd"):
+            if not merged.get(k) and r.get(k):
+                merged[k] = r[k]
+    checkins = sorted(r.get("checkin") for r in rooms if r.get("checkin"))
+    if checkins:
+        merged["checkin"] = checkins[0]    # a date CHOICE -> take the earliest offered start
+    return [merged]
+
+
+# Persona 25 (Sprint 4): bed-configuration question — twin/separate beds vs one double bed.
+_BED_CONFIG_MARKERS = [
+    "роздільн", "окремі ліжк", "окремими ліжк", "два ліжк", "дві ліжк", "двоспальн",
+    "односпальн", "одне ліжко", "одним ліжком", "тип ліжк",
+    "які ліжк", "яке ліжко", "конфігурац ліжк", "ліжка окремо",
+]
+
+# Owner-CONFIRMED (2026-07-11) authoritative bed configuration per OtelMS internal sub-type. NOT
+# shown verbatim to clients (rule 6 — no sub-type leak); templates.BED_CONFIG describes these by
+# CONFIGURATION only. Kept here as the knowledge-base source of truth for future per-type matching.
+BED_CONFIG_MAP = {
+    "Стандарт сімейний В+Д": "велике двоспальне ліжко + диван",
+    "Стандарт + Сімейний В+Д": "велике двоспальне ліжко + диван",
+    "Стандарт 4х 2Л + Д": "2 роздільні односпальні ліжка + диван",
+    "Напівлюкс": "двоспальне + односпальне ліжко + диван",
+    # every OTHER Стандарт / Стандарт + sub-type:
+    "_default": "3 односпальні ліжка",
+}
+
+
+def is_bed_config_question(text: str) -> bool:
+    """True for a question about the BED configuration (twin/separate beds vs one double bed)."""
+    t = (text or "").lower()
+    return any(m in t for m in _BED_CONFIG_MARKERS)
+
+
+# Owner-CONFIRMED (2026-07-11): the hotel has NO air conditioners in ANY room -> AIR_CONDITIONING.
+_AC_MARKERS = ["кондиціон", "кондіціон", "кондицион", "клімат-контрол", "клімат контрол"]
+
+
+def is_ac_question(text: str) -> bool:
+    """True for a question about air conditioning (owner: there are NO air conditioners)."""
+    t = (text or "").lower()
+    return any(m in t for m in _AC_MARKERS)
+
+
+# Owner-CONFIRMED (2026-07-11): fridge/balcony questions are answered STRICTLY from the per-type
+# GENERAL_INFORMATION template (Стандарт: none; Стандарт+: balcony + fridge; Напівлюкс: fridge).
+_ROOM_AMENITY_MARKERS = ["холодильник", "холодильн", "балкон", "мінібар", "міні-бар", "міні бар"]
+
+
+def is_room_amenity_question(text: str) -> bool:
+    """True for a fridge / balcony / mini-bar question -> the per-room-type GENERAL_INFORMATION list.
+    Excludes a smoking-on-the-balcony question (that is SMOKING, not an amenity list)."""
+    t = (text or "").lower()
+    if any(s in t for s in ("курит", "палит", "курін", "палін")):
+        return False
+    return any(m in t for m in _ROOM_AMENITY_MARKERS)
+
+
+# Persona 27 (Sprint 4): the client asks for a COTTAGE, which the hotel does not have (owner Q10f:
+# "у нас готель") — answer honestly and pivot to rooms.
+def is_cottage_question(text: str) -> bool:
+    """True when the client asks about a cottage / separate house (we have none — offer rooms)."""
+    t = (text or "").lower()
+    return "котедж" in t or "котеж" in t or "будинок" in t or "будиночок" in t
+
+
 def is_split_offer_message(text: str) -> bool:
     """True if the bot's previous message PROPOSED a room split — so a bare 'Так, порахуйте'
     means: accept that distribution and quote it (owner #15/#21, 2026-07-10)."""
@@ -551,6 +783,14 @@ def faq_override(text: str):
         return "FOOD_MENU"
     if "буковел" in t:                          # Persona 20: distance to Bukovel
         return "DISTANCE_BUKOVEL"
+    if is_ac_question(text):                    # owner 2026-07-11: NO air conditioners in any room
+        return "AIR_CONDITIONING"
+    if is_cottage_question(text):               # Persona 27: no cottage -> pivot to rooms
+        return "COTTAGE"
+    if is_bed_config_question(text):            # Persona 25: twin vs double beds
+        return "BED_CONFIG"
+    if is_room_amenity_question(text):          # owner 2026-07-11: fridge/balcony -> per-type list
+        return "GENERAL_INFORMATION"
     if is_pool_sit_question(text):              # Persona 17: same price if only sitting
         return "POOL_ENTRY_SAME_PRICE"
     if is_outside_food_question(text):          # Persona 17: no own food/drinks
@@ -641,9 +881,14 @@ def merge_room(remembered, fresh) -> Dict:
     rem = remembered or {}
     fresh_mentions_dates = bool(out.get("checkin") or out.get("checkout") or out.get("fuzzy_date"))
     if not fresh_mentions_dates:
-        for f in ("checkin", "checkout", "fuzzy_date", "nights"):
+        for f in ("checkin", "checkout", "fuzzy_date"):
             if not out.get(f) and rem.get(f):
                 out[f] = rem[f]
+    # `nights` is a STAY LENGTH, not a specific date, so it is inherited even when the fresh turn
+    # names a NEW check-in ("15 липня" after "дві доби") — that lets bot_server derive the check-out
+    # for the dated split re-proposal instead of going silent (owner Sprint-4 Test 21).
+    if not out.get("nights") and rem.get("nights"):
+        out["nights"] = rem["nights"]
     for f in ("room_type", "adults", "children_count", "children_ages"):
         if not out.get(f) and rem.get(f):
             out[f] = rem[f]
