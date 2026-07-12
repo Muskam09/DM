@@ -1,0 +1,107 @@
+# docker-compose-coolify.yaml — Coolify/production variant of scraper/docker-compose.yaml.
+#
+# Differences vs the local dev compose:
+#   * NO host port bindings (no "127.0.0.1:XXXX:XXXX"). Coolify's reverse proxy (Traefik) handles
+#     ingress to the web service; the databases are NEVER published to the host. Ports are only
+#     `expose`d on the internal network so the containers reach each other by service name.
+#   * All services share ONE explicit bridge network (`dt-net`) so DNS works: bot-brain -> rails:3000,
+#     rails/sidekiq -> postgres:5432 / redis:6379, and Chatwoot webhooks -> http://bot-brain:8000/webhook.
+#   * bot-brain builds from ./scraper AND now reads `env_file: .env`. On Coolify the repo is cloned
+#     WITHOUT .env (it is gitignored), so secrets come from Coolify's env-var UI (materialised into
+#     the `.env` next to this file), not from a .env baked into the image.
+#
+# Set ALL required variables in the Coolify "Environment Variables" UI (same values as scraper/.env):
+#   GEMINI_API_KEY, CHATWOOT_TOKEN, CHATWOOT_ACCOUNT_ID, OTELMS_HMS_ID, OTELMS_LOGIN, OTELMS_PASSWORD,
+#   REDIS_PASSWORD, POSTGRES_PASSWORD, and every Chatwoot var (SECRET_KEY_BASE, FRONTEND_URL,
+#   POSTGRES_HOST=postgres, POSTGRES_USERNAME=postgres, POSTGRES_DATABASE=chatwoot,
+#   REDIS_URL=redis://:$REDIS_PASSWORD@redis:6379, RAILS_ENV=production, …).
+
+services:
+  base: &base
+    image: chatwoot/chatwoot:latest
+    env_file: .env
+    volumes:
+      - storage_data:/app/storage
+    networks:
+      - dt-net
+
+  rails:
+    <<: *base
+    depends_on:
+      - postgres
+      - redis
+    # No host binding — Coolify's proxy routes the assigned domain to this port on dt-net.
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=production
+      - RAILS_ENV=production
+      - INSTALLATION_ENV=docker
+    entrypoint: docker/entrypoints/rails.sh
+    command: ['bundle', 'exec', 'rails', 's', '-p', '3000', '-b', '0.0.0.0']
+    restart: always
+
+  sidekiq:
+    <<: *base
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - NODE_ENV=production
+      - RAILS_ENV=production
+      - INSTALLATION_ENV=docker
+    command: ['bundle', 'exec', 'sidekiq', '-C', 'config/sidekiq.yml']
+    restart: always
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: always
+    # Internal only — the DB is NEVER published to the host.
+    expose:
+      - "5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=chatwoot
+      - POSTGRES_USER=postgres
+      # Must match POSTGRES_PASSWORD that rails/sidekiq use (set it in Coolify's env UI).
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-6C569d7f3Z5Uu!UJvBWqWo3yeVk9Va8dY}
+    networks:
+      - dt-net
+
+  redis:
+    image: redis:alpine
+    restart: always
+    command: ["sh", "-c", "redis-server --requirepass \"$REDIS_PASSWORD\""]
+    env_file: .env
+    # Internal only — Redis is NEVER published to the host.
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - dt-net
+
+  bot-brain:
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    restart: always
+    # On Coolify the image has NO baked .env -> secrets come from here (Coolify env UI -> .env).
+    env_file: .env
+    # Internal only — rails sends webhooks to http://bot-brain:8000/webhook on dt-net.
+    expose:
+      - "8000"
+    depends_on:
+      - rails
+    networks:
+      - dt-net
+
+networks:
+  dt-net:
+    driver: bridge
+
+volumes:
+  storage_data:
+  postgres_data:
+  redis_data:
