@@ -718,3 +718,30 @@ flagged the conversation. Used to prevent any bot output once a human takes over
 - Persona 2 (Bug 3, food): #340 (GREEN — food 10200 / quote 16320, no ROOM_TOO_SMALL leak).
 - Persona 21 regression (date-after-split): #341 (GREEN).
 - Persona 23 regression (two families aggregate): #342 (GREEN).
+
+## 16. Deployment & project phase (2026-07-13)
+
+**Sprint 5 is COMPLETE, tested, and MERGED into `main`** (fast-forward to `38b92c2`, pushed to
+`origin/main`). Everything is finalized on `main`: the `Позначено`/`Замовлено` label KILL-SWITCH
+(§15.1), the three Sprint-5 bug fixes (§15.2 — beds→real availability, no-"booked"-without-committed-
+dates, 2-rooms flip-flop), the owner AC/amenity rules, and the strict-TDD / mandatory-exact-conv-ID
+reporting rule (§14). 486 unit tests green.
+
+### 16.1 Coolify production deployment
+The project is being deployed to a production VM via **Coolify** using `docker-compose-coolify.yaml`
+(repo root). Key traits: NO host port bindings (Coolify/Traefik fronts `rails:3000`), databases are
+internal-only (`expose`), all five services share one `dt-net` bridge, and `bot-brain` builds from
+`./scraper` and reads `env_file: .env`. On Coolify the repo is cloned WITHOUT `.env` (gitignored), so
+ALL secrets are supplied through Coolify's Environment-Variables UI, not a baked-in `.env`.
+
+Fresh-DB init: run `bundle exec rails db:chatwoot_prepare` inside the `rails` container via Coolify's
+Terminal, then restart `rails`/`sidekiq` (idempotent; safe to re-run).
+
+### 16.2 Current phase — "Test-Drive / Beta"
+In flight: initializing the production DB and waiting to apply the PRODUCTION `CHATWOOT_TOKEN`
+(+ `CHATWOOT_ACCOUNT_ID`) in Coolify, then redeploy `bot-brain`. Also set a FRESH `POSTGRES_PASSWORD`
+(the compose still carries the old committed value as a `${POSTGRES_PASSWORD:-…}` fallback).
+
+**Future work = monitoring the real-world test-drive and infrastructure tweaks, NOT core logic
+changes.** The deterministic engine (pricing / dialogue / bot_logic) is treated as STABLE; touch it
+only on a confirmed live bug, and only with a failing test written first (strict TDD).
