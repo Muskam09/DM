@@ -205,17 +205,17 @@ def build_quote_reply(priced_rooms: List[Dict], ubd_booking: bool = False) -> st
     return reply
 
 
-# --- planning (slots -> decision) ------------------------------------------
+# --- planning (slots -> decision) ----------------Міжсезоння--------------------------
 
 OFFERABLE_ROOMS = ["Стандарт", "Стандарт +", "Напівлюкс"]
 _ROOM_EMOJI = {"Стандарт": "🏔", "Стандарт +": "🌿", "Напівлюкс": "✨"}
-_OFFSEASON_WORDS = ["січ", "лют", "берез", "квіт", "трав", "верес", "жовт", "листопад", "груд"]
+_OFFSEASON_WORDS = ["січ", "лют", "берез", "квіт", "трав", "листопад", "груд"]
 
 # Default scan year for fuzzy periods (bookings are 2026; only summer is priced).
 _FUZZY_YEAR = 2026
 # Longest stems first so "серпн" wins before "серп", etc.
 _PRICED_MONTH_STEMS = [("червн", 6), ("черв", 6), ("липн", 7), ("лип", 7),
-                       ("серпн", 8), ("серп", 8)]
+                       ("серпн", 8), ("серп", 8), ("вересн", 9), ("верес", 9), ("жовтн", 10), ("жовт", 10)]
 
 
 def _fuzzy_month(text: str) -> Optional[int]:
