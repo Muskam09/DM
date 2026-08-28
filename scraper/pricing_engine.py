@@ -68,7 +68,7 @@ CHILD_PLACE_KEY = "дитяче_місце"
 EXTRA_PLACE_KEY = "додаткове_місце"
 
 # Only the summer months are priced today; everything else is off-season.
-PRICED_MONTHS = frozenset({6, 7, 8})
+PRICED_MONTHS = frozenset({6, 7, 8, 9, 10})  # June–October
 
 # A single booking may span at most this many rooms (multi-room calculation).
 MAX_ROOMS_PER_BOOKING = 8
