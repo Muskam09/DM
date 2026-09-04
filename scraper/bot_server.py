@@ -907,6 +907,15 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
     if event == "message_created" and mtype in ("incoming", 0):
         if payload.get("private"):
             return {"status": "ok"}                    # ignore private agent notes
+        # --- ПОЧАТОК НОВОГО КОДУ ---
+        message_content = payload.get("content") or ""
+        content_attributes = payload.get("content_attributes") or {}
+
+        # Ігноруємо технічні повідомлення від Instagram (переслані рекламні пости)
+        if message_content.strip() == "Shared post" or content_attributes.get("image_type") == "ig_post":
+            print("[i] Ігноруємо пересланий Instagram-пост, чекаємо на текст")
+            return {"status": "ignored"}
+        # --- КІНЕЦЬ НОВОГО КОДУ ---
         content = payload.get("content")
         conv = payload.get("conversation") or {}
         conversation_id = conv.get("id") or payload.get("conversation_id")
@@ -923,5 +932,3 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
         print(f"[i] webhook ignored message_created: message_type={mtype!r}")
 
     return {"status": "ok"}
-
-# Запусти код я не тестив ще)
