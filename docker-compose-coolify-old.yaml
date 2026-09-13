@@ -1,11 +1,32 @@
+# docker-compose-coolify.yaml — Coolify/production variant of scraper/docker-compose.yaml.
+#
+# Differences vs the local dev compose:
+#   * NO host port bindings (no "127.0.0.1:XXXX:XXXX"). Coolify's reverse proxy (Traefik) handles
+#     ingress to the web service; the databases are NEVER published to the host. Ports are only
+#     `expose`d on the internal network so the containers reach each other by service name.
+#   * All services share ONE explicit bridge network (`dt-net`) so DNS works: bot-brain -> rails:3000,
+#     rails/sidekiq -> postgres:5432 / redis:6379, and Chatwoot webhooks -> http://bot-brain:8000/webhook.
+#   * bot-brain builds from ./scraper AND now reads `env_file: .env`. On Coolify the repo is cloned
+#     WITHOUT .env (it is gitignored), so secrets come from Coolify's env-var UI (materialised into
+#     the `.env` next to this file), not from a .env baked into the image.
+#
+# Set ALL required variables in the Coolify "Environment Variables" UI (same values as scraper/.env):
+#   GEMINI_API_KEY, CHATWOOT_TOKEN, CHATWOOT_ACCOUNT_ID, OTELMS_HMS_ID, OTELMS_LOGIN, OTELMS_PASSWORD,
+#   REDIS_PASSWORD, POSTGRES_PASSWORD, and every Chatwoot var (SECRET_KEY_BASE, FRONTEND_URL,
+#   POSTGRES_HOST=postgres, POSTGRES_USERNAME=postgres, POSTGRES_DATABASE=chatwoot,
+#   REDIS_URL=redis://:$REDIS_PASSWORD@redis:6379, RAILS_ENV=production, …).
+
 services:
-  rails:
+  base: &base
     image: chatwoot/chatwoot:latest
     env_file: .env
     volumes:
       - storage_data:/app/storage
     networks:
       - dt-net
+
+  rails:
+    <<: *base
     depends_on:
       - postgres
       - redis
@@ -21,12 +42,7 @@ services:
     restart: always
 
   sidekiq:
-    image: chatwoot/chatwoot:latest
-    env_file: .env
-    volumes:
-      - storage_data:/app/storage
-    networks:
-      - dt-net
+    <<: *base
     depends_on:
       - postgres
       - redis
