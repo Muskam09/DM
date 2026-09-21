@@ -79,6 +79,9 @@ BOOKING_COM = """Доброго дня! 🙏 Щодо бронювань та п
 # Persona 20: відстань до Буковелю.
 DISTANCE_BUKOVEL = """Ми знаходимось орієнтовно за 35 км від Буковелю. 🏔"""
 
+DISTANCE_GOVERLA = """Ми знаходимось орієнтовно за 10 км від Говерли. 🏔"""
+
+
 # Persona 25 (Sprint 4): питання про конфігурацію ліжок. Owner-CONFIRMED (2026-07-11) bed mapping
 # per internal sub-type -> described here by CONFIGURATION (twin/double/single), WITHOUT leaking the
 # internal sub-type names (rule 6). See bot_logic.BED_CONFIG_MAP for the authoritative sub-type table.

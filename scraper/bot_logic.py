@@ -898,6 +898,8 @@ def faq_override(text: str):
         return "FOOD_MENU"
     if "буковел" in t:                          # Persona 20: distance to Bukovel
         return "DISTANCE_BUKOVEL"
+    if "говерл" in t:                 # Persona 20: distance to Hoverla
+        return "DISTANCE_GOVERLA"
     if is_ac_question(text):                    # owner 2026-07-11: NO air conditioners in any room
         return "AIR_CONDITIONING"
     if is_cottage_question(text):               # Persona 27: no cottage -> pivot to rooms
