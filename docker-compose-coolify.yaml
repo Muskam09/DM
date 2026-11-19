@@ -1,14 +1,49 @@
+# docker-compose-coolify.yaml — Coolify/production variant.
+#
+# Changes vs previous revision (hotfix 2026-11-19 — db/volume recovery):
+#   1. Volumes are now declared `external: true` with EXPLICIT, HARDCODED names that match
+#      the real production volumes already present on the server. This stops Coolify from
+#      ever auto-creating fresh empty volumes on redeploy regardless of what project
+#      prefix it picks:
+#         pfdrdlpya9cdo6hce9x4jctz_postgres-data   <- live chatwoot_production DB
+#         pfdrdlpya9cdo6hce9x4jctz_storage-data    <- Rails /app/storage (uploads, attachments)
+#         pfdrdlpya9cdo6hce9x4jctz_redis-data      <- Redis AOF/RDB
+#      If this stack ever moves to a new Coolify project UUID, update the three `name:`
+#      fields below and leave `external: true`.
+#
+#   2. The `rails` container now runs `db:chatwoot_prepare` AS PART OF its long-running
+#      command, right before `rails s`. `db:chatwoot_prepare` is idempotent (creates the
+#      DB if missing, otherwise applies any pending migrations, no-ops when up to date),
+#      so every redeploy auto-syncs the schema. If migrations fail, the container exits
+#      non-zero and Coolify restarts it (restart: always) — surfacing the error instead
+#      of silently drifting. No one-shot / sidecar container (which Coolify flips to
+#      Degraded/Stopped on exit 0).
+#
+#   3. `postgres` and `rails` now have healthchecks; `rails`, `sidekiq` and `bot-brain`
+#      wait for the dependency to be `service_healthy`, not merely `service_started`.
+#      This eliminates the race where Sidekiq boots against a half-migrated DB (which
+#      was producing `column calls.ring_state does not exist` and
+#      `relation "conversation_monitor_automation_deliveries" does not exist` in prod).
+#
+# Required Coolify env (unchanged):
+#   GEMINI_API_KEY, CHATWOOT_TOKEN, CHATWOOT_ACCOUNT_ID, OTELMS_HMS_ID, OTELMS_LOGIN,
+#   OTELMS_PASSWORD, REDIS_PASSWORD, POSTGRES_PASSWORD, SECRET_KEY_BASE, FRONTEND_URL,
+#   POSTGRES_HOST=postgres, POSTGRES_USERNAME=postgres, POSTGRES_DATABASE=chatwoot_production,
+#   REDIS_URL=redis://:$REDIS_PASSWORD@redis:6379, RAILS_ENV=production, NODE_ENV=production.
+
 services:
   rails:
     image: chatwoot/chatwoot:latest
     env_file: .env
     volumes:
-      - storage_data:/app/storage
+      - storage-data:/app/storage
     networks:
       - dt-net
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     # No host binding — Coolify's proxy routes the assigned domain to this port on dt-net.
     expose:
       - "3000"
@@ -17,19 +52,46 @@ services:
       - RAILS_ENV=production
       - INSTALLATION_ENV=docker
     entrypoint: docker/entrypoints/rails.sh
-    command: ['bundle', 'exec', 'rails', 's', '-p', '3000', '-b', '0.0.0.0']
+    # IMPORTANT: db:chatwoot_prepare runs in-process before the server starts. This is
+    # the Chatwoot-documented idempotent way to bootstrap/migrate. If it fails the
+    # container exits non-zero -> Coolify restarts -> error is visible in logs.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        echo "[rails] running db:chatwoot_prepare (idempotent create/migrate)..."
+        bundle exec rails db:chatwoot_prepare
+        echo "[rails] starting server..."
+        exec bundle exec rails s -p 3000 -b 0.0.0.0
+    healthcheck:
+      # --spider makes wget exit 0 on ANY HTTP response (200/302/401/...), i.e. "Rails is
+      # answering". It fails only on connection refused / timeout -> exactly the signal
+      # we want to gate Sidekiq on.
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:3000/api || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
     restart: always
 
   sidekiq:
     image: chatwoot/chatwoot:latest
     env_file: .env
     volumes:
-      - storage_data:/app/storage
+      - storage-data:/app/storage
     networks:
       - dt-net
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rails:
+        # Wait until Rails is healthy -> migrations are guaranteed to have completed.
+        # This fixes the "relation does not exist" / "column does not exist" errors
+        # that appeared when Sidekiq raced ahead of the migration on previous deploys.
+        condition: service_healthy
     environment:
       - NODE_ENV=production
       - RAILS_ENV=production
@@ -44,7 +106,7 @@ services:
     expose:
       - "5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
     environment:
       - POSTGRES_DB=chatwoot
       - POSTGRES_USER=postgres
@@ -52,6 +114,12 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-6C569d7f3Z5Uu!UJvBWqWo3yeVk9Va8dY}
     networks:
       - dt-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chatwoot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   redis:
     image: redis:alpine
@@ -62,7 +130,7 @@ services:
     expose:
       - "6379"
     volumes:
-      - redis_data:/data
+      - redis-data:/data
     networks:
       - dt-net
 
@@ -77,7 +145,8 @@ services:
     expose:
       - "8000"
     depends_on:
-      - rails
+      rails:
+        condition: service_healthy
     networks:
       - dt-net
 
@@ -85,7 +154,19 @@ networks:
   dt-net:
     driver: bridge
 
+# -------------------------------------------------------------------------------------
+# VOLUMES — pinned by explicit `name:` + `external: true`.
+# These three volumes already exist on the production host (lsblk/docker volume ls
+# confirmed). Compose will ATTACH to them, NOT create new ones. If Coolify renames the
+# project the volumes stay put.
+# -------------------------------------------------------------------------------------
 volumes:
-  storage_data:
-  postgres_data:
-  redis_data:
+  postgres-data:
+    external: true
+    name: pfdrdlpya9cdo6hce9x4jctz_postgres-data
+  storage-data:
+    external: true
+    name: pfdrdlpya9cdo6hce9x4jctz_storage-data
+  redis-data:
+    external: true
+    name: pfdrdlpya9cdo6hce9x4jctz_redis-data
