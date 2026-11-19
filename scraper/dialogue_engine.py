@@ -32,12 +32,16 @@ _GEN_MONTHS = {
     7: "липня", 8: "серпня", 9: "вересня", 10: "жовтня", 11: "листопада", 12: "грудня",
 }
 _MONTH_TEMPLATE = {
-    6: templates.PRICE_JUNE,
-    7: templates.PRICE_JULY,
-    8: templates.PRICE_AUGUST,
-    9: templates.PRICE_SEPTEMBER,
+    6:  templates.PRICE_JUNE,
+    7:  templates.PRICE_JULY,
+    8:  templates.PRICE_AUGUST,
+    9:  templates.PRICE_SEPTEMBER,
     10: templates.PRICE_OCTOBER,
-    11: templates.PRICE_NOVEMBER}
+    11: templates.PRICE_NOVEMBER,
+    12: templates.PRICE_DECEMBER,
+    1:  templates.PRICE_JANUARY,
+    2:  templates.PRICE_FEBRUARY}
+
 
 
 # --- slot parsing ----------------------------------------------------------
