@@ -210,13 +210,22 @@ def build_quote_reply(priced_rooms: List[Dict], ubd_booking: bool = False) -> st
 
 OFFERABLE_ROOMS = ["Стандарт", "Стандарт +", "Напівлюкс"]
 _ROOM_EMOJI = {"Стандарт": "🏔", "Стандарт +": "🌿", "Напівлюкс": "✨"}
-_OFFSEASON_WORDS = ["січ", "лют", "берез", "квіт", "трав", "груд"]
+# Owner update 2026-11: січень/лютий/грудень are now PRICED, so they must NOT appear
+# in the off-season word-list (only March–May remain off-season for fuzzy intent).
+_OFFSEASON_WORDS = ["берез", "квіт", "трав"]
 
-# Default scan year for fuzzy periods (bookings are 2026; only summer is priced).
-_FUZZY_YEAR = 2026
+# Default scan year for fuzzy periods. Owner update 2026-11: the bot now books
+# year-round, so the default year follows the calendar via `bot_logic.resolve_booking_year`
+# and is picked PER-MONTH (a named month that already passed this year rolls to the next).
+# Tests that need a frozen "today" pass `year=` explicitly.
+_FUZZY_YEAR_FALLBACK = 2026  # back-compat only — never read when `year` is resolved per month
 # Longest stems first so "серпн" wins before "серп", etc.
-_PRICED_MONTH_STEMS = [("червн", 6), ("черв", 6), ("липн", 7), ("лип", 7),
-                       ("серпн", 8), ("серп", 8), ("вересн", 9), ("верес", 9), ("жовтн", 10), ("жовт", 10), ("листопад", 11), ("листоп", 11)]
+# Owner update 2026-11: Jan/Feb/Dec joined the priced season.
+_PRICED_MONTH_STEMS = [("січн", 1), ("січ", 1), ("лютог", 2), ("лют", 2),
+                       ("червн", 6), ("черв", 6), ("липн", 7), ("лип", 7),
+                       ("серпн", 8), ("серп", 8), ("вересн", 9), ("верес", 9),
+                       ("жовтн", 10), ("жовт", 10), ("листопад", 11), ("листоп", 11),
+                       ("грудн", 12), ("груд", 12)]
 
 
 def _fuzzy_month(text: str) -> Optional[int]:
@@ -232,6 +241,13 @@ def _fuzzy_month(text: str) -> Optional[int]:
         if mon in pricing_engine.PRICED_MONTHS:
             return mon
     return None
+
+
+def _fuzzy_explicit_year(text: str) -> Optional[int]:
+    """If the fuzzy text already carries an explicit year ("2026-08", "07.2027"),
+    honour it verbatim (do NOT roll forward). Returns None when no year is present."""
+    m = re.search(r"(20\d\d)[-/.]\d{1,2}", text) or re.search(r"\d{1,2}[./](20\d\d)", text)
+    return int(m.group(1)) if m else None
 
 
 # A compound fuzzy period can name several months/parts joined by a connector
@@ -268,25 +284,38 @@ def _single_period_range(t: str, year: int):
             date(year, month, end_day).isoformat())
 
 
-def fuzzy_period_ranges(fuzzy: str, year: int = _FUZZY_YEAR):
+def fuzzy_period_ranges(fuzzy: str, year: "int | None" = None, today=None):
     """ALL inclusive ('YYYY-MM-DD', 'YYYY-MM-DD') windows named in a fuzzy period, so a
     compound period naming several months/parts is fully scanned ("друга половина липня
     або після 6 серпня" -> [(2026-07-16, 2026-07-31), (2026-08-06, 2026-08-31)]). Returns
-    [] when no priced month can be identified (scan left unconstrained)."""
+    [] when no priced month can be identified (scan left unconstrained).
+
+    Year selection (owner update 2026-11): when `year` is omitted the year is picked
+    PER SEGMENT by the named month (so "в серпні" on 2027-10-01 resolves to
+    2028-08). Tests freeze "today" with the `today=` keyword."""
     t = (fuzzy or "").lower()
     segments = [s.strip() for s in _PERIOD_SPLIT_RE.split(t) if s and s.strip()] or [t]
     ranges = []
     for seg in segments:
-        r = _single_period_range(seg, year)
+        if year is not None:
+            y = year
+        else:
+            explicit = _fuzzy_explicit_year(seg)
+            if explicit is not None:
+                y = explicit
+            else:
+                mon = _fuzzy_month(seg)
+                y = bot_logic.resolve_booking_year(mon, today) if mon else _FUZZY_YEAR_FALLBACK
+        r = _single_period_range(seg, y)
         if r and r not in ranges:
             ranges.append(r)
     return ranges
 
 
-def fuzzy_period_range(fuzzy: str, year: int = _FUZZY_YEAR):
+def fuzzy_period_range(fuzzy: str, year: "int | None" = None, today=None):
     """The FIRST inclusive window named in a fuzzy period (back-compat single-range view).
     Prefer `fuzzy_period_ranges` for compound periods. Returns None when no priced month."""
-    ranges = fuzzy_period_ranges(fuzzy, year)
+    ranges = fuzzy_period_ranges(fuzzy, year, today=today)
     return ranges[0] if ranges else None
 
 
@@ -408,6 +437,61 @@ def has_off_season_dates(slots: Dict) -> bool:
                 r["checkin"], r["checkout"]):
             return True
     return False
+
+
+# --- New Year package detector (owner 2026-11) -----------------------------
+# The hotel sells a FIXED New Year package for the window 29.12 — 03.01 (minimum
+# 3 nights, flat per-person price, meals included). Whenever a booking stay
+# intersects that window, the bot must send `templates.NEW_YEAR_PACKAGE` instead
+# of running the normal quote pipeline — regardless of guest counts.
+#
+# "Intersection" means ANY paid night of the stay falls on a day where you sleep
+# between 29 Dec and 3 Jan inclusive — i.e. one of these local-date boundaries:
+#     * check-in day ∈ {29, 30, 31 Dec, 1, 2, 3 Jan}
+#     * OR a night whose check-in day is 29–31 Dec / 1–3 Jan
+# A fuzzy_date mentioning "новий рік", "НР", "новорічн" also counts.
+
+def _is_new_year_day(iso_date: str) -> bool:
+    """A date you SLEEP on that falls inside the NY package window (29 Dec – 3 Jan)."""
+    try:
+        d = pricing_engine._as_date(iso_date)
+    except (ValueError, TypeError):
+        return False
+    return (d.month == 12 and d.day >= 29) or (d.month == 1 and d.day <= 3)
+
+
+# Keywords in a fuzzy date that unambiguously name the New Year holiday — the
+# extractor may return these without exact ISO dates ("на новий рік", "НР").
+_NEW_YEAR_FUZZY_RE = re.compile(
+    r"нов(?:ий|ого|им|орічн)|\bнр\b|\bн\.р\.", re.IGNORECASE)
+
+
+def _room_intersects_new_year(room: Dict) -> bool:
+    """True iff the room's stay touches the NY package window (see module doc above)."""
+    if not isinstance(room, dict):
+        return False
+    fuzzy = room.get("fuzzy_date")
+    if isinstance(fuzzy, str) and _NEW_YEAR_FUZZY_RE.search(fuzzy):
+        return True
+    ci, co = room.get("checkin"), room.get("checkout")
+    # Exact-date stay: walk every night and test it.
+    if ci and co:
+        try:
+            for night_iso in pricing_engine.night_dates(ci, co):
+                if _is_new_year_day(night_iso):
+                    return True
+        except (ValueError, TypeError):
+            return False
+        return False
+    # Only check-in known: the night slept on that day decides.
+    if ci:
+        return _is_new_year_day(ci)
+    return False
+
+
+def has_new_year_stay(slots: Dict) -> bool:
+    """True iff ANY room in the slots has a stay/date that triggers the NY package."""
+    return any(_room_intersects_new_year(r) for r in (slots.get("rooms") or []))
 
 
 def _nights(room: Dict) -> Optional[int]:
@@ -622,8 +706,21 @@ def offered_window(decision: Dict, availability: Dict):
 
 
 def plan(slots: Dict) -> Dict:
-    """Slots -> decision. action in {reply, quote, quote_all, explore, nearest}."""
+    """Slots -> decision. action in {reply, quote, quote_all, explore, nearest, new_year}.
+
+    New Year short-circuit (owner 2026-11): a stay touching 29 Dec — 3 Jan is sold as
+    a fixed PACKAGE (see `templates.NEW_YEAR_PACKAGE`). Checked BEFORE off-season so a
+    client naming "на новий рік" (fuzzy, which has no priced month) still gets the
+    package instead of OFF_SEASON, and BEFORE the normal quote pipeline so we never
+    run a per-night quote for those dates. FAQ turns are handled by bot_server.py
+    (it only reroutes INCLUDED_IN_THE_PRICE through the normal FAQ path for NY
+    stays — everything else becomes MANAGER_HANDOFF there).
+    """
     rooms = slots.get("rooms") or []
+
+    # --- New Year package short-circuit ---
+    if has_new_year_stay(slots):
+        return {"action": "new_year", "reply": templates.NEW_YEAR_PACKAGE}
 
     # Off-season (exact OR a clearly-named fuzzy month that isn't priced).
     for r in rooms:

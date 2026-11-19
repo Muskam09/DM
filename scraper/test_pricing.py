@@ -225,9 +225,11 @@ def test_unknown_room_raises(engine):
 
 
 def test_month_without_price_table_raises(engine):
-    # Hotel only prices summer (June/July/August).
+    # Only March–May are off-season now (December + Jan + Feb got winter prices
+    # in the 2026-11 owner update, see pricing.json). A March stay must still
+    # raise OffSeasonError / KeyError.
     with pytest.raises(KeyError):
-        engine.price("Стандарт", "2026-12-20", "2026-12-21", make_guests(adults=2))
+        engine.price("Стандарт", "2026-03-20", "2026-03-21", make_guests(adults=2))
 
 
 def test_napivlyuks_capacity_extra_adults(engine):
@@ -281,21 +283,31 @@ def test_multi_room_rejects_over_8(engine):
         engine.quote_multiple([one] * 9)
 
 
-# --- Case 11: off-season (Sept–May) has no pricing -------------------------
+# --- Case 11: off-season (March–May) has no pricing ------------------------
+# Owner update 2026-11: winter (Dec+Jan+Feb) + full autumn + summer are priced.
+# Only March–May remain off-season.
 
 def test_off_season_raises_offseason_error(engine):
     from pricing_engine import OffSeasonError
+    # Квітень is squarely off-season.
     with pytest.raises(OffSeasonError):
-        engine.price("Стандарт", "2026-09-13", "2026-09-14", make_guests(adults=2))
+        engine.price("Стандарт", "2026-04-13", "2026-04-14", make_guests(adults=2))
 
 
 def test_is_priced_month_and_stay():
     from pricing_engine import is_priced_month, stay_is_priced
     assert is_priced_month("2026-07-06") is True
-    assert is_priced_month("2026-09-01") is False
+    assert is_priced_month("2026-09-01") is True   # autumn is now priced
+    assert is_priced_month("2026-12-15") is True   # winter is now priced
+    assert is_priced_month("2026-01-15") is True
+    assert is_priced_month("2026-02-15") is True
+    assert is_priced_month("2026-03-15") is False  # shoulder month: still off
+    assert is_priced_month("2026-05-15") is False
     assert stay_is_priced("2026-07-06", "2026-07-08") is True
-    # checkin Aug 31 -> night of Sep 1 is off-season:
-    assert stay_is_priced("2026-08-31", "2026-09-02") is False
+    # Night of Nov 30 (last night paid) is priced; Dec 1 is also priced now.
+    assert stay_is_priced("2026-11-30", "2026-12-02") is True
+    # But a Feb→March stay crosses into off-season on the night of March 1:
+    assert stay_is_priced("2026-02-28", "2026-03-02") is False
 
 
 # --- meals (харчування) — exact food math (owner 2026-07-10) ---------------
@@ -327,3 +339,321 @@ def test_meal_cost_zero_when_empty():
     data = json.load(open(os.path.join(os.path.dirname(__file__), "pricing.json"), encoding="utf-8"))
     q = meal_cost(data, "Липень", 3)
     assert q.total == 0 and q.lines == []
+
+
+# ===========================================================================
+# Winter season (owner update 2026-11)
+# ===========================================================================
+# Three December sub-periods + two January sub-periods + a flat February key.
+# The sub-period is picked PER NIGHT by `season_key_for_night` using the day
+# you sleep (the check-in day of that night), not the next morning.
+#
+#   22→23 Dec  = "Грудень 1-22"  (you sleep on the 22nd)
+#   23→24 Dec  = "Грудень 23-28"
+#   28→29 Dec  = "Грудень 23-28" (you sleep on the 28th — owner rule)
+#   29→30 Dec  = "Грудень 29-31"
+#   31 Dec→1 Jan = "Грудень 29-31"
+#   1 → 2 Jan  = "Січень 1-3"
+#   3 → 4 Jan  = "Січень 1-3"
+#   4 → 5 Jan  = "Січень 4-31"
+
+from pricing_engine import season_key_for_night, OffSeasonError
+import datetime as _dt
+
+
+@pytest.mark.parametrize("iso,expected", [
+    # December sub-periods
+    ("2026-12-01", "Грудень 1-22"),
+    ("2026-12-15", "Грудень 1-22"),
+    ("2026-12-22", "Грудень 1-22"),    # night 22→23 goes HERE per owner rule
+    ("2026-12-23", "Грудень 23-28"),   # night 23→24 goes HERE
+    ("2026-12-27", "Грудень 23-28"),
+    ("2026-12-28", "Грудень 23-28"),   # night 28→29 goes HERE per owner rule
+    ("2026-12-29", "Грудень 29-31"),   # New Year peak begins
+    ("2026-12-31", "Грудень 29-31"),   # night 31 Dec→1 Jan still peak
+    # January sub-periods
+    ("2027-01-01", "Січень 1-3"),
+    ("2027-01-03", "Січень 1-3"),      # night 3→4 Jan still peak (owner rule)
+    ("2027-01-04", "Січень 4-31"),     # night 4→5 Jan — low winter rate
+    ("2027-01-15", "Січень 4-31"),
+    ("2027-01-31", "Січень 4-31"),
+    # February — single flat key
+    ("2027-02-01", "Лютий"),
+    ("2027-02-15", "Лютий"),
+    ("2027-02-28", "Лютий"),
+    # Summer / autumn — same name
+    ("2026-07-10", "Липень"),
+    ("2026-11-15", "Листопад"),
+])
+def test_season_key_for_night(iso, expected):
+    assert season_key_for_night(_dt.date.fromisoformat(iso)) == expected
+
+
+@pytest.mark.parametrize("iso", ["2027-03-10", "2027-04-01", "2027-05-31"])
+def test_season_key_for_night_off_season_raises(iso):
+    with pytest.raises(OffSeasonError):
+        season_key_for_night(_dt.date.fromisoformat(iso))
+
+
+# --- "Грудень 1-22" — owner rule: night 22→23 uses this key ---------------
+
+def test_december_1_22_single_night_standard(engine):
+    # 2026-12-15 (Tuesday, будні), Стандарт: "Грудень 1-22" будні = 2000.
+    q = engine.quote("Стандарт", "2026-12-15", "2026-12-16", make_guests(adults=2))
+    assert q.total == 2000
+
+
+def test_december_22_to_23_still_uses_1_22_rate(engine):
+    # ТЗ: "ніч з 22-23 рахується по прайсам Грудень 1-22". 2026-12-22 is Tuesday (будні),
+    # so the night of the 22nd goes for "Грудень 1-22" будні = 2000, NOT 2200.
+    q = engine.quote("Стандарт", "2026-12-22", "2026-12-23", make_guests(adults=2))
+    assert q.total == 2000
+
+
+def test_december_1_22_weekend_night_standard(engine):
+    # 2026-12-18 is Friday (вихідні), Стандарт: "Грудень 1-22" вихідні = 2300.
+    q = engine.quote("Стандарт", "2026-12-18", "2026-12-19", make_guests(adults=2))
+    assert q.total == 2300
+
+
+# --- "Грудень 23-28" — owner rule: night 28→29 uses this key --------------
+
+def test_december_23_to_24_uses_23_28_rate(engine):
+    # 2026-12-23 is Wednesday (будні). "Грудень 23-28" будні = 2200 for Standard.
+    q = engine.quote("Стандарт", "2026-12-23", "2026-12-24", make_guests(adults=2))
+    assert q.total == 2200
+
+
+def test_december_28_to_29_uses_23_28_rate(engine):
+    # ТЗ: "ніч 28-29 включено по тому прайсу [Грудень 23-28]".
+    # 2026-12-28 is Monday (будні) → 2200, NOT 2700.
+    q = engine.quote("Стандарт", "2026-12-28", "2026-12-29", make_guests(adults=2))
+    assert q.total == 2200
+
+
+# --- "Грудень 29-31" / "Січень 1-3" — New Year peak -----------------------
+
+def test_december_29_30_peak_rate(engine):
+    # "Грудень 29-31" is a flat 2700 for Standard (будні == вихідні).
+    # 2026-12-29 is Tuesday — would be будні, but the New Year key is flat.
+    q = engine.quote("Стандарт", "2026-12-29", "2026-12-30", make_guests(adults=2))
+    assert q.total == 2700
+
+
+def test_new_year_night_31_to_1_uses_december_peak(engine):
+    # The night of 31 Dec → 1 Jan: you sleep on the 31st, so it's "Грудень 29-31" (2700).
+    q = engine.quote("Стандарт", "2026-12-31", "2027-01-01", make_guests(adults=2))
+    assert q.total == 2700
+
+
+def test_january_1_to_2_still_peak(engine):
+    # Night 1→2 Jan: sleep on the 1st, "Січень 1-3" = 2700 flat.
+    q = engine.quote("Стандарт", "2027-01-01", "2027-01-02", make_guests(adults=2))
+    assert q.total == 2700
+
+
+def test_january_3_to_4_still_peak(engine):
+    # Owner rule: "Січень 1-3" covers through night 3→4.
+    q = engine.quote("Стандарт", "2027-01-03", "2027-01-04", make_guests(adults=2))
+    assert q.total == 2700
+
+
+def test_january_4_to_5_drops_to_low_winter(engine):
+    # Night 4→5 Jan: "Січень 4-31" будні (Mon) = 2200.
+    q = engine.quote("Стандарт", "2027-01-04", "2027-01-05", make_guests(adults=2))
+    assert q.total == 2200
+
+
+# --- Лютий — single flat key ----------------------------------------------
+
+def test_february_weekday_standard(engine):
+    # 2027-02-10 is Wednesday (будні), "Лютий" будні = 2200 for Standard.
+    q = engine.quote("Стандарт", "2027-02-10", "2027-02-11", make_guests(adults=2))
+    assert q.total == 2200
+
+
+def test_february_weekend_standard(engine):
+    # 2027-02-12 is Friday (вихідні), "Лютий" вихідні = 2500 for Standard.
+    q = engine.quote("Стандарт", "2027-02-12", "2027-02-13", make_guests(adults=2))
+    assert q.total == 2500
+
+
+# --- period boundary crossings --------------------------------------------
+
+def test_stay_straddles_1_22_and_23_28_boundary(engine):
+    # 21-24 Dec 2026, Стандарт, 2 adults. Nights:
+    #   21 Dec (Mon, будні, "Грудень 1-22")   = 2000
+    #   22 Dec (Tue, будні, "Грудень 1-22")   = 2000   (owner rule — night 22→23 stays in 1-22)
+    #   23 Dec (Wed, будні, "Грудень 23-28")  = 2200
+    # Total = 6200
+    q = engine.quote("Стандарт", "2026-12-21", "2026-12-24", make_guests(adults=2))
+    assert q.total == 6200
+    assert q.nights == 3
+
+
+def test_stay_straddles_23_28_and_29_31_boundary(engine):
+    # 27-30 Dec 2026, Стандарт, 2 adults. Nights:
+    #   27 Dec (Sun, будні, "Грудень 23-28")  = 2200
+    #   28 Dec (Mon, будні, "Грудень 23-28")  = 2200   (owner rule — night 28→29 stays in 23-28)
+    #   29 Dec (Tue, flat peak, "Грудень 29-31") = 2700
+    # Total = 7100
+    q = engine.quote("Стандарт", "2026-12-27", "2026-12-30", make_guests(adults=2))
+    assert q.total == 7100
+
+
+def test_stay_crosses_dec_to_jan_new_year(engine):
+    # 30 Dec 2026 → 2 Jan 2027, Стандарт, 2 adults. Three peak nights:
+    #   30 Dec = 2700 (Грудень 29-31)
+    #   31 Dec = 2700 (Грудень 29-31, night 31→1 Jan)
+    #   1  Jan = 2700 (Січень 1-3, flat)
+    q = engine.quote("Стандарт", "2026-12-30", "2027-01-02", make_guests(adults=2))
+    assert q.total == 8100
+    assert q.nights == 3
+
+
+def test_stay_crosses_jan_peak_to_low_winter(engine):
+    # 2-5 Jan 2027, Стандарт, 2 adults. Nights:
+    #   2 Jan (Sat, "Січень 1-3", flat)   = 2700
+    #   3 Jan (Sun, "Січень 1-3", flat)   = 2700   (owner rule — night 3→4 stays in 1-3)
+    #   4 Jan (Mon, "Січень 4-31", будні) = 2200
+    q = engine.quote("Стандарт", "2027-01-02", "2027-01-05", make_guests(adults=2))
+    assert q.total == 7600
+
+
+# --- other categories: verify the key naming was unified (NO "Грудень 22-28") ---
+
+def test_napivlux_december_1_22_weekday(engine):
+    # "Напівлюкс" has no одномісне (null), so 2 adults = base. "Грудень 1-22" будні = 2500.
+    q = engine.quote("Напівлюкс", "2026-12-15", "2026-12-16", make_guests(adults=2))
+    assert q.total == 2500
+
+
+def test_napivlux_december_23_28_weekday(engine):
+    # Previously the JSON had a buggy "Грудень 22-28" key for Напівлюкс — the rename to
+    # "Грудень 23-28" must still resolve. 2026-12-23 is Wednesday (будні) = 2700.
+    q = engine.quote("Напівлюкс", "2026-12-23", "2026-12-24", make_guests(adults=2))
+    assert q.total == 2700
+
+
+def test_standard_plus_december_29_31_peak(engine):
+    # Стандарт +, "Грудень 29-31" flat = 3000.
+    q = engine.quote("Стандарт +", "2026-12-30", "2026-12-31", make_guests(adults=2))
+    assert q.total == 3000
+
+
+# ===========================================================================
+# Rolling-year logic (bot_logic.resolve_booking_year)
+# ===========================================================================
+# A bare month name ("на червень") must resolve to THIS year if the month is still
+# ahead or ongoing, and to NEXT year once the month has already passed. Prevents
+# the January-2027 client from being quoted stale 2026 prices (= wrong calendar
+# days-of-week, hence wrong weekday/weekend split).
+
+from bot_logic import resolve_booking_year, current_booking_year, parse_date_request
+
+
+def test_resolve_booking_year_future_month_this_year():
+    # Today = 2026-06-01. "На серпень" → 2026 (still ahead).
+    today = _dt.date(2026, 6, 1)
+    assert resolve_booking_year(8, today) == 2026
+    assert resolve_booking_year(6, today) == 2026   # same month = this year
+
+
+def test_resolve_booking_year_past_month_rolls_forward():
+    # Today = 2026-11-30. "На лютий" → 2027 (Feb already passed this year).
+    today = _dt.date(2026, 11, 30)
+    assert resolve_booking_year(2, today) == 2027
+    assert resolve_booking_year(1, today) == 2027
+
+
+def test_resolve_booking_year_default_today_uses_system_clock():
+    # When `today` is omitted, `date.today()` is used. In the test suite conftest.py
+    # freezes it to 2026-06-16, so August must resolve to 2026, not the wall-clock year.
+    assert resolve_booking_year(8) == 2026
+    assert current_booking_year() == 2026
+
+
+def test_parse_date_request_rolls_forward_past_months():
+    # Today pinned to 2027-10-15: a bare "15 лютого" must resolve to 2028, not 2027.
+    today = _dt.date(2027, 10, 15)
+    out = parse_date_request("заїзд 15 лютого", today=today)
+    assert out == {"checkin": "2028-02-15"}
+
+
+def test_parse_date_request_keeps_current_year_for_future_months():
+    # Today pinned to 2027-04-10: "на червень" must stay in 2027.
+    today = _dt.date(2027, 4, 10)
+    out = parse_date_request("з 5 по 10 червня", today=today)
+    assert out == {"checkin": "2027-06-05", "checkout": "2027-06-10"}
+
+
+def test_parse_date_request_respects_explicit_year_in_dotted():
+    # Explicit year in dotted format is honoured (overrides rolling-year logic).
+    # Today pinned to 2027-10-15 — rolling would roll "02.26" to the next-year
+    # February, but the dotted ".26" is an explicit 2026 and must be kept.
+    today = _dt.date(2027, 10, 15)
+    out = parse_date_request("10.07.26", today=today)
+    assert out == {"checkin": "2026-07-10"}
+
+
+# ===========================================================================
+# Fuzzy-period year resolution (dialogue_engine.fuzzy_period_ranges)
+# ===========================================================================
+
+import dialogue_engine as _de
+
+
+def test_fuzzy_period_rolls_forward_past_month():
+    # Today = 2027-10-15 → "у лютому" resolves to 2028-02.
+    today = _dt.date(2027, 10, 15)
+    assert _de.fuzzy_period_range("у лютому", today=today) == ("2028-02-01", "2028-02-29")
+
+
+def test_fuzzy_period_stays_in_same_year_for_future_month():
+    # Today = 2027-01-15 → "на липень" resolves to 2027-07 (still ahead).
+    today = _dt.date(2027, 1, 15)
+    assert _de.fuzzy_period_range("на липень", today=today) == ("2027-07-01", "2027-07-31")
+
+
+def test_fuzzy_period_honours_explicit_yyyy_mm():
+    # Even when today has moved past Jan 2026, "2026-01" names an explicit past year —
+    # honour it verbatim (do NOT roll forward to 2027). This path matches the extractor
+    # output format "YYYY-MM" (e.g. "2026-01" for "у січні").
+    today = _dt.date(2027, 10, 15)
+    assert _de.fuzzy_period_range("2026-01", today=today) == ("2026-01-01", "2026-01-31")
+
+
+def test_fuzzy_period_compound_each_segment_picks_own_year():
+    # Compound period "лютий або липень" today = 2027-08-01:
+    #   Feb has already passed (2027-02) → rolls to 2028-02
+    #   July has already passed (2027-07) → rolls to 2028-07
+    today = _dt.date(2027, 8, 1)
+    ranges = _de.fuzzy_period_ranges("лютий або липень", today=today)
+    assert ranges == [("2028-02-01", "2028-02-29"), ("2028-07-01", "2028-07-31")]
+
+
+# ===========================================================================
+# PRICED_MONTHS surface — Jan/Feb/Dec are now priced
+# ===========================================================================
+
+def test_priced_months_include_winter():
+    from pricing_engine import PRICED_MONTHS
+    for m in (1, 2, 6, 7, 8, 9, 10, 11, 12):
+        assert m in PRICED_MONTHS, f"month {m} must be priced"
+    # Only March–May remain off-season.
+    for m in (3, 4, 5):
+        assert m not in PRICED_MONTHS, f"month {m} must be off-season"
+
+
+def test_stay_entirely_in_winter_is_priced():
+    from pricing_engine import stay_is_priced
+    assert stay_is_priced("2026-12-10", "2026-12-15") is True
+    assert stay_is_priced("2027-01-10", "2027-01-15") is True
+    assert stay_is_priced("2027-02-10", "2027-02-15") is True
+
+
+def test_stay_crossing_from_feb_into_march_is_offseason():
+    from pricing_engine import stay_is_priced
+    # Last paid night on Feb 28 (priced), but the night of March 1 is OFF — so
+    # `stay_is_priced` is False for the whole stay.
+    assert stay_is_priced("2027-02-28", "2027-03-02") is False

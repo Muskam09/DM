@@ -155,7 +155,8 @@ async def generate_with_retry(prompt: str, retries: int = 3, base_delay: int = 2
 # The LLM does EXTRACTION ONLY — it never computes prices, dates or weekdays and
 # never writes the client-facing text. It returns structured slots as JSON; all
 # pricing/availability/formatting is handled deterministically in dialogue_engine.
-EXTRACTION_PROMPT = """Ти — аналізатор повідомлень готелю D&T Hotel. Сьогодні: %%TODAY%%. Рік бронювань: 2026.
+EXTRACTION_PROMPT = """Ти — аналізатор повідомлень готелю D&T Hotel. Сьогодні: %%TODAY%%.
+Правило року (ВАЖЛИВО): рік для бронювання бери ВІД СЬОГОДНІ (%%TODAY%%). Якщо названий місяць ще попереду або триває — це ЦЬОГОРІЧНИЙ рік; якщо місяць уже минув цього року — це НАСТУПНИЙ рік. Приклади (коли сьогодні 2027-10-15): "на серпень" → 2028, "у лютому" → 2028, "на грудень" → 2027. Клієнт може явно вказати рік ("27.12.26", "2028-02") — тоді використовуй саме його.
 Прочитай ВСЮ історію діалогу і нове повідомлення та ОБ'ЄДНАЙ дані з УСІХ повідомлень
 (клієнт часто пише по частинах: дати в одному, людей у другому, номер у третьому).
 
@@ -198,7 +199,7 @@ EXTRACTION_PROMPT = """Ти — аналізатор повідомлень го
 - ВІДНОСНІ ДНІ ТИЖНЯ → ТОЧНІ ДАТИ (ОБОВ'ЯЗКОВО): якщо клієнт називає день/дні тижня
   ("п'ятниця", "субота", "неділя", "понеділок", "із суботи на неділю", "виїзд у неділю")
   і є будь-який орієнтир часу (місяць, діапазон чисел типу "23-27", "після N", "наступного
-  тижня", або %%TODAY%%) — РОЗРАХУЙ конкретні дати YYYY-MM-DD у 2026 році і заповни
+  тижня", або %%TODAY%%) — РОЗРАХУЙ конкретні дати YYYY-MM-DD (рік обирай за правилом року вище) і заповни
   checkin/checkout. НЕ лишай рядком, НЕ став fuzzy_date, НЕ перепитуй. Місяць бери з
   КОНТЕКСТУ попередніх повідомлень, якщо в цьому повідомленні його не названо.
   ⚠ ПРАВИЛО ДІАПАЗОНУ: якщо названо діапазон чисел (напр. "23-27") РАЗОМ із днями тижня
@@ -620,6 +621,36 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             await _deliver(conversation_id, templates.MANAGER_HANDOFF)
             await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
         return
+
+    # New Year package (owner 2026-11): whenever a stay touches the window 29 Dec — 3 Jan
+    # the bot stops the normal pipeline and sends the fixed NEW_YEAR_PACKAGE text —
+    # UNLESS this turn is a GENERIC "what's included" FAQ, which gets the standard
+    # INCLUDED_IN_THE_PRICE answer. Anything else NY-dated (children, bed config, pets,
+    # etc.) is handed off to a manager (owner rule: NY sales close in person).
+    #
+    # This block MUST run BEFORE `route_simple_topic` so a `topic=booking_confirm`,
+    # `presentation`, `thinking` etc. for NY dates doesn't leak the IBAN / room list /
+    # polite close — the fixed package text is always what the client sees.
+    if dialogue_engine.has_new_year_stay(slots):
+        topic = slots.get("topic")
+        faq_name = slots.get("faq_template")
+        if topic == "faq":
+            if faq_name == "INCLUDED_IN_THE_PRICE":
+                # Fall through to the normal FAQ path (route_simple_topic -> INCLUDED template).
+                print(f"[i] {conversation_id}: NY-dated FAQ 'INCLUDED_IN_THE_PRICE' -> standard template")
+            else:
+                print(f"[i] {conversation_id}: NY-dated FAQ '{faq_name}' -> MANAGER_HANDOFF + '{bot_logic.INSTAGRAM_LABEL}'")
+                if not _superseded(conversation_id, seq):
+                    await _deliver(conversation_id, templates.MANAGER_HANDOFF)
+                    await asyncio.to_thread(add_conversation_label, conversation_id, bot_logic.INSTAGRAM_LABEL)
+                return
+        else:
+            # Any booking/price/greeting/booking_confirm/presentation turn for NY dates ->
+            # send the fixed package text once. Anti-spam will silence a repeat.
+            print(f"[i] {conversation_id}: NY-dated '{topic}' -> NEW_YEAR_PACKAGE")
+            if not _superseded(conversation_id, seq):
+                await _deliver(conversation_id, templates.NEW_YEAR_PACKAGE)
+            return
 
     # 2) DETERMINISTIC ROUTING — Python decides everything below.
     is_faq_reply = (slots.get("topic") == "faq")

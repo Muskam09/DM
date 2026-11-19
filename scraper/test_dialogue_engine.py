@@ -112,14 +112,17 @@ def test_has_off_season_dates():
 
 
 def test_plan_off_season():
-    out = de.plan({"rooms": [{"room_type": "Стандарт", "checkin": "2026-09-13",
-                              "checkout": "2026-09-14", "adults": 2, "children_ages": []}]})
+    # Owner update 2026-11: Jan/Feb/Dec joined the priced season; only March–May stay off.
+    # April is squarely off-season.
+    out = de.plan({"rooms": [{"room_type": "Стандарт", "checkin": "2026-04-13",
+                              "checkout": "2026-04-14", "adults": 2, "children_ages": []}]})
     assert out["reply"] == templates.OFF_SEASON
 
 
 def test_plan_fuzzy_off_season():
-    # "жовтень" (fuzzy) names an unpriced month -> OFF_SEASON.
-    out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "жовтень",
+    # A fuzzy period naming an off-season month -> OFF_SEASON. "квітень" is off-season
+    # (unlike October/December, which got priced in 2026-11).
+    out = de.plan({"rooms": [{"room_type": None, "fuzzy_date": "квітень",
                               "checkin": None, "checkout": None, "adults": 2, "children_ages": []}]})
     assert out["reply"] == templates.OFF_SEASON
 
@@ -219,7 +222,11 @@ def test_fuzzy_period_range_parses_normalized_yyyy_mm():
     # must still resolve the month (else an August period offers July windows).
     assert de.fuzzy_period_range("2026-08") == ("2026-08-01", "2026-08-31")
     assert de.fuzzy_period_range("2026-07") == ("2026-07-01", "2026-07-31")
-    assert de.fuzzy_period_range("2026-01") is None          # off-season month -> unconstrained
+    # Owner update 2026-11: January is now PRICED (it used to be off-season). The last
+    # remaining off-season bucket (March–May) should still return None (unconstrained scan).
+    assert de.fuzzy_period_range("2026-04") is None          # off-season month -> unconstrained
+    # And the newly priced Jan does map now.
+    assert de.fuzzy_period_range("2026-01") == ("2026-01-01", "2026-01-31")
 
 
 def test_fuzzy_period_ranges_compound_keeps_all_months():
@@ -1017,3 +1024,247 @@ def test_finalize_multiroom_all_soldout_offers_nearest():
     reply = de.finalize_quote(rooms, avail)
     assert "буде вартувати" not in reply
     assert "найближче вільне віконце" in reply
+
+
+# ===========================================================================
+# New Year package detector + plan() short-circuit (owner 2026-11)
+# ===========================================================================
+# The hotel sells a fixed New Year package for 29.12 — 03.01 (min 3 nights,
+# flat per-person price with meals). Whenever a booking stay touches that window,
+# plan() must return the NEW_YEAR_PACKAGE text instead of running the normal
+# quote pipeline — regardless of guest counts or room type. FAQ handling for NY
+# stays is split at the bot_server level (INCLUDED_IN_THE_PRICE goes through the
+# standard FAQ path; everything else becomes MANAGER_HANDOFF).
+
+# --- detector: _is_new_year_day + has_new_year_stay ----------------------
+
+@pytest.mark.parametrize("iso,expected", [
+    # Days INSIDE the NY package window (checkin days that count)
+    ("2026-12-29", True),
+    ("2026-12-30", True),
+    ("2026-12-31", True),
+    ("2027-01-01", True),
+    ("2027-01-02", True),
+    ("2027-01-03", True),
+    # Boundary - just outside
+    ("2026-12-28", False),   # last day of "Грудень 23-28" price key
+    ("2027-01-04", False),   # first day of "Січень 4-31" price key
+    # Clearly outside
+    ("2026-07-15", False),
+    ("2026-11-30", False),
+    ("2027-02-10", False),
+    # Garbage
+    ("not-a-date", False),
+    ("", False),
+])
+def test_is_new_year_day(iso, expected):
+    assert de._is_new_year_day(iso) is expected
+
+
+def test_has_new_year_stay_empty_slots():
+    assert de.has_new_year_stay({}) is False
+    assert de.has_new_year_stay({"rooms": []}) is False
+    assert de.has_new_year_stay({"rooms": [{}]}) is False
+
+
+def test_has_new_year_stay_exact_checkin_inside():
+    # Check-in on 30 Dec — immediately qualifies.
+    slots = {"rooms": [{"checkin": "2026-12-30", "checkout": "2027-01-02",
+                        "adults": 2, "children_ages": []}]}
+    assert de.has_new_year_stay(slots) is True
+
+
+def test_has_new_year_stay_checkin_before_but_night_crosses():
+    # Check-in 27 Dec, check-out 30 Dec — nights of 27/28 Dec are OUT of NY window,
+    # but night of 29 Dec is INSIDE -> qualifies.
+    slots = {"rooms": [{"checkin": "2026-12-27", "checkout": "2026-12-30",
+                        "adults": 2, "children_ages": []}]}
+    assert de.has_new_year_stay(slots) is True
+
+
+def test_has_new_year_stay_checkout_in_jan_1_3():
+    # Checkin 31 Dec, checkout 1 Jan — the single night of 31→1 Jan qualifies.
+    slots = {"rooms": [{"checkin": "2026-12-31", "checkout": "2027-01-01",
+                        "adults": 2, "children_ages": []}]}
+    assert de.has_new_year_stay(slots) is True
+
+
+def test_has_new_year_stay_checkout_on_4_jan_still_touches():
+    # Last paid night is 3 Jan — INSIDE the window.
+    slots = {"rooms": [{"checkin": "2027-01-02", "checkout": "2027-01-04",
+                        "adults": 2, "children_ages": []}]}
+    assert de.has_new_year_stay(slots) is True
+
+
+def test_has_new_year_stay_stay_fully_before_window():
+    # 20-25 Dec — entire stay BEFORE 29 Dec -> not NY.
+    slots = {"rooms": [{"checkin": "2026-12-20", "checkout": "2026-12-25",
+                        "adults": 2, "children_ages": []}]}
+    assert de.has_new_year_stay(slots) is False
+
+
+def test_has_new_year_stay_stay_fully_after_window():
+    # 5-10 Jan — entire stay AFTER 3 Jan -> not NY.
+    slots = {"rooms": [{"checkin": "2027-01-05", "checkout": "2027-01-10",
+                        "adults": 2, "children_ages": []}]}
+    assert de.has_new_year_stay(slots) is False
+
+
+def test_has_new_year_stay_boundary_checkout_on_29_dec_not_touching():
+    # Checkin 26 Dec, checkout 29 Dec — nights slept on 26, 27, 28 Dec. The 29th is
+    # a checkout day (not paid), so the stay does NOT touch the NY window.
+    slots = {"rooms": [{"checkin": "2026-12-26", "checkout": "2026-12-29",
+                        "adults": 2, "children_ages": []}]}
+    assert de.has_new_year_stay(slots) is False
+
+
+def test_has_new_year_stay_only_checkin_known():
+    # Only checkin — a lone 30 Dec counts (the night of the 30th is NY).
+    slots = {"rooms": [{"checkin": "2026-12-30", "adults": 2}]}
+    assert de.has_new_year_stay(slots) is True
+    # A lone 20 Dec does not.
+    slots = {"rooms": [{"checkin": "2026-12-20", "adults": 2}]}
+    assert de.has_new_year_stay(slots) is False
+
+
+def test_has_new_year_stay_fuzzy_keyword():
+    # Fuzzy date mentioning "новий рік" / "НР" also triggers the package.
+    for fuzzy in ["на новий рік", "хочемо новорічну ніч", "НР", "новорічні свята", "на н.р."]:
+        slots = {"rooms": [{"fuzzy_date": fuzzy, "adults": 2}]}
+        assert de.has_new_year_stay(slots) is True, f"fuzzy {fuzzy!r} must match"
+
+
+def test_has_new_year_stay_fuzzy_not_newyear_keyword():
+    # Generic fuzzy (no NY keywords, no exact dates) -> False.
+    slots = {"rooms": [{"fuzzy_date": "у липні", "adults": 2}]}
+    assert de.has_new_year_stay(slots) is False
+
+
+# --- plan() short-circuit --------------------------------------------------
+
+def test_plan_new_year_exact_dates_returns_package():
+    # The canonical case: client picked NY dates -> plan returns the package text.
+    slots = {"topic": "price_quote",
+             "rooms": [{"room_type": "Стандарт", "checkin": "2026-12-30",
+                        "checkout": "2027-01-02", "adults": 2, "children_ages": []}]}
+    out = de.plan(slots)
+    assert out == {"action": "new_year", "reply": templates.NEW_YEAR_PACKAGE}
+
+
+def test_plan_new_year_no_guests_still_returns_package():
+    # Owner rule: the package goes out regardless of guest count — prices for 1/2/3
+    # people are inside the text, the client picks.
+    slots = {"topic": "general_price",
+             "rooms": [{"checkin": "2026-12-31", "checkout": "2027-01-03"}]}
+    out = de.plan(slots)
+    assert out["action"] == "new_year"
+    assert out["reply"] == templates.NEW_YEAR_PACKAGE
+
+
+def test_plan_new_year_with_child_still_returns_package():
+    # Even with a child in the party, the package response wins (the manager handoff
+    # for child/age specifics is a FAQ-only concern handled at bot_server level).
+    slots = {"topic": "price_quote",
+             "rooms": [{"room_type": "Стандарт", "checkin": "2026-12-30",
+                        "checkout": "2027-01-02", "adults": 2, "children_ages": [8]}]}
+    out = de.plan(slots)
+    assert out["action"] == "new_year"
+
+
+def test_plan_new_year_only_checkin_set():
+    # Partial date (only checkin in the NY window) also qualifies.
+    slots = {"topic": "price_quote",
+             "rooms": [{"room_type": "Стандарт +", "checkin": "2026-12-31",
+                        "adults": 2, "children_ages": []}]}
+    out = de.plan(slots)
+    assert out["action"] == "new_year"
+
+
+def test_plan_new_year_fuzzy_triggers_package():
+    # "На новий рік" without exact dates — package still fires (bypasses off-season).
+    slots = {"topic": "fuzzy_dates",
+             "rooms": [{"fuzzy_date": "на новий рік", "adults": 2, "children_ages": []}]}
+    out = de.plan(slots)
+    assert out["action"] == "new_year"
+
+
+def test_plan_normal_december_stay_no_package():
+    # A regular mid-December stay (15-17 Dec) must NOT trigger the NY package.
+    slots = {"topic": "price_quote",
+             "rooms": [{"room_type": "Стандарт", "checkin": "2026-12-15",
+                        "checkout": "2026-12-17", "adults": 2, "children_ages": []}]}
+    out = de.plan(slots)
+    assert out["action"] != "new_year"
+
+
+def test_plan_july_stay_no_package():
+    # Summer stay — package must not fire.
+    slots = {"topic": "price_quote",
+             "rooms": [{"room_type": "Стандарт", "checkin": "2026-07-10",
+                        "checkout": "2026-07-12", "adults": 2, "children_ages": []}]}
+    out = de.plan(slots)
+    assert out["action"] != "new_year"
+
+
+def test_plan_new_year_beats_off_season_for_fuzzy_newyear_keyword():
+    # Edge case: "на новий рік" has no priced month on its own (the `_OFFSEASON_WORDS`
+    # list no longer blocks it — грудень is priced — but the fuzzy mapper won't find
+    # a month). The NY detector must win BEFORE off-season/other checks so the client
+    # gets the package text, not QUESTION_ALL_MISSING or OFF_SEASON.
+    slots = {"topic": "fuzzy_dates",
+             "rooms": [{"fuzzy_date": "на новий рік", "adults": 2, "children_ages": []}]}
+    out = de.plan(slots)
+    assert out["reply"] == templates.NEW_YEAR_PACKAGE
+
+
+def test_new_year_package_text_contents():
+    # Lock down the owner-approved copy — the three price points must stay verbatim.
+    t = templates.NEW_YEAR_PACKAGE
+    assert "29.12.2026" in t and "03.01.2027" in t
+    assert "9 500" in t or "9500" in t
+    assert "19 000" in t or "19000" in t
+    assert "28 500" in t or "28500" in t
+    assert "від 3 ночей" in t
+    assert "сніданок" in t.lower() and "вечеря" in t.lower()
+
+
+def test_plan_new_year_short_stay_still_returns_package():
+    # A sub-3-night stay in the NY window still gets the package text (which itself
+    # tells the client the 3-night minimum). The bot does NOT negotiate / reject.
+    slots = {"topic": "price_quote",
+             "rooms": [{"room_type": "Стандарт", "checkin": "2026-12-31",
+                        "checkout": "2027-01-01", "adults": 2, "children_ages": []}]}
+    out = de.plan(slots)
+    assert out["action"] == "new_year"
+
+
+def test_plan_new_year_multi_room():
+    # Multi-room request on NY dates — the package response still wins.
+    slots = {"topic": "price_quote", "rooms": [
+        {"room_type": "Стандарт", "checkin": "2026-12-30", "checkout": "2027-01-02",
+         "adults": 2, "children_ages": []},
+        {"room_type": "Стандарт", "checkin": "2026-12-30", "checkout": "2027-01-02",
+         "adults": 2, "children_ages": []},
+    ]}
+    out = de.plan(slots)
+    assert out["action"] == "new_year"
+
+
+def test_has_new_year_stay_detects_stay_from_28_to_30_dec():
+    # Checkin 28 Dec (last day of "Грудень 23-28" per owner rule for a single
+    # night) but checkout 30 Dec — night of 29 Dec is inside the window -> NY.
+    slots = {"rooms": [{"checkin": "2026-12-28", "checkout": "2026-12-30",
+                        "adults": 2, "children_ages": []}]}
+    assert de.has_new_year_stay(slots) is True
+
+
+def test_plan_new_year_booking_confirm_path():
+    # When a client says "так, бронюю" for NY dates (booking_confirm), plan() itself
+    # does not see this topic (route_simple_topic handles it in bot_server.py).
+    # But if plan IS called — e.g. because the pre-filter reclassified to price_quote —
+    # the NY package must still fire.
+    slots = {"topic": "price_quote",   # pre-filter reclass
+             "rooms": [{"room_type": "Стандарт", "checkin": "2026-12-30",
+                        "checkout": "2027-01-02", "adults": 2, "children_ages": []}]}
+    out = de.plan(slots)
+    assert out["action"] == "new_year"

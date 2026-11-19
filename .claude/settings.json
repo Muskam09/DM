@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout *)",
+      "Bash(venv/Scripts/python.exe -m py_compile live_auto_qa.py simulate_live_chat.py)",
+      "Bash(venv/Scripts/python.exe -c ' *)",
+      "Bash(venv/Scripts/python.exe live_auto_qa.py --read 339)",
+      "Bash(SIM_SETTLE=45 venv/Scripts/python.exe live_auto_qa.py 21)",
+      "Bash(printf 'POSTGRES_PASSWORD=x\\\\nREDIS_PASSWORD=x\\\\n' > .env && docker compose -f docker-compose-coolify.yaml config >/tmp/coolify-config.txt 2>/tmp/coolify-err.txt && echo \"=== VALID \\(config rendered\\) ===\" && grep -E \"^  [a-z-]+:|expose:|- \\\\\"[0-9]+\\\\\"|driver:|image:|context:|dockerfile:\" /tmp/coolify-config.txt | head -50; echo \"--- stderr ---\"; cat /tmp/coolify-err.txt | head; rm -f .env)",
+      "Read(//tmp/**)",
+      "Bash(git merge *)",
+      "Bash(:)",
+      "Bash(grep -vE '^\\(venv|\\\\.git\\)/$')",
+      "Bash(python -m pytest --collect-only -q)",
+      "Bash(python -m pytest scraper/ --collect-only -q)",
+      "Bash(awk 'NR<909 && /def test_/{a++} NR>=909 && /def test_/{b++} END{print \"Layer A \\(pure helpers\\) funcs:\", a; print \"Layer B \\(live-flow e2e\\) funcs:\", b}' test_webhook.py)",
+      "Bash(exit 1)",
+      "Bash(exit 2)",
+      "Bash(echo \"EXIT=$?\")"
+    ]
+  }
+}

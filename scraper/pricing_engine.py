@@ -67,8 +67,22 @@ _UA_MONTHS = {
 CHILD_PLACE_KEY = "дитяче_місце"
 EXTRA_PLACE_KEY = "додаткове_місце"
 
-# Only the summer months are priced today; everything else is off-season.
-PRICED_MONTHS = frozenset({6, 7, 8, 9, 10, 11})  # June–November
+# Months with a price table. Owner update 2026-11-xx: winter season (December +
+# New Year window + January + February) is now priced. Only the shoulder months
+# March–May remain off-season.
+#
+# December splits into three sub-periods, January into two, and February stays
+# as a single key. The sub-period that applies is picked per NIGHT by
+# `season_key_for_night(night)` — see below.
+#
+#   Грудень 1-22    — low winter season
+#   Грудень 23-28   — mid-season (the night of 22→23 still goes to "Грудень 1-22";
+#                     the night of 28→29 goes here, per owner rule)
+#   Грудень 29-31   — New Year peak (through the night of 31→1 Jan)
+#   Січень 1-3      — New Year peak (through the night of 3→4 Jan)
+#   Січень 4-31     — low winter season
+#   Лютий           — low winter season
+PRICED_MONTHS = frozenset({1, 2, 6, 7, 8, 9, 10, 11, 12})  # Jan, Feb, Jun–Dec
 
 # A single booking may span at most this many rooms (multi-room calculation).
 MAX_ROOMS_PER_BOOKING = 8
@@ -80,7 +94,7 @@ _DEFAULT_PRICING_PATH = os.path.join(os.path.dirname(__file__), "pricing.json")
 
 
 class OffSeasonError(KeyError):
-    """Raised when a stay falls in a month that has no price table (Sept–May)."""
+    """Raised when a stay falls in a month that has no price table (March–May)."""
 
 
 class OverCapacityError(ValueError):
@@ -152,8 +166,45 @@ def month_name_uk(d: date) -> str:
     return _UA_MONTHS[d.month]
 
 
+def season_key_for_night(night: date) -> str:
+    """Return the pricing.json season key that applies to the NIGHT being slept.
+
+    Most months map 1-to-1 to their Ukrainian name (e.g. "Червень", "Липень", …,
+    "Листопад", "Лютий"). December and January are split into sub-periods —
+    owner rule: the sub-period is selected by the **check-in day of the night**
+    (i.e. the day you sleep), NOT by the next morning. Concretely:
+
+        * Night of 22→23 Dec → "Грудень 1-22" (you check in on the 22nd).
+        * Night of 28→29 Dec → "Грудень 23-28" (you check in on the 28th).
+        * Night of 31 Dec→1 Jan → "Грудень 29-31".
+        * Night of 3→4 Jan → "Січень 1-3".
+        * Night of 4→5 Jan → "Січень 4-31".
+
+    Raises OffSeasonError for months without any price table (March–May).
+    """
+    m, d = night.month, night.day
+    if m == 12:
+        if d <= 22:
+            return "Грудень 1-22"
+        if d <= 28:
+            return "Грудень 23-28"
+        return "Грудень 29-31"
+    if m == 1:
+        if d <= 3:
+            return "Січень 1-3"
+        return "Січень 4-31"
+    if m == 2:
+        return "Лютий"
+    if m in PRICED_MONTHS:
+        return _UA_MONTHS[m]
+    raise OffSeasonError(
+        f"No pricing for {_UA_MONTHS[m]} ({night.isoformat()}); "
+        f"off-season (only {sorted(PRICED_MONTHS)} are priced)."
+    )
+
+
 def is_priced_month(value) -> bool:
-    """True if the given date's month has a price table (summer only)."""
+    """True if the given date's month has a price table (winter + summer)."""
     return _as_date(value).month in PRICED_MONTHS
 
 
@@ -259,20 +310,18 @@ class PricingEngine:
         raise KeyError(f"Unknown room type: {room_type!r}")
 
     def _rates_for_night(self, room_type: str, night: date) -> dict:
-        if night.month not in PRICED_MONTHS:
-            raise OffSeasonError(
-                f"No pricing for {month_name_uk(night)} ({night.isoformat()}); "
-                f"off-season (only {sorted(PRICED_MONTHS)} are priced)."
-            )
-        month = month_name_uk(night)
+        # `season_key_for_night` raises OffSeasonError for March–May and returns
+        # the right sub-period key for the winter (e.g. "Грудень 1-22" for the
+        # night of 22→23 Dec, "Грудень 23-28" for 28→29 Dec).
+        season_key = season_key_for_night(night)
         try:
-            month_table = self.prices[room_type][month]
+            season_table = self.prices[room_type][season_key]
         except KeyError as exc:
             raise KeyError(
-                f"No price table for room {room_type!r} in month {month!r}"
+                f"No price table for room {room_type!r} in season {season_key!r}"
             ) from exc
         tariff = "вихідні" if is_weekend_night(night) else "будні"
-        return month_table[tariff]
+        return season_table[tariff]
 
     # -- extra-place categorisation ----------------------------------------
 

@@ -393,8 +393,40 @@ def parse_meal_request(text: str):
 # SAME split, which the anti-spam guard then suppresses (silence — the owner's Sprint-4 Test 21
 # bug). This PURE parser is a safety net: it fires ONLY on an explicit month name or a dotted date
 # (never a bare number, so it can't misfire on prices/ages/counts), so bot_server can fill in a
-# check-in the extractor missed. Bookings are 2026 (any month parses; only summer is priced later).
-_DATE_YEAR = 2026
+# check-in the extractor missed.
+#
+# Rolling year rule (owner update 2026-11): the hotel books rooms year-round, so
+# the "default year" for a bare month name ("на червень") must FOLLOW the calendar
+# — not a hardcoded 2026. We pick the year by comparing the requested month against
+# today's month:
+#   • requested month ≥ today's month → THIS year  (it's still ahead of us);
+#   • requested month <  today's month → NEXT year  (it has already passed).
+# So on 2027-04-15 "на червень" resolves to 2027-06-xx, and on 2027-11-30 "на лютий"
+# resolves to 2028-02-xx. This matters because the weekday-vs-weekend tariff is
+# picked per NIGHT by calendar day (Fri/Sat = вихідні), and 2026-06-15 ≠ 2027-06-15.
+#
+# Tests force a deterministic "today" by passing an explicit year= override.
+
+def current_booking_year(today: "date | None" = None) -> int:
+    """Default booking year — the ONE anchor for every "bare month" the client names.
+
+    Returns today's year. The MONTH-aware roll-forward (June after it already passed →
+    next year) lives in `resolve_booking_year(month, today)`, so a code path that only
+    knows "we're parsing a date right now" uses this and gets today's year; a code path
+    that knows the month uses `resolve_booking_year` and gets the right year even when
+    the named month has already passed this year.
+    """
+    return (today or date.today()).year
+
+
+def resolve_booking_year(month: int, today: "date | None" = None) -> int:
+    """Pick the right year for a bare month name ("на червень"): current year if
+    the month is still ahead or ongoing, otherwise NEXT year."""
+    t = today or date.today()
+    return t.year if month >= t.month else t.year + 1
+
+
+
 
 # Longest stems first so "серпн" wins before "серп", etc. Genitive + short forms cover "15 липня",
 # "1 серпня", the "лип"/"серп" abbreviations, etc.
@@ -414,9 +446,12 @@ def _month_from_word(word: str):
     return None
 
 
-def _safe_iso(day: int, month: int, year: int = _DATE_YEAR):
+def _safe_iso(day: int, month: int, year: "int | None" = None, today: "date | None" = None):
+    """Build an ISO date; when `year` is not given, pick it by `resolve_booking_year`
+    so a bare month that has already passed this year rolls forward to the next year."""
     try:
-        return date(year, month, day).isoformat()
+        y = year if year is not None else resolve_booking_year(month, today)
+        return date(y, month, day).isoformat()
     except ValueError:
         return None
 
@@ -426,7 +461,7 @@ def _safe_iso(day: int, month: int, year: int = _DATE_YEAR):
 _ORD = r"(?:\s*-?\s*(?:го|е|му|числа))?"
 
 
-def parse_date_request(text, year: int = _DATE_YEAR):
+def parse_date_request(text, year: "int | None" = None, today: "date | None" = None):
     """Best-effort deterministic check-in (and, when stated, check-out) from ONE message.
 
     Fires ONLY on an explicit month name ("15 липня", "15 чи 16 липня", "з 13 по 17 липня") or a
@@ -434,6 +469,13 @@ def parse_date_request(text, year: int = _DATE_YEAR):
     fallback for a date the LLM extractor dropped right after a group-split proposal. A CHOICE
     ("15 чи 16 липня") returns the earliest option as the check-in (check-out is derived later from
     the remembered nights). Returns {"checkin", "checkout"?} (ISO) or None.
+
+    Year selection (owner update 2026-11):
+      * If the caller passes `year`, it is honoured verbatim (back-compat, tests).
+      * Otherwise the year is picked per-month by `resolve_booking_year`: if the
+        named month is still ahead or ongoing this year, use this year; if it has
+        already passed, use NEXT year. So on 2027-04-15 "в серпні" → 2027-08-xx,
+        and on 2027-10-15 "в лютому" → 2028-02-xx. `today` is only used by tests.
     """
     t = (text or "").lower()
 
@@ -442,8 +484,8 @@ def parse_date_request(text, year: int = _DATE_YEAR):
     #    not mis-read as "07-17.07").
     m = re.search(r"(?<![\d.])(\d{1,2})\s*[-–—]\s*(\d{1,2})\.(\d{1,2})(?:\.\d{2,4})?", t)
     if m:
-        ci = _safe_iso(int(m.group(1)), int(m.group(3)), year)
-        co = _safe_iso(int(m.group(2)), int(m.group(3)), year)
+        ci = _safe_iso(int(m.group(1)), int(m.group(3)), year, today)
+        co = _safe_iso(int(m.group(2)), int(m.group(3)), year, today)
         if ci:
             out = {"checkin": ci}
             if co and co > ci:
@@ -451,10 +493,22 @@ def parse_date_request(text, year: int = _DATE_YEAR):
             return out
 
     # 2) dotted date, optional dotted range: "13.07-17.07" / "20.07" / "20.07.26".
-    dotted = re.findall(r"\b(\d{1,2})\.(\d{1,2})(?:\.\d{2,4})?", t)
+    # When the user writes an explicit year suffix ("20.07.26" or "20.07.2026") it must be
+    # honoured verbatim — rolling-year logic only kicks in when the year is OMITTED.
+    dotted = re.findall(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?", t)
     if dotted:
-        ci = _safe_iso(int(dotted[0][0]), int(dotted[0][1]), year)
-        co = _safe_iso(int(dotted[1][0]), int(dotted[1][1]), year) if len(dotted) > 1 else None
+        def _dotted_year(suffix: str) -> "int | None":
+            if not suffix:
+                return None
+            n = int(suffix)
+            return 2000 + n if n < 100 else n  # "26" → 2026, "2026" → 2026
+
+        y0 = _dotted_year(dotted[0][2]) if year is None else year
+        ci = _safe_iso(int(dotted[0][0]), int(dotted[0][1]), y0, today)
+        co = None
+        if len(dotted) > 1:
+            y1 = _dotted_year(dotted[1][2]) if year is None else year
+            co = _safe_iso(int(dotted[1][0]), int(dotted[1][1]), y1, today)
         if ci:
             out = {"checkin": ci}
             if co and co > ci:
@@ -467,12 +521,14 @@ def parse_date_request(text, year: int = _DATE_YEAR):
                   + r"\s+([а-яіїєґ']+)", t)
     if m and _month_from_word(m.group(3)) is not None:
         mon = _month_from_word(m.group(3))
+        if mon is None:  # pragma: no cover — guarded by the `is not None` above
+            return None
         d1, d2, sep = int(m.group(1)), int(m.group(2)), m.group(0)
-        ci = _safe_iso(d1, mon, year)
+        ci = _safe_iso(d1, mon, year, today)
         if ci:
             out = {"checkin": ci}
             if (("-" in sep) or ("–" in sep) or ("—" in sep) or ("по" in sep)) and d2 > d1:
-                co = _safe_iso(d2, mon, year)
+                co = _safe_iso(d2, mon, year, today)
                 if co:
                     out["checkout"] = co
             return out
@@ -480,7 +536,10 @@ def parse_date_request(text, year: int = _DATE_YEAR):
     # 4) a single "<day> <month>" ("15 липня", "з 20 серпня").
     m = re.search(r"(\d{1,2})" + _ORD + r"\s+([а-яіїєґ']+)", t)
     if m and _month_from_word(m.group(2)) is not None:
-        ci = _safe_iso(int(m.group(1)), _month_from_word(m.group(2)), year)
+        mon2 = _month_from_word(m.group(2))
+        if mon2 is None:  # pragma: no cover — guarded by the `is not None` above
+            return None
+        ci = _safe_iso(int(m.group(1)), mon2, year, today)
         if ci:
             return {"checkin": ci}
     return None
