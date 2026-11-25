@@ -121,12 +121,40 @@ def match_availability_key(simplified: Dict, room_type: str):
     return None
 
 
+def _nights_outside_calendar_window(simplified: Dict, night_dates: List[str]) -> bool:
+    """True when at least one requested night is OUTSIDE the horizon that the scrape
+    actually rendered (either past the max visible date or before the min visible date).
+
+    OtelMS "Шахівниця" only renders a ~46-day window around the browser-side "today".
+    For any stay that is far enough in the future (e.g. January 2027 scraped from
+    November 2026 without calendar navigation), the requested nights simply do NOT
+    appear in the HTML grid — every `avail.get(d, 0)` returns 0 and the old rule
+    reported "sold_out" for calendar cells that were never on the screen.
+
+    This helper lets `is_room_available` distinguish "OtelMS says 0 free rooms on this
+    date" (true sold-out) from "OtelMS never showed this date" (genuinely unknown). It
+    is based ONLY on the scrape payload — no clock reads — so it stays deterministic
+    and testable.
+    """
+    if not night_dates:
+        return False
+    # Union of every date OtelMS rendered for ANY room type. Faster than checking per
+    # category and lets us handle the case where one category has a wider horizon than
+    # another (e.g. a sub-type with lots of bookings vs. a brand-new type).
+    all_dates = [d for v in (simplified or {}).values() for d in (v or {})]
+    if not all_dates:
+        return False  # empty scrape -> treated as "unknown" via the key-miss branch above
+    lo, hi = min(all_dates), max(all_dates)
+    return any(d < lo or d > hi for d in night_dates)
+
+
 def is_room_available(simplified: Dict, room_type: str, night_dates: List[str]) -> str:
     """Availability of a specific room over the requested nights.
 
     Returns 'available' (free every night), 'sold_out' (booked on >=1 night), or
-    'unknown' (room not found in the scraped data). Used to GATE pricing: the bot
-    must never quote a 'sold_out' room.
+    'unknown' (either room not scraped, or the stay is outside the visible calendar
+    window — 2027 Jan/Feb while the grid only shows Nov-Dec 2026). Used to GATE
+    pricing: the bot must never quote a 'sold_out' room.
     """
     key = match_availability_key(simplified, room_type)
     if key is None:
@@ -136,8 +164,14 @@ def is_room_available(simplified: Dict, room_type: str, night_dates: List[str]) 
     avail = simplified.get(key) or {}
     if not night_dates:
         return "unknown"
-    # Owner rule (2026-06-24): a date MISSING from a scraped room's calendar defaults to
-    # SOLD OUT (count 0), never "available" — never quote a date OtelMS didn't confirm free.
+    # Owner fix 2026-11-19 (prod incident "сiчень/лютий 2027 all booked"): if ANY
+    # requested night sits OUTSIDE the calendar window the scrape rendered, we don't
+    # know anything about it — do NOT treat an absent cell as sold_out.
+    if _nights_outside_calendar_window(simplified, night_dates):
+        return "unknown"
+    # Owner rule (2026-06-24): a date MISSING from a scraped room's calendar WHILE THE
+    # OVERALL WINDOW COVERS the stay defaults to SOLD OUT (count 0) — never quote a
+    # date OtelMS didn't confirm free. (The outside-window case is handled above.)
     if all(avail.get(d, 0) > 0 for d in night_dates):
         return "available"
     return "sold_out"

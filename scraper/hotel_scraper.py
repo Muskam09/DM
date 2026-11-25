@@ -13,13 +13,53 @@ HMS_ID = os.getenv("OTELMS_HMS_ID", "18472")
 USERNAME = os.getenv("OTELMS_LOGIN")
 PASSWORD = os.getenv("OTELMS_PASSWORD")
 
-LOGIN_URL = f"https://desktop.otelms.com/login_c2/single_login?hmsid={HMS_ID}" 
+LOGIN_URL = f"https://desktop.otelms.com/login_c2/single_login?hmsid={HMS_ID}"
 CALENDAR_URL = "https://desktop.otelms.com/reservation_c2/calendar"
 
-async def fetch_hotel_availability():
+# OtelMS "Шахівниця" (chessboard) only renders a ~46-day window around the browser-side
+# "today". Without explicit navigation it is IMPOSSIBLE to see Jan/Feb 2027 from Nov 2026
+# — the grid simply doesn't contain those columns, so every parse of a far-future date
+# returned `count=0` and the bot wrongly said "all rooms booked" (2026-11-19 prod bug).
+#
+# The calendar form (`#frmdata`) exposes a date picker `#datein100` whose `change` event
+# copies the full ISO date into the hidden `#date_shift` and submits the form, re-rendering
+# the grid centred on the chosen day. We drive exactly that handler via Playwright so the
+# scrape returns a grid that COVERS the requested check-in instead of the browser default.
+
+
+def _target_iso(target_date) -> "str | None":
+    """Normalise target_date into 'YYYY-MM-DD' (OtelMS format) or None if unusable."""
+    if not target_date:
+        return None
+    if isinstance(target_date, str):
+        s = target_date.strip()
+        # Accept full ISO and best-effort 'YYYY-MM' (first day of month).
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            return s
+        if re.fullmatch(r"\d{4}-\d{2}", s):
+            return s + "-01"
+        return None
+    # datetime / date
+    try:
+        return target_date.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+async def fetch_hotel_availability(target_date=None):
+    """Scrape the "Шахівниця" availability grid.
+
+    Args:
+        target_date: optional ISO 'YYYY-MM-DD' (or `datetime`/`date`) that the client
+            wants to book. When given, we navigate the OtelMS calendar to that date so
+            the grid contains the requested nights; otherwise we scrape the default
+            window (today ± ~23 days). Driven via the real `#datein100` picker, which
+            submits `#frmdata` → the grid re-renders centred on the chosen date.
+    """
+    target_iso = _target_iso(target_date)
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True) 
-        
+        browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720}
@@ -29,14 +69,14 @@ async def fetch_hotel_availability():
         print("[*] Відкриваємо сторінку авторизації...")
         await page.goto(LOGIN_URL)
         await page.wait_for_selector('#userLogin', state='visible', timeout=15000)
-        
+
         print("[*] Вводимо логін та пароль...")
         await page.fill('#userLogin', USERNAME)
         await page.fill('#password', PASSWORD)
         await page.press('#password', 'Enter')
-        
-        await page.wait_for_timeout(4000) 
-        
+
+        await page.wait_for_timeout(4000)
+
         print("[*] Перехід на Шахівницю...")
         await page.goto(CALENDAR_URL)
 
@@ -44,16 +84,72 @@ async def fetch_hotel_availability():
         try:
             await page.wait_for_selector('td[category_id]', timeout=20000)
             print("[+] Сітка успішно завантажена!")
-        except Exception as e:
+        except Exception:
             print("[-] Помилка: елементи таблиці не з'явилися.")
             await browser.close()
             return {"error": "Не вдалося завантажити шахівницю."}
-        
+
+        # Owner fix 2026-11-19: navigate to the requested month BEFORE parsing. OtelMS
+        # only shows ~46 days around browser-today, so a client asking about Jan 2027
+        # from Nov 2026 gets an empty grid for Jan — which the parser then (wrongly)
+        # treats as "all booked". The navigation uses the real jQuery handler so the
+        # server-side re-render path matches what the UI does.
+        if target_iso:
+            print(f"[*] Перемикаємо календар на цільову дату {target_iso}...")
+            try:
+                # (1) First try the server-authoritative path: write ISO into the hidden
+                #     `#date_shift` input and submit `#frmdata` directly. This is EXACTLY
+                #     what the `#datein100.change` handler does and bypasses the jQuery
+                #     datepicker UI entirely (datepicker libraries sometimes reject
+                #     `fill()`/`type()` writes made before their "ready" event fires).
+                shifted = await page.evaluate(
+                    """(iso) => {
+                        const ds = document.getElementById('date_shift');
+                        const frm = document.getElementById('frmdata');
+                        if (!ds || !frm) return false;
+                        ds.value = iso;
+                        // Mirror the datepicker's behaviour: also sync #datein100 so the
+                        // rendered header matches, but don't fire its change (would double-submit).
+                        const picker = document.getElementById('datein100');
+                        if (picker) picker.value = iso;
+                        frm.submit();
+                        return true;
+                    }""",
+                    target_iso,
+                )
+                if not shifted:
+                    print("[!] Форма #frmdata не знайдена — ймовірно, OtelMS змінив розмітку.")
+                else:
+                    # Wait for the grid to be rebuilt on the new date window.
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    await page.wait_for_selector('td[category_id]', timeout=20000)
+                    # Sanity check: the grid now MUST include the requested day_id.
+                    # If OtelMS silently refused the shift (e.g. unauthorised date), we
+                    # degrade gracefully — the stay-outside-calendar fallback in
+                    # `bot_logic.is_room_available` turns it into "unknown", not "sold_out".
+                    try:
+                        want_day_id = str((datetime.strptime(target_iso, "%Y-%m-%d")
+                                           - datetime(1970, 1, 1)).days)
+                        found = await page.query_selector(f'td[day_id="{want_day_id}"]')
+                        if found:
+                            print(f"[+] Календар перемкнуто: день {target_iso} видно на сітці.")
+                        else:
+                            print(f"[!] Календар не містить {target_iso} після перемикання — "
+                                  f"можливо OtelMS обмежив горизонт бронювання.")
+                    except Exception as e:
+                        print(f"[i] Пропускаю sanity-check видимості дня ({e}).")
+            except Exception as e:
+                # Navigation failure MUST NOT crash the scrape — fall back to the default
+                # window. `bot_logic.is_room_available` will return "unknown" for nights
+                # that end up outside the window, which is the correct lenient behaviour
+                # (never claim "sold out" for dates we literally couldn't see).
+                print(f"[-] Помилка перемикання календаря: {e}. Парсимо дефолтне вікно.")
+
         print("[*] Збір HTML-даних...")
         await page.wait_for_timeout(2000)
         html_content = await page.content()
         await browser.close()
-        
+
         return parse_detailed_availability(html_content)
 
 def parse_detailed_availability(html_content):
@@ -132,8 +228,10 @@ def parse_detailed_availability(html_content):
     return availability
 
 if __name__ == "__main__":
-    print("=== Старт тестування розумного скрапера ===")
-    result = asyncio.run(fetch_hotel_availability())
+    import sys
+    target = sys.argv[1] if len(sys.argv) > 1 else None
+    print(f"=== Старт тестування розумного скрапера (target_date={target!r}) ===")
+    result = asyncio.run(fetch_hotel_availability(target_date=target))
     
     print("\n[+] РЕЗУЛЬТАТ (JSON):")
     print(json.dumps(result, ensure_ascii=False, indent=4))

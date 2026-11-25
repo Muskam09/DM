@@ -7,6 +7,7 @@ never a price). Pure stdlib + pytest.
 """
 import pytest
 
+import bot_logic
 import dialogue_engine as de
 import templates
 
@@ -499,15 +500,54 @@ def test_finalize_unknown_room_in_availability_still_quotes():
     assert "2200 грн" in reply
 
 
-def test_finalize_missing_dates_default_sold_out():
-    # Owner fix 2026-06-24: dates the scraper didn't return default to SOLD OUT, never quoted.
-    # Here only 5 July is known; an August request has no forward window in the data.
-    avail = {"Стандарт": {"2026-07-05": 3}}
+def test_finalize_missing_dates_inside_window_default_sold_out():
+    # Owner fix 2026-06-24 (still enforced): a room whose requested night is INSIDE the
+    # visible window but missing from the dict defaults to SOLD OUT (count 0) — we must
+    # never quote a date OtelMS didn't confirm free. Window here is 2026-07-05..2026-07-20;
+    # the requested 2026-07-10 sits INSIDE that span, so an absent cell == sold out.
+    avail = {"Стандарт": {"2026-07-05": 3, "2026-07-20": 2}}
     reply = de.finalize_quote(
-        [{"room_type": "Стандарт", "checkin": "2026-08-10", "checkout": "2026-08-11",
+        [{"room_type": "Стандарт", "checkin": "2026-07-10", "checkout": "2026-07-11",
           "adults": 2, "children_ages": []}], avail)
     assert "буде вартувати" not in reply         # NOT quoted
-    assert reply == templates.NEAREST_NONE
+    # A night on the far edge of the window (2026-07-20) IS free, so the bot offers it
+    # as the nearest fit rather than NEAREST_NONE. Either way the key invariant holds:
+    # the originally requested dates are NOT quoted.
+    assert ("найближче вільне віконце" in reply) or (reply == templates.NEAREST_NONE)
+
+
+def test_finalize_dates_far_beyond_scrape_window_lenient_quote():
+    # Owner fix 2026-11-19 (prod incident "сiчень/лютий 2027 all booked"):
+    # OtelMS "Шахівниця" only renders a ~46-day window around browser-today, so a
+    # client asking about Jan/Feb 2027 from Nov 2026 lands on dates that the scrape
+    # NEVER returned. Those nights MUST become 'unknown' (lenient-quote) instead of
+    # 'sold_out' — otherwise the bot wrongly reports "all rooms booked" for a date
+    # it literally never saw. The scrape here covers a short window entirely before
+    # the request, mimicking the production payload shape.
+    scrape_window = {"Стандарт": {f"2026-11-{d:02d}": 3 for d in range(10, 26)}}
+    reply = de.finalize_quote(
+        [{"room_type": "Стандарт", "checkin": "2027-01-11", "checkout": "2027-01-13",
+          "adults": 2, "children_ages": []}], scrape_window)
+    # The stay is QUOTED (price present) and it is NOT the "all booked" apology.
+    assert "грн" in reply
+    assert "усі номери вже зайняті" not in reply
+    assert templates.NEAREST_NONE not in reply
+
+
+def test_is_room_available_far_future_returns_unknown():
+    # Same incident at the unit level: when EVERY requested night is past the max
+    # scraped date, is_room_available must return 'unknown' (not 'sold_out'), even
+    # though the room category is present in the scrape.
+    simplified = {"Стандарт": {"2026-11-20": 3, "2026-11-21": 3, "2026-11-22": 3}}
+    assert bot_logic.is_room_available(
+        simplified, "Стандарт", ["2027-02-04", "2027-02-05", "2027-02-06"]) == "unknown"
+
+
+def test_is_room_available_sold_out_still_wins_inside_window():
+    # A night sitting INSIDE the scraped window with a 0 count is still 'sold_out'.
+    simplified = {"Стандарт": {"2026-07-05": 3, "2026-07-06": 0, "2026-07-07": 2}}
+    assert bot_logic.is_room_available(
+        simplified, "Стандарт", ["2026-07-05", "2026-07-06"]) == "sold_out"
 
 
 def test_finalize_soldout_specific_room_falls_back_to_any_fitting():

@@ -82,13 +82,22 @@ def test_build_simplified_folds_internal_names():
 # -- availability gating helper (the new pricing gate) ----------------------
 
 def test_is_room_available_states():
-    avail = {"Стандарт": {"2026-07-05": 3, "2026-07-06": 0}, "Напівлюкс": {"2026-07-05": 1}}
+    avail = {"Стандарт": {"2026-07-05": 3, "2026-07-06": 0, "2026-08-20": 2},
+             "Напівлюкс": {"2026-07-05": 1}}
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-05"]) == "available"
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-06"]) == "sold_out"
     assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-05", "2026-07-06"]) == "sold_out"
     assert bot_logic.is_room_available(avail, "Président", ["2026-07-05"]) == "unknown"      # room category absent
-    # Owner fix 2026-06-24: a date the scraper didn't return defaults to SOLD OUT, not available.
-    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-08-10"]) == "sold_out"      # missing date
+    # Owner fix 2026-06-24: a date INSIDE the scraped window but absent from the dict
+    # defaults to SOLD OUT (count 0) — never quote an unconfirmed date.
+    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-07-10"]) == "sold_out"
+    # Owner fix 2026-11-19 (prod incident): a date OUTSIDE the scraped window (OtelMS
+    # only renders ~46 days around today) is UNKNOWN, not sold_out — so far-future
+    # 2027 queries aren't reported as "all booked" just because the grid never showed
+    # them. The window above runs 2026-07-05..2026-08-20; 2027-02-04 lies past the max.
+    assert bot_logic.is_room_available(avail, "Стандарт", ["2027-02-04"]) == "unknown"
+    # Same for dates BEFORE the window min — they're outside, hence unknown.
+    assert bot_logic.is_room_available(avail, "Стандарт", ["2026-01-01"]) == "unknown"
 
 
 def test_room_key_matching_handles_spacing():
@@ -958,8 +967,15 @@ def server(monkeypatch):
         else:
             monkeypatch.setattr(bot_server, "get_chatwoot_history", lambda conv_id: history or [])
 
-        async def fake_fetch():
+        # Owner fix 2026-11-19: production fetch_hotel_availability now accepts a
+        # `target_date` kwarg so Playwright navigates Шахівниця to the requested
+        # month. The test fake must match that signature (and remember what was
+        # requested so tests can assert the scrape targeted the right month).
+        state["scrape_targets"] = []
+
+        async def fake_fetch(target_date=None):
             state["scraped"] = True
+            state["scrape_targets"].append(target_date)
             return availability
         monkeypatch.setattr(bot_server, "fetch_hotel_availability", fake_fetch)
         return bot_server
@@ -1006,6 +1022,74 @@ def test_e2e_price_quote_deterministic_total(server):
     assert any("Секундочку" in m for m in server.sent)        # availability checked first
     assert any("4400 грн" in m for m in server.sent)          # 2200*2 будні, NOT 2500
     assert not any("2500" in m for m in server.sent)
+    # Owner fix 2026-11-19: Playwright must be told which month to navigate to.
+    assert server.state["scrape_targets"] == ["2026-07-05"]
+
+
+def test_e2e_scrape_navigates_to_requested_month_2027(server):
+    # Owner fix 2026-11-19 (prod incident "сiчень 2027 — all booked"):
+    # A booking in a far-future month MUST pass the check-in through to
+    # fetch_hotel_availability as `target_date`, so Playwright navigates Шахівниця
+    # to that month before parsing. If the target_date is NOT passed, Шахівниця
+    # defaults to "today" and the grid never contains Jan/Feb 2027 columns — then
+    # every date reads as 0 free rooms and the bot wrongly replies "all booked".
+    #
+    # Here we pre-stock the scrape result with a payload that covers 2027-01, mimicking
+    # a successful post-navigation scrape, and assert the price is quoted (NOT the
+    # "all rooms booked" apology).
+    jan_window = {"Стандарт": {f"2027-01-{d:02d}": 2 for d in range(5, 20)}}
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2027-01-11", "checkout": "2027-01-13",
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(),
+        availability=_raw(jan_window),
+    )
+    _run(bs.process_incoming_message("Цікавлять 11-13 січня, 2є дорослих", 701))
+    assert server.state["scraped"] is True
+    assert server.state["scrape_targets"] == ["2027-01-11"]      # navigated to Jan 2027
+    joined = "\n".join(server.sent)
+    assert "усі номери вже зайняті" not in joined               # the exact prod wrong reply
+    assert "грн" in joined                                       # a real price is quoted
+
+
+def test_e2e_second_question_different_month_triggers_fresh_scrape(server):
+    # Owner fix 2026-11-19 (prod incident "лютий 2027 — scrape НЕ запустився"):
+    # In the same conversation, a follow-up question about a DIFFERENT month must
+    # force a fresh scrape — the per-conversation cache slot is keyed by YYYY-MM
+    # so January's 46-day payload can't be reused as the answer about February.
+    # Before the fix the second turn silently reused the January scrape (whose
+    # window did NOT include February), reported "all booked" again, and the
+    # anti-spam guard suppressed the identical reply -> total silence.
+    jan_window = {"Стандарт": {f"2027-01-{d:02d}": 2 for d in range(5, 20)}}
+    feb_window = {"Стандарт": {f"2027-02-{d:02d}": 2 for d in range(1, 15)}}
+
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2027-01-11", "checkout": "2027-01-13",
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(),
+        availability=_raw(jan_window),
+    )
+    _run(bs.process_incoming_message("Цікавлять 11-13 січня, 2є дорослих", 702))
+    assert server.state["scrape_targets"] == ["2027-01-11"]
+
+    # Second turn: SAME conversation, different month. Reconfigure the fake fetcher
+    # to return the Feb payload. The server MUST call fetch again (per-month cache
+    # miss) and MUST navigate Playwright to February.
+    bs = server.configure(
+        slots={"topic": "price_quote", "rooms": [
+            {"room_type": "Стандарт", "checkin": "2027-02-04", "checkout": "2027-02-07",
+             "adults": 2, "children_ages": []}]},
+        history=_bot_spoke(),
+        availability=_raw(feb_window),
+    )
+    _run(bs.process_incoming_message("Гаразд а як на рахунок 4-7 лютого?", 702))
+    # New scrape fired (not silent anymore), targeted at the correct month.
+    assert "2027-02-04" in server.state["scrape_targets"]
+    joined = "\n".join(server.sent)
+    assert "усі номери вже зайняті" not in joined
+    assert "грн" in joined                                        # Feb is quoted, not "booked"
 
 
 # -- availability gating: sold out -> Polite Close, no price ----------------
@@ -1259,7 +1343,12 @@ def test_e2e_faq_during_scrape_combines_with_cached_booking(server):
             {"room_type": None, "fuzzy_date": "друга половина липня", "nights": 3,
              "adults": 2, "children_ages": []}]},
         history=_bot_spoke())
-    bs.AVAILABILITY_CACHE[905] = (
+    # Owner fix 2026-11-19: cache is now keyed by (conversation_id, YYYY-MM) so a
+    # client asking about a different month in the same conversation forces a fresh
+    # scrape. The fuzzy period in this test lands in July, so pre-populate the July
+    # slot (fuzzy flows fall back to the "*" slot too, which peek_cached_availability
+    # covers via its "any fresh entry for this conversation" branch).
+    bs.AVAILABILITY_CACHE[(905, "2026-07")] = (
         _raw({"Стандарт": {f"2026-07-{d:02d}": 2 for d in range(20, 28)}}), _t.time())
     _run(bs.process_incoming_message("а харчування є?", 905))
     joined = "\n".join(server.sent)

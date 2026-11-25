@@ -96,37 +96,101 @@ def add_conversation_label(conversation_id: int, label: str):
     except Exception as e:
         print(f"[-] Помилка додавання мітки: {e}")
 
-async def get_hotel_data_cached(conversation_id: int):
+def _cache_month_key(target_date):
+    """Normalise a target date into a YYYY-MM slot used as part of the cache key.
+
+    Owner fix 2026-11-19: the OtelMS "Шахівниця" only shows a ~46-day window, so a
+    single scrape payload covers at most ~1.5 months. Using the raw conversation_id
+    as a cache key meant that after a client asked about January 2027, a later
+    question about February 2027 in the SAME conversation returned the stale January
+    payload (which does NOT include February dates) — the bot then reported "all
+    booked" for February WITHOUT re-running Playwright. Keying by (conv_id, month)
+    forces a fresh scrape whenever the client changes to a different month.
+
+    Returns None when the date is unusable; callers fall back to the shared slot
+    `"*"` which preserves back-compat for FAQ / fuzzy flows that have no exact date
+    yet (an FAQ answered WHILE a scrape is in flight must still peek the cache).
+    """
+    if not target_date:
+        return "*"
+    s = str(target_date)
+    import re as _re
+    m = _re.match(r"(\d{4}-\d{2})", s)
+    return m.group(1) if m else "*"
+
+
+def _slots_earliest_checkin(slots_or_rooms):
+    """Return the earliest ISO check-in across every room in the slots payload, or None.
+    Accepts either the full `slots` dict or a bare list of room dicts.
+
+    Used for TWO purposes (both introduced by the 2026-11-19 prod incident):
+      * Keying AVAILABILITY_CACHE by (conv_id, YYYY-MM) so January 2027 doesn't
+        poison the cache slot February 2027 reads from.
+      * Passing `target_date` into `fetch_hotel_availability` so Playwright navigates
+        the Шахівниця to the requested month before scraping (otherwise the grid is
+        centred on browser-today and far-future dates are invisible).
+    """
+    rooms = slots_or_rooms if isinstance(slots_or_rooms, list) else (
+        (slots_or_rooms or {}).get("rooms") or [])
+    checkins = sorted(r.get("checkin") for r in rooms if r and r.get("checkin"))
+    return checkins[0] if checkins else None
+
+
+async def get_hotel_data_cached(conversation_id: int, target_date=None):
+    """Scrape-with-cache.
+
+    The cache slot is (conversation_id, YYYY-MM-of-target_date). A client asking
+    about a DIFFERENT month in the same conversation forces a fresh scrape — which
+    `hotel_scraper.fetch_hotel_availability` runs with `target_date` so Playwright
+    actually navigates Шахівниця to the requested month before parsing.
+    """
     now = time.time()
-    if conversation_id in AVAILABILITY_CACHE:
-        cached_data, timestamp = AVAILABILITY_CACHE[conversation_id]
+    month_slot = _cache_month_key(target_date)
+    key = (conversation_id, month_slot)
+    if key in AVAILABILITY_CACHE:
+        cached_data, timestamp = AVAILABILITY_CACHE[key]
         if now - timestamp < CACHE_TTL:
             return cached_data
-            
-    print("[*] Запускаємо Playwright...")
+
+    print(f"[*] Запускаємо Playwright... (target_date={target_date!r}, month_slot={month_slot})")
     await asyncio.to_thread(send_chatwoot_message, conversation_id, "Секундочку, перевіряю доступність номеру та актуальні ціни на ці дати… 🗓️")
-    
+
     try:
-        data = await fetch_hotel_availability()
-        AVAILABILITY_CACHE[conversation_id] = (data, now)
+        data = await fetch_hotel_availability(target_date=target_date)
+        AVAILABILITY_CACHE[key] = (data, now)
         return data
     except Exception as e:
         print(f"[-] Помилка скрапера: {e}")
         return None
 
 
-def peek_cached_availability(conversation_id: int):
+def peek_cached_availability(conversation_id: int, target_date=None):
     """Return fresh cached availability WITHOUT scraping (no Playwright, no
     "Секундочку"). Lets an FAQ reply be combined with a pending booking answer when
     a scrape already ran this conversation (Bug 1: an FAQ during a scrape must not
-    drop the calendar result)."""
-    entry = AVAILABILITY_CACHE.get(conversation_id)
-    if not entry:
+    drop the calendar result).
+
+    When ``target_date`` is given we only return a cache entry for the matching
+    month slot, so the Jan-2027 payload is NOT silently reused for a Feb-2027
+    query. When ``target_date`` is None (FAQ / fuzzy / no exact date yet) we fall
+    back to any fresh entry for this conversation — the existing FAQ-combine-with-
+    cached-calendar flow relies on this to stitch the latest result into an FAQ
+    answer without triggering a double scrape.
+    """
+    now = time.time()
+    if target_date is not None:
+        entry = AVAILABILITY_CACHE.get((conversation_id, _cache_month_key(target_date)))
+        if entry and now - entry[1] < CACHE_TTL:
+            return entry[0]
         return None
-    data, ts = entry
-    if time.time() - ts < CACHE_TTL:
-        return data
-    return None
+    # No target date -> accept the freshest live entry for this conversation.
+    best = None
+    for (cid, _month), (data, ts) in AVAILABILITY_CACHE.items():
+        if cid != conversation_id or now - ts >= CACHE_TTL:
+            continue
+        if best is None or ts > best[1]:
+            best = (data, ts)
+    return best[0] if best else None
 
 def _is_retryable_llm_error(exc) -> bool:
     """Transient Gemini errors worth retrying (overload / rate limit / timeout)."""
@@ -686,8 +750,12 @@ async def _handle_incoming(user_message: str, conversation_id: int,
         _bd = bot_logic._shared_booking_dates(slots.get("rooms") or [])
         _bci, _bco = _bd.get("checkin"), _bd.get("checkout")
         if _bci and _bco:
-            _cached = peek_cached_availability(conversation_id)
-            _raw = _cached if _cached is not None else await get_hotel_data_cached(conversation_id)
+            # Owner fix 2026-11-19: key the cache by the actual booking month and
+            # navigate Playwright to it so Jan 2027 / Feb 2027 stays don't collapse
+            # into an "all booked" reply off a stale Nov-2026 scrape payload.
+            _cached = peek_cached_availability(conversation_id, target_date=_bci)
+            _raw = (_cached if _cached is not None
+                    else await get_hotel_data_cached(conversation_id, target_date=_bci))
             # Only answer from availability when the scrape is VALID (has real categories, no error);
             # otherwise keep the generic BED_CONFIG template.
             _raw_ok = isinstance(_raw, dict) and "error" not in _raw and any(
@@ -739,7 +807,8 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                 # re-emitting known slots. "Search nearest dates" is exempt above.
                 if slots.get("topic") in ("price_quote", "general_price"):
                     # Decision 1: a price re-ask must NOT go silent.
-                    cached = peek_cached_availability(conversation_id)
+                    _earliest = _slots_earliest_checkin(slots)
+                    cached = peek_cached_availability(conversation_id, target_date=_earliest)
                     if cached is None:
                         reply = templates.PRICE_NEED_DETAILS
                     elif decision["action"] == "explore":
@@ -764,7 +833,13 @@ async def _handle_incoming(user_message: str, conversation_id: int,
                     _greeted.add(conversation_id)
                     bot_has_spoken = True
                 # Check the calendar BEFORE answering (sends "Секундочку…").
-                availability_data = await get_hotel_data_cached(conversation_id)
+                # Owner fix 2026-11-19: pass the earliest booking checkin so Playwright
+                # navigates Шахівниця to that month and the cache is keyed per-month —
+                # otherwise a follow-up query about a DIFFERENT month reuses a stale
+                # 46-day window and wrongly reports "all booked" (Jan→Feb 2027 incident).
+                _earliest = _slots_earliest_checkin(slots)
+                availability_data = await get_hotel_data_cached(
+                    conversation_id, target_date=_earliest)
                 if not availability_data:
                     if not _superseded(conversation_id, seq):
                         await asyncio.to_thread(send_chatwoot_message, conversation_id,
@@ -881,7 +956,8 @@ async def _handle_incoming(user_message: str, conversation_id: int,
     # quote was SUPERSEDED by a rapid FAQ follow-up (drip < scrape latency): a warm cache exists but the
     # last real bot message isn't a quote yet, so resurface it from cache (the anti-spam dedup drops it
     # if it was already shown). An unchanged booking whose quote IS already visible won't re-render.
-    _resurface = (peek_cached_availability(conversation_id) is not None
+    _faq_target_date = _slots_earliest_checkin(slots)
+    _resurface = (peek_cached_availability(conversation_id, target_date=_faq_target_date) is not None
                   and not bot_logic.is_quote_message(last_bot_msg))
     if is_faq_reply and (slots_changed or _resurface):
         d2 = dialogue_engine.plan(slots)    # an unchanged, already-quoted booking must NOT re-render
@@ -892,9 +968,10 @@ async def _handle_incoming(user_message: str, conversation_id: int,
             except Exception as e:
                 print(f"[-] Помилка надсилання (FAQ): {e}")
             reply = None                            # already sent above
-            cached = peek_cached_availability(conversation_id)
+            cached = peek_cached_availability(conversation_id, target_date=_faq_target_date)
             availability_data = (cached if cached is not None
-                                 else await get_hotel_data_cached(conversation_id))
+                                 else await get_hotel_data_cached(
+                                     conversation_id, target_date=_faq_target_date))
             if availability_data and not _superseded(conversation_id, seq):
                 simplified = bot_logic.build_simplified_availability(availability_data)
                 _candidate = build_booking_reply(d2, simplified)
